@@ -1,0 +1,21 @@
+# Секреты и локальное окружение
+.env
+.env.local
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Данные приложения
+data/audio/
+
+# macOS
+.DS_Store

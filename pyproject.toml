@@ -1,0 +1,87 @@
+[project]
+name = "brain"
+version = "0.1.0"
+description = "Персональный ассистент: захват, память, ретривал"
+requires-python = "==3.13.*"
+
+# Версии пиним по реальному состоянию PyPI, а не по памяти модели.
+# Проверено 15 августа 2026. Перепроверять командой /check-versions.
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.3",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.15.0",
+    "sqlalchemy[asyncio]==2.0.52",
+    "alembic==1.19.1",
+    "asyncpg==0.31.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.3",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "httpx==0.28.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/brain"]
+
+# --- ruff: заменяет black + flake8 + isort ---
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "RUF",      # ruff-специфичные
+]
+ignore = [
+    # Комментарии и документация в проекте на русском. Эти правила ловят
+    # кириллицу как «похожую на латиницу» и на русском тексте бесполезны.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic генерирует шаблонный код, который не стоит причёсывать вручную.
+"src/brain/storage/migrations/versions/*" = ["E501"]
+
+# --- mypy: strict на всём коде приложения ---
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src/brain", "tests"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Alembic-миграции — сгенерированный код с динамическими импортами.
+module = "brain.storage.migrations.*"
+ignore_errors = true
+
+# --- pytest ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Быстрые тесты по умолчанию: всё, что требует живой БД, помечено integration
+# и исключается — иначе Stop-хук перестаёт отрабатывать за секунды.
+addopts = "-q --strict-markers -m 'not integration'"
+markers = [
+    "integration: требует живой Postgres (в быстрый прогон и в Stop-хук не входит)",
+]

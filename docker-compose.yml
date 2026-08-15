@@ -1,0 +1,32 @@
+# Одно хранилище на всё: реляционка, полнотекст, триграммы, вектора и очередь.
+# Postgres — единственный сервис. Ни Redis, ни брокера, ни векторной БД.
+#
+# Приложение в compose не живёт: до Фазы 1 деплоить нечего, локально
+# API поднимается через `just dev`.
+
+services:
+  postgres:
+    # Официальный образ pgvector поверх Postgres 17.
+    # Ниже 0.8.2 не опускаемся: в ней закрыт CVE-2026-3172.
+    image: pgvector/pgvector:0.8.6-pg17
+    container_name: brain-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: brain
+      POSTGRES_PASSWORD: brain
+      POSTGRES_DB: brain
+      # Ускоряет инициализацию и держит сортировку предсказуемой.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brain -d brain"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
