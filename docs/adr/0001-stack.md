@@ -58,7 +58,7 @@
 | API-ядро | FastAPI + Pydantic v2 | 0.141.1 / 2.13.4 |
 | ORM и миграции | SQLAlchemy + Alembic | 2.0.52 / 1.19.1 |
 | БД | PostgreSQL + pgvector + pg_trgm | 17 / ≥0.8.2 |
-| Очередь и расписание | pgqueuer поверх Postgres | 0.26.1 |
+| Очередь и расписание | pgqueuer поверх Postgres | 1.3.2 |
 | LLM | свой `core/llm`, дешёвый тир Gemini Flash-Lite | — |
 | STT | внешний API за интерфейсом `core/stt` | — |
 | Эмбеддинги | Gemini Embedding, 768 измерений | — |
