@@ -38,6 +38,16 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
+def asyncpg_dsn() -> str:
+    """Тот же адрес базы, но без диалекта SQLAlchemy.
+
+    Нужен воркеру: pgqueuer подключается напрямую через asyncpg и про приставку
+    `+asyncpg` ничего не знает. База при этом та же самая — иначе задание
+    и запись оказались бы в разных базах, а с ними и инвариант 7.
+    """
+    return get_settings().database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     """Фабрика сессий. `expire_on_commit=False` — чтобы объекты жили после коммита."""
     global _session_factory

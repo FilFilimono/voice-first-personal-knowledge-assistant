@@ -22,6 +22,24 @@ if config.config_file_name is not None:
 # То, с чем autogenerate сравнивает состояние базы.
 target_metadata = Base.metadata
 
+# Объекты pgqueuer моделями не описаны и описаны не будут: их схемой владеет
+# библиотека (ADR-0008). Для autogenerate это выглядит как «в базе есть лишнее»,
+# и он честно предлагает всё это снести — вместе с очередью и заданиями.
+# Один раз пропустить такой дифф на ревью достаточно, чтобы потерять данные,
+# поэтому решение не «внимательно смотреть», а не показывать их вовсе.
+PGQUEUER_PREFIX = "pgqueuer"
+
+
+def include_object(
+    obj: object,
+    name: str | None,
+    type_: str,
+    reflected: bool,
+    compare_to: object,
+) -> bool:
+    """Не давать autogenerate трогать чужую схему очереди."""
+    return not (name or "").startswith(PGQUEUER_PREFIX)
+
 
 def _database_url() -> str:
     """URL из окружения. В `alembic.ini` его нет намеренно."""
@@ -35,6 +53,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -48,6 +67,7 @@ def _do_run_migrations(connection: object) -> None:
         # Смену типа колонки Alembic сам не замечает — включаем сравнение явно.
         compare_type=True,
         compare_server_default=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
