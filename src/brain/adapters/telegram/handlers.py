@@ -22,8 +22,10 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
+from brain.adapters.telegram import status_text
 from brain.config import Settings
 from brain.core import ingest
+from brain.core import status as core_status
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
 
@@ -37,7 +39,9 @@ PRIVATE_VOICE_REFUSED = (
     "отправить наружу. Наберите текстом."
 )
 HELP = (
-    "Пишите или наговаривайте — сохраню.\n\n"
+    "Пишите или наговаривайте — сохраню.\n"
+    "Скажите «напомни завтра в 10 …» — напомню.\n\n"
+    "/status — всё ли работает\n"
     "/private on — приватный режим: записи не уходят наружу, голосовые "
     "не принимаются\n"
     "/private off — обычный режим\n"
@@ -53,6 +57,12 @@ def build_router(settings: Settings) -> Router:
     @router.message(CommandStart())
     async def start(message: Message) -> None:
         await message.answer(HELP)
+
+    @router.message(Command("status"))
+    async def status(message: Message) -> None:
+        """Что сейчас происходит — чтобы не лезть в терминал с телефона."""
+        collected = await core_status.collect()
+        await message.answer(status_text.render(collected, timezone=settings.brain_timezone))
 
     @router.message(Command("private"))
     async def private_mode(message: Message, command: CommandObject) -> None:

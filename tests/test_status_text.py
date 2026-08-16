@@ -1,0 +1,110 @@
+"""Что должно работать:
+
+1. мёртвый воркер виден первой строкой и **со временем молчания**: разница
+   между «минуту назад перезапустили» и «лежит со вчера» — это разница между
+   «подождать» и «чинить»
+2. воркер, который ни разу не отметился, — тоже мёртвый, а не «неизвестно»
+3. пустые разделы не занимают место: нечего показать — строки нет
+4. упавшие задания приходят вместе с командой, которая их возвращает
+5. напоминание показывается в таймзоне владельца, а не в UTC сервера
+"""
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from brain.adapters.telegram.status_text import render
+from brain.core.status import NextReminder, SystemStatus, WorkerStatus
+
+TIMEZONE = "Europe/Moscow"
+STALE_AFTER = timedelta(minutes=3)
+
+
+def _status(
+    *,
+    silent_for: timedelta | None = timedelta(seconds=10),
+    entries: int = 12,
+    voice_without_transcript: int = 0,
+    jobs_queued: int = 0,
+    jobs_failed: int = 0,
+    next_reminder: NextReminder | None = None,
+    private_mode: bool = False,
+) -> SystemStatus:
+    last_beat = None if silent_for is None else datetime.now(UTC) - silent_for
+    return SystemStatus(
+        worker=WorkerStatus(last_beat=last_beat, stale_after=STALE_AFTER),
+        entries=entries,
+        voice_without_transcript=voice_without_transcript,
+        jobs_queued=jobs_queued,
+        jobs_failed=jobs_failed,
+        next_reminder=next_reminder,
+        private_mode=private_mode,
+    )
+
+
+def test_live_worker_is_the_first_line() -> None:
+    report = render(_status(), timezone=TIMEZONE)
+
+    assert report.splitlines()[0] == "✅ Воркер жив"
+
+
+@pytest.mark.parametrize(
+    ("silent", "expected"),
+    [
+        (timedelta(minutes=12), "12 мин"),
+        (timedelta(hours=3), "3 ч"),
+        (timedelta(days=2), "2 дн"),
+    ],
+)
+def test_dead_worker_reports_how_long_it_has_been_silent(silent: timedelta, expected: str) -> None:
+    report = render(_status(silent_for=silent), timezone=TIMEZONE)
+
+    first = report.splitlines()[0]
+    assert "🔴" in first
+    assert expected in first
+    assert "just worker" in first
+
+
+def test_worker_that_never_reported_is_dead_not_unknown() -> None:
+    """Воркер, не отметившийся ни разу, — это не запущенный воркер."""
+    report = render(_status(silent_for=None), timezone=TIMEZONE)
+
+    assert "ни разу не отмечался" in report
+    assert "just worker" in report
+
+
+def test_quiet_sections_are_omitted() -> None:
+    report = render(_status(), timezone=TIMEZONE)
+
+    assert "без расшифровки" not in report
+    assert "Упало" not in report
+    assert "Напоминаний нет" in report
+
+
+def test_backlog_and_failures_are_shown_with_the_way_out() -> None:
+    report = render(
+        _status(voice_without_transcript=2, jobs_queued=3, jobs_failed=1),
+        timezone=TIMEZONE,
+    )
+
+    assert "Голосовых без расшифровки: 2" in report
+    assert "Заданий в очереди: 3" in report
+    assert "Упало: 1" in report
+    assert "just requeue" in report
+
+
+def test_reminder_is_shown_in_the_owners_timezone() -> None:
+    # 07:30 UTC — это 10:30 в Москве.
+    reminder = NextReminder(
+        fire_at=datetime(2026, 8, 17, 7, 30, tzinfo=UTC), text="позвонить в банк"
+    )
+
+    report = render(_status(next_reminder=reminder), timezone=TIMEZONE)
+
+    assert "17.08 в 10:30" in report
+    assert "позвонить в банк" in report
+
+
+def test_private_mode_is_visible() -> None:
+    assert "🔒" in render(_status(private_mode=True), timezone=TIMEZONE)
+    assert "🔓" in render(_status(private_mode=False), timezone=TIMEZONE)

@@ -16,12 +16,14 @@
 import asyncio
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import pytest
 from aiogram import Bot, Dispatcher
 
-from brain.adapters.telegram.bot import build_dispatcher
+from brain.adapters.telegram.bot import COMMANDS, build_dispatcher, register_commands
 from brain.config import Settings
+from brain.core.status import SystemStatus, WorkerStatus
 from tests.fakes import FakeUnitOfWork
 from tests.telegram_harness import (
     OWNER_ID,
@@ -176,6 +178,46 @@ async def test_redelivered_update_leaves_no_second_entry_and_no_extra_message(
     assert len(uow.entries) == 1
     # Второе подтверждение убирается за собой: владелец отправлял сообщение один раз.
     assert len(session.calls_named("DeleteMessage")) == 1
+
+
+async def test_status_reports_the_worker_first(
+    dispatcher: Dispatcher, bot: Bot, session: FakeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/status` существует ради вопроса «жив ли воркер» — он и идёт первым."""
+    collected = SystemStatus(
+        worker=WorkerStatus(last_beat=None, stale_after=timedelta(minutes=3)),
+        entries=7,
+        voice_without_transcript=2,
+        jobs_queued=2,
+        jobs_failed=0,
+        next_reminder=None,
+        private_mode=False,
+    )
+
+    async def fake_collect() -> SystemStatus:
+        return collected
+
+    monkeypatch.setattr("brain.adapters.telegram.handlers.core_status.collect", fake_collect)
+
+    await dispatcher.feed_update(bot, make_update(make_message(text="/status")))
+
+    report = session.texts[-1]
+    assert "Воркер" in report.splitlines()[0]
+    assert "Записей: 7" in report
+    assert "без расшифровки: 2" in report
+
+
+async def test_command_menu_lists_every_command_the_bot_answers() -> None:
+    """Меню не должно обещать того, чего бот не понимает, и наоборот."""
+    promised = {command.command for command in COMMANDS}
+
+    assert promised == {"start", "status", "private"}
+
+
+async def test_command_menu_is_registered_on_start(bot: Bot, session: FakeSession) -> None:
+    await register_commands(bot)
+
+    assert len(session.calls_named("SetMyCommands")) == 1
 
 
 async def test_private_mode_switches(

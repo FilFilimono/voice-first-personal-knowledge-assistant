@@ -19,13 +19,17 @@
 """
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.core import stt
 from brain.core.memory import audio as audio_store
 from brain.core.memory import repository
+from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.ports import AudioSource, Notifier, Transcriber
+from brain.core.scheduler import reminders
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
+from brain.storage.models.entry import Entry
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +60,11 @@ async def transcribe(
     existing = await repository.get_transcript(entry_id)
     if existing is not None:
         # Задание выполнилось дважды: расшифровка уже есть, платить за неё
-        # второй раз незачем. Подтверждение всё равно приводим в порядок —
-        # первый проход мог упасть как раз на правке сообщения.
-        await notifier.edit(chat_id, ack_message_id, existing)
+        # второй раз незачем. Но напоминание могло не завестись — первый проход
+        # мог упасть между сохранением расшифровки и постановкой напоминания,
+        # и тогда повтор это единственный шанс его завести.
+        reminder = await _schedule_reminder(entry, chat_id, existing)
+        await notifier.edit(chat_id, ack_message_id, _reply(existing, reminder))
         return
 
     audio = await _audio_bytes(entry.audio_path, entry.meta.get("file_id"), audio_source)
@@ -82,7 +88,43 @@ async def transcribe(
         return
 
     await repository.save_transcript(entry_id, transcription)
-    await notifier.edit(chat_id, ack_message_id, transcription.text)
+
+    # Напоминание разбирается здесь, а не при приёме: при приёме текста ещё нет.
+    # Голосом «напомни через 3 минуты» говорят чаще, чем текстом, — на ходу
+    # только так и получается.
+    reminder = await _schedule_reminder(entry, chat_id, transcription.text)
+    await notifier.edit(chat_id, ack_message_id, _reply(transcription.text, reminder))
+
+
+def _reply(transcript: str, reminder: reminders.ScheduleOutcome | None) -> str:
+    """Расшифровка плюс судьба напоминания — одним сообщением."""
+    if reminder is None:
+        return transcript
+
+    mark = "⏰" if reminder.created else "⚠️"
+    return f"{transcript}\n\n{mark} {reminder.message}"
+
+
+async def _schedule_reminder(
+    entry: Entry, chat_id: int, text: str
+) -> reminders.ScheduleOutcome | None:
+    """Завести напоминание по расшифровке, если она им является.
+
+    Повторно не заводит: задание может выполниться дважды, а два напоминания
+    об одном и том же раздражают сильнее, чем отсутствие одного.
+    """
+    if await repository.has_reminder(entry.id):
+        return None
+
+    async with capture_transaction() as uow:
+        return await reminders.schedule(
+            uow,
+            entry_id=entry.id,
+            chat_id=chat_id,
+            text=text,
+            timezone=entry.timezone,
+            now=datetime.now(UTC),
+        )
 
 
 async def _audio_bytes(path: str, file_id: object, audio_source: AudioSource) -> bytes:

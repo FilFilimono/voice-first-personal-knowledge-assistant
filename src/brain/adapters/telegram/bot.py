@@ -11,6 +11,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 
 from brain.adapters.telegram.handlers import build_router
 from brain.adapters.telegram.whitelist import WhitelistMiddleware
@@ -18,6 +19,26 @@ from brain.config import Settings, get_runtime_settings
 from brain.storage.db import dispose_engine
 
 logger = logging.getLogger(__name__)
+
+
+# Меню команд: то, что Telegram подсказывает при вводе «/». Список короткий
+# намеренно — команд ровно столько, сколько их есть, и каждая описана так,
+# чтобы не приходилось вспоминать синтаксис.
+COMMANDS = [
+    BotCommand(command="status", description="всё ли работает"),
+    BotCommand(command="private", description="приватный режим: on / off / без аргумента"),
+    BotCommand(command="start", description="что я умею"),
+]
+
+
+async def register_commands(bot: Bot) -> None:
+    """Показать команды подсказкой при вводе.
+
+    Ставится при каждом старте, а не один раз руками: список команд живёт
+    в коде рядом с обработчиками, и это единственный способ не дать ему
+    разъехаться с тем, что бот на самом деле понимает.
+    """
+    await bot.set_my_commands(COMMANDS)
 
 
 def build_dispatcher(settings: Settings) -> Dispatcher:
@@ -40,6 +61,8 @@ async def run() -> None:
 
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = build_dispatcher(settings)
+
+    await register_commands(bot)
 
     logger.info("бот запущен: окружение %s", settings.brain_env)
     try:

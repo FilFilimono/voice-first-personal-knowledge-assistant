@@ -244,6 +244,55 @@ async def test_failing_provider_keeps_the_entry_and_the_audio(tmp_path: Path) ->
     assert transcriber.calls == 2
 
 
+async def test_reminder_spoken_by_voice_is_scheduled(tmp_path: Path) -> None:
+    """«Напомни через 3 минуты», сказанное голосом, заводит напоминание.
+
+    До 16 августа 2026 не заводило: разбор времени стоял только на приёме
+    текста, а у голосового текста в этот момент ещё нет. Запись сохранялась,
+    напоминание — нет, и выглядело это как случайно сломавшаяся функция.
+    """
+    entry_id = await _capture_voice(tmp_path)
+    assert entry_id is not None
+    notifier = FakeNotifier()
+
+    await jobs.transcribe(
+        entry_id=entry_id,
+        chat_id=CHAT_ID,
+        ack_message_id=21,
+        transcriber=StubTranscriber("Напомни мне через 3 минуты сходить за посылкой"),
+        audio_source=FakeAudioSource(),
+        notifier=notifier,
+        max_duration_sec=900,
+    )
+
+    reminder = await repository.get_reminder(1)
+    assert reminder is not None
+    assert "сходить за посылкой" in reminder.text
+    assert timedelta(minutes=2) < reminder.fire_at - datetime.now(UTC) <= timedelta(minutes=3)
+
+    # В подтверждении и расшифровка, и обещание — одним сообщением.
+    _, _, shown = notifier.edited[0]
+    assert "сходить за посылкой" in shown
+    assert "Напомню" in shown
+
+
+async def test_ordinary_voice_note_creates_no_reminder(tmp_path: Path) -> None:
+    entry_id = await _capture_voice(tmp_path)
+    assert entry_id is not None
+
+    await jobs.transcribe(
+        entry_id=entry_id,
+        chat_id=CHAT_ID,
+        ack_message_id=21,
+        transcriber=StubTranscriber("завтра будет тяжёлый день"),
+        audio_source=FakeAudioSource(),
+        notifier=FakeNotifier(),
+        max_duration_sec=900,
+    )
+
+    assert await repository.get_reminder(1) is None
+
+
 async def test_repeated_job_does_not_pay_for_a_second_transcription(tmp_path: Path) -> None:
     """Задание может выполниться дважды — платить за расшифровку дважды нельзя."""
     entry_id = await _capture_voice(tmp_path)

@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from brain.core.ports import CaptureUnitOfWork, ReminderDraft
+from brain.core.scheduler.queue import REMINDER
+
 # Признак того, что запись вообще про напоминание. Без него любая фраза
 # со словом «завтра» превращалась бы в будильник.
 TRIGGER = re.compile(r"^\s*(напомни(?:ть)?|напомните)\b[\s,:-]*", re.IGNORECASE)
@@ -50,11 +53,49 @@ MONTHS: dict[str, int] = {
     "декабря": 12,
 }
 
-# «через 20 минут», «через час», «через 2 часа», «через 3 дня»
+# Числительные словами. Вслух говорят именно так: «через две минуты», а не
+# «через 2 минуты» — и расшифровка передаёт это словом. Пока их здесь не было,
+# голосовые напоминания молча не работали, а тесты этого не видели, потому что
+# в них подставляли цифру (16 августа 2026).
+WORD_NUMERALS: dict[str, int] = {
+    "один": 1,
+    "одну": 1,
+    "одна": 1,
+    "два": 2,
+    "две": 2,
+    "пару": 2,
+    "пары": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "пятнадцать": 15,
+    "двадцать": 20,
+    "тридцать": 30,
+    "сорок": 40,
+    "пятьдесят": 50,
+}
+
+# Длинные варианты вперёд, иначе «двадцать» съест «два».
+_NUMERAL_ALTERNATION = "|".join(sorted(WORD_NUMERALS, key=len, reverse=True))
+
+UNIT = r"минут\w*|час\w*|дн\w*|день|недел\w*"
+
+# «через 20 минут», «через час», «через две минуты», «через пару часов»
 RELATIVE = re.compile(
-    r"через\s+(?P<count>\d+)?\s*(?P<unit>минут\w*|час\w*|дн\w*|день|недел\w*)",
+    rf"через\s+(?P<count>\d+|{_NUMERAL_ALTERNATION})?\s*(?P<unit>{UNIT})",
     re.IGNORECASE,
 )
+
+# «через полчаса», «через пол часа», «через полтора часа».
+# Отдельно от остальных: это не «число плюс единица», а готовый отрезок.
+FRACTIONAL = re.compile(r"через\s+(?P<what>пол\s?часа|полтора\s+часа)", re.IGNORECASE)
+HALF_HOUR = timedelta(minutes=30)
+HOUR_AND_A_HALF = timedelta(minutes=90)
 # «в 10», «в 10:30», «в 9.15»
 CLOCK = re.compile(r"\bв\s+(?P<hour>\d{1,2})(?:[:.](?P<minute>\d{2}))?\b", re.IGNORECASE)
 # «15 сентября»
@@ -95,15 +136,29 @@ def _clean(text: str, *matched: re.Match[str] | None) -> str:
     return result or text.strip()
 
 
+def _count_of(spoken: str | None) -> int:
+    """«3» и «три» — одно и то же число. Пусто («через час») — единица."""
+    if not spoken:
+        return 1
+    if spoken.isdigit():
+        return int(spoken)
+    return WORD_NUMERALS[spoken.lower()]
+
+
 def _relative(text: str, now: datetime) -> tuple[datetime, re.Match[str]] | None:
+    if fractional := FRACTIONAL.search(text):
+        whole = re.sub(r"\s+", " ", fractional.group("what").lower())
+        return now + (HOUR_AND_A_HALF if whole.startswith("полтора") else HALF_HOUR), fractional
+
     match = RELATIVE.search(text)
     if match is None:
         return None
-    delta = _unit_delta(match.group("unit"))
-    if delta is None:  # pragma: no cover — регулярка не пропустит чужую единицу
+
+    unit = _unit_delta(match.group("unit"))
+    if unit is None:  # pragma: no cover — регулярка не пропустит чужую единицу
         return None
-    count = int(match.group("count") or 1)
-    return now + delta * count, match
+
+    return now + unit * _count_of(match.group("count")), match
 
 
 def _absolute(text: str, now: datetime) -> tuple[datetime, tuple[re.Match[str] | None, ...]] | None:
@@ -181,3 +236,61 @@ def parse(text: str, *, now: datetime, timezone: str) -> ParsedReminder | None:
         return ParsedReminder(fire_at=fire_at, text=_clean(text, *matches))
 
     return None
+
+
+NOT_UNDERSTOOD = (
+    "Не понял, когда напомнить — записал как обычную мысль.\n"
+    "Скажите точнее: «через 10 минут», «завтра в 10», «в понедельник»."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleOutcome:
+    """Что случилось с напоминанием и что об этом сказать владельцу."""
+
+    message: str
+    created: bool
+
+
+async def schedule(
+    uow: CaptureUnitOfWork,
+    *,
+    entry_id: int,
+    chat_id: int,
+    text: str,
+    timezone: str,
+    now: datetime,
+) -> ScheduleOutcome | None:
+    """Завести напоминание, если текст им является. `None` — если не является.
+
+    Одна функция на оба канала: текст разбирается при приёме, голос — после
+    расшифровки, в воркере.
+
+    Три исхода, и третий — главный. Если слово «напомни» прозвучало, а время
+    не разобрано, система **говорит об этом вслух**. Молчаливое сохранение
+    здесь хуже отказа: владелец уверен, что напоминание заведено, и узнаёт
+    обратное, не дождавшись его. Именно так 16 августа пропали и «через две
+    минуты», и «через 3 минуты» — обе записи спокойно легли в архив.
+
+    Напоминание и задание пишутся одной транзакцией — инвариант 7 касается
+    не только записей.
+    """
+    if not TRIGGER.match(text):
+        return None
+
+    parsed = parse(text, now=now, timezone=timezone)
+    if parsed is None:
+        return ScheduleOutcome(message=NOT_UNDERSTOOD, created=False)
+
+    reminder_id = await uow.add_reminder(
+        ReminderDraft(source_entry_id=entry_id, fire_at=parsed.fire_at, text=parsed.text)
+    )
+    await uow.enqueue(
+        REMINDER,
+        {"reminder_id": reminder_id, "chat_id": chat_id},
+        execute_after=parsed.fire_at - now,
+    )
+    return ScheduleOutcome(
+        message=f"Напомню {parsed.fire_at:%d.%m в %H:%M}.",
+        created=True,
+    )

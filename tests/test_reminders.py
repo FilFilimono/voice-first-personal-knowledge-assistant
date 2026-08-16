@@ -81,6 +81,55 @@ def test_relative_time(text: str, hours: float) -> None:
     assert delta.total_seconds() == pytest.approx(hours * 3600)
 
 
+@pytest.mark.parametrize(
+    ("text", "hours"),
+    [
+        # Так говорят вслух — и так это приходит из расшифровки.
+        ("напомни мне через две минуты чегнуть Discord", 2 / 60),
+        ("напомни через одну минуту посмотреть календарь", 1 / 60),
+        ("напомни через три часа про созвон", 3),
+        ("напомни через пару минут глянуть почту", 2 / 60),
+        ("напомни через пять дней продлить домен", 120),
+        ("напомни через двадцать минут выйти", 20 / 60),
+        ("напомни через полчаса поесть", 0.5),
+        ("напомни через пол часа поесть", 0.5),
+        ("напомни через полтора часа выехать", 1.5),
+    ],
+)
+def test_numerals_spoken_as_words(text: str, hours: float) -> None:
+    """Живая речь цифр не содержит.
+
+    Пока этих случаев здесь не было, голосовые напоминания молча не работали:
+    тесты подставляли «через 3 минуты», а владелец говорил «через две минуты».
+    """
+    parsed = _parse(text)
+
+    assert parsed is not None, "напоминание не разобрано"
+    delta = parsed.fire_at - NOW.astimezone(parsed.fire_at.tzinfo)
+    assert delta.total_seconds() == pytest.approx(hours * 3600)
+
+
+def test_word_numeral_does_not_eat_a_longer_one() -> None:
+    """«двадцать» не должно разбираться как «два»."""
+    parsed = _parse("напомни через двадцать минут выйти")
+
+    assert parsed is not None
+    assert (parsed.fire_at - NOW.astimezone(parsed.fire_at.tzinfo)).total_seconds() == 20 * 60
+
+
+def test_reminder_text_survives_the_word_numeral() -> None:
+    parsed = _parse("напомни мне через две минуты чегнуть Discord")
+
+    assert parsed is not None
+    assert "Discord" in parsed.text
+    assert "через" not in parsed.text
+
+
+def test_vague_amount_is_not_guessed() -> None:
+    """«через несколько минут» — это не число. Угадывать нельзя."""
+    assert _parse("напомни через несколько минут глянуть почту") is None
+
+
 def test_weekday_points_to_the_next_one() -> None:
     """Суббота плюс «в понедельник» — ближайший понедельник."""
     parsed = _parse("напомни в понедельник в 9 отправить отчёт")

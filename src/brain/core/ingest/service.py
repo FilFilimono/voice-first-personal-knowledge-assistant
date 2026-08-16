@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from brain.core.ports import CaptureUnitOfWork, EntryDraft, ReminderDraft
+from brain.core.ports import CaptureUnitOfWork, EntryDraft
 from brain.core.scheduler import reminders
-from brain.core.scheduler.queue import REMINDER, TRANSCRIBE
+from brain.core.scheduler.queue import TRANSCRIBE
 from brain.storage.models.entry import EntryKind, EntrySource
 
 # Расширение сохраняется как есть: Telegram отдаёт OGG/Opus, провайдер
@@ -106,7 +106,7 @@ async def capture_text(
     if entry_id is None:
         return CaptureResult(reply="", duplicate=True)
 
-    reminder = await _schedule_reminder(
+    reminder = await reminders.schedule(
         uow,
         entry_id=entry_id,
         text=message.text,
@@ -116,7 +116,9 @@ async def capture_text(
     )
 
     if reminder is not None:
-        return CaptureResult(reply=reminder, entry_id=entry_id)
+        # Сюда попадают оба исхода: и заведённое напоминание, и признание
+        # «не понял, когда». Второе обязано быть видно — см. `reminders.schedule`.
+        return CaptureResult(reply=reminder.message, entry_id=entry_id)
 
     return CaptureResult(
         reply="Записал приватно." if is_private else "Записал.",
@@ -166,31 +168,6 @@ async def capture_voice(
         },
     )
     return CaptureResult(reply="Расшифровываю…", entry_id=entry_id)
-
-
-async def _schedule_reminder(
-    uow: CaptureUnitOfWork,
-    *,
-    entry_id: int,
-    text: str,
-    chat_id: int,
-    timezone: str,
-    now: datetime,
-) -> str | None:
-    """Завести напоминание, если текст им является. Вернуть, что ответить."""
-    parsed = reminders.parse(text, now=now, timezone=timezone)
-    if parsed is None:
-        return None
-
-    reminder_id = await uow.add_reminder(
-        ReminderDraft(source_entry_id=entry_id, fire_at=parsed.fire_at, text=parsed.text)
-    )
-    await uow.enqueue(
-        REMINDER,
-        {"reminder_id": reminder_id, "chat_id": chat_id},
-        execute_after=parsed.fire_at - now,
-    )
-    return f"Напомню {parsed.fire_at:%d.%m в %H:%M}."
 
 
 def _meta(

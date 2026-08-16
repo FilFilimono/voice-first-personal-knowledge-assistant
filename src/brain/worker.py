@@ -33,6 +33,8 @@ from brain.core.scheduler import jobs
 from brain.core.scheduler.queue import (
     AUDIO_RETENTION,
     AUDIO_RETENTION_SCHEDULE,
+    HEARTBEAT,
+    HEARTBEAT_SCHEDULE,
     REMINDER,
     TRANSCRIBE,
 )
@@ -129,6 +131,15 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     @pgq.sm.schedule(AUDIO_RETENTION, AUDIO_RETENTION_SCHEDULE)
     async def clean_audio(schedule: Schedule) -> None:
         await jobs.clean_audio(retention_days=settings.audio_retention_days)
+
+    @pgq.sm.schedule(HEARTBEAT, HEARTBEAT_SCHEDULE)
+    async def heartbeat(schedule: Schedule) -> None:
+        """Пульс. Ничего не делает — важен сам факт срабатывания.
+
+        Библиотека обновляет `last_run` у расписания, и по этой отметке
+        `/status` отличает спящий воркер от мёртвого. Без пульса пустая
+        очередь выглядит одинаково в обоих случаях.
+        """
 
     logger.info("воркер запущен: окружение %s", settings.brain_env)
     try:

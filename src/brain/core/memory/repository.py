@@ -77,6 +77,19 @@ async def get_reminder(reminder_id: int) -> Reminder | None:
         return await session.get(Reminder, reminder_id)
 
 
+async def has_reminder(entry_id: int) -> bool:
+    """Заводили ли уже напоминание по этой записи.
+
+    Нужно повторному выполнению задания: расшифровка сохраняется отдельно
+    от напоминания, и без этой проверки второй проход завёл бы второе.
+    """
+    async with session_scope() as session:
+        found = await session.scalar(
+            select(Reminder.id).where(Reminder.source_entry_id == entry_id).limit(1)
+        )
+    return found is not None
+
+
 async def mark_reminder_fired(reminder_id: int) -> bool:
     """Отметить напоминание отправленным.
 
