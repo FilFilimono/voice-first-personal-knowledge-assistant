@@ -67,6 +67,7 @@ class StubTranscriber:
     def __init__(self, text: str = "расшифровано") -> None:
         self._text = text
         self.calls: list[tuple[bytes, str]] = []
+        self.checked = 0
 
     @property
     def provider(self) -> str:
@@ -75,6 +76,9 @@ class StubTranscriber:
     @property
     def model(self) -> str:
         return "stub-1"
+
+    async def check_available(self) -> None:
+        self.checked += 1
 
     async def transcribe(self, audio: bytes, mime_type: str) -> Transcription:
         self.calls.append((audio, mime_type))
@@ -96,6 +100,9 @@ class FailingTranscriber:
     @property
     def model(self) -> str:
         return "failing-1"
+
+    async def check_available(self) -> None:
+        return None
 
     async def transcribe(self, audio: bytes, mime_type: str) -> Transcription:
         self.calls += 1

@@ -12,7 +12,12 @@
 
 from brain.config import Settings
 from brain.core.ports import Transcriber, Transcription
-from brain.core.stt.errors import AudioTooLongError, PrivateContentError, TranscriptionError
+from brain.core.stt.errors import (
+    AudioTooLongError,
+    PrivateContentError,
+    ProviderUnavailableError,
+    TranscriptionError,
+)
 from brain.core.stt.gemini import GeminiTranscriber
 
 
@@ -51,6 +56,7 @@ async def transcribe_entry(
 __all__ = [
     "AudioTooLongError",
     "PrivateContentError",
+    "ProviderUnavailableError",
     "Transcriber",
     "Transcription",
     "TranscriptionError",

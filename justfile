@@ -33,6 +33,22 @@ bot:
 worker:
     uv run pgq run brain.worker:create_app
 
+# Адрес базы для CLI pgqueuer: он подключается напрямую через asyncpg
+# и про приставку `+asyncpg` в DATABASE_URL ничего не знает.
+pgdsn := "$(uv run python -c 'from brain.storage.db import asyncpg_dsn; print(asyncpg_dsn())')"
+
+# Упавшие задания, оставшиеся в очереди: посмотреть и вернуть в работу
+failed:
+    PGDSN="{{pgdsn}}" uv run pgq failed
+
+requeue *ids:
+    PGDSN="{{pgdsn}}" uv run pgq requeue {{ids}}
+
+# Записи без расшифровки, у которых задания в очереди уже нет.
+# Сначала посмотреть, потом ставить.
+requeue-transcripts *args:
+    uv run python -m brain.maintenance requeue-transcripts {{args}}
+
 # Быстрые тесты: без БД, без сети. Это же гоняет Stop-хук.
 test:
     uv run pytest
@@ -69,3 +85,7 @@ migration message:
 # Текущая версия схемы
 migration-status:
     uv run alembic current
+
+# Схема очереди соответствует версии библиотеки (ADR-0008, шаг 4)
+verify-queue:
+    PGDSN="{{pgdsn}}" uv run pgq verify --expect present

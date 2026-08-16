@@ -83,9 +83,28 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     audio_source = TelegramAudioSource(bot)
     transcriber = stt.build_transcriber(settings)
 
+    # Проверка модели — до того, как воркер возьмёт первое задание. Иначе
+    # неверное имя выясняется на первом голосовом, пятью попытками подряд
+    # и уже после того, как владелец что-то наговорил.
+    try:
+        await transcriber.check_available()
+    except stt.ProviderUnavailableError as error:
+        await bot.session.close()
+        await connection.close()
+        raise SystemExit(
+            f"\nВоркер не запущен.\n{error}\n\nПоправьте STT_MODEL в .env.\n"
+        ) from None
+
+    logger.info("модель расшифровки доступна: %s/%s", transcriber.provider, transcriber.model)
+
     pgq = PgQueuer(AsyncpgDriver(connection))
 
-    @pgq.qm.entrypoint(TRANSCRIBE, executor_factory=retry_executor)
+    # on_failure="hold": исчерпав попытки, задание остаётся в очереди
+    # со статусом failed, а не исчезает. Запись при этом цела в любом случае
+    # (инвариант 7), но удалённое задание значит, что расшифровки не будет
+    # никогда и никто об этом не узнает. Held-задание видно в `pgq failed`
+    # и возвращается в работу `pgq requeue`.
+    @pgq.qm.entrypoint(TRANSCRIBE, executor_factory=retry_executor, on_failure="hold")
     async def transcribe(job: Job) -> None:
         payload = payload_of(job)
         await jobs.transcribe(
@@ -98,7 +117,7 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
             max_duration_sec=settings.stt_max_duration_sec,
         )
 
-    @pgq.qm.entrypoint(REMINDER, executor_factory=retry_executor)
+    @pgq.qm.entrypoint(REMINDER, executor_factory=retry_executor, on_failure="hold")
     async def remind(job: Job) -> None:
         payload = payload_of(job)
         await jobs.remind(
