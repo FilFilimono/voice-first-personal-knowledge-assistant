@@ -7,19 +7,21 @@
 инвариант 7 развалится молча — и вернётся подчищающий sweep, от которого
 ADR-0005 избавился.
 
-Отсюда три проверки: до коммита задания не видно со стороны (значит, оно
-действительно внутри транзакции сессии), после коммита есть и запись и задание,
-после отката нет ни того ни другого.
+Здесь проверяется сам стык — `queue_on`, — на голой таблице. То же самое
+на настоящих `entries` и через настоящий приём записи проверяет
+`test_capture_integration.py`: там видно, что стыком действительно
+пользуются, а не что он теоретически работает.
 
-Требует поднятого Postgres: `just up`. Работает в отдельной одноразовой базе,
-рабочую не трогает и схему проекта не создаёт.
+Схему очереди ставит Alembic (ADR-0008), а не `Queries.install()`:
+`pgq install` не используется в проекте нигде, и тесты не исключение —
+иначе они проверяли бы схему, которой в проде нет.
+
+Требует поднятого Postgres: `just up`.
 """
 
 from collections.abc import AsyncGenerator
 
 import pytest
-from pgqueuer.db import AsyncpgDriver
-from pgqueuer.queries import Queries
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -28,40 +30,11 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from brain.config import get_settings
+from brain.core.scheduler.queue import queue_on
 
-# Одноразовая база под проверку. Имя намеренно не пересекается с рабочим `brain`:
-# фикстура её дропает, и промахнуться здесь нельзя.
-PROBE_DB = "brain_invariant7_probe"
 ENTRYPOINT = "invariant7_probe"
 
 pytestmark = pytest.mark.integration
-
-
-def _url(database: str) -> str:
-    """URL к соседней базе на том же сервере, что и рабочая."""
-    return f"{get_settings().database_url.rsplit('/', 1)[0]}/{database}"
-
-
-async def _admin(sql: str) -> None:
-    """CREATE/DROP DATABASE: вне транзакции и не из той базы, которую трогаем."""
-    engine = create_async_engine(_url("postgres"), isolation_level="AUTOCOMMIT")
-    try:
-        async with engine.connect() as connection:
-            await connection.execute(text(sql))
-    finally:
-        await engine.dispose()
-
-
-async def _queue_on(session: AsyncSession) -> Queries:
-    """Очередь поверх того же соединения, на котором работает сессия.
-
-    Здесь и держится инвариант 7: `driver_connection` — это ровно то соединение
-    asyncpg, которым SQLAlchemy выполняет INSERT и на котором уже открыта
-    транзакция. Отдельного соединения для очереди не берётся намеренно.
-    """
-    raw = await (await session.connection()).get_raw_connection()
-    return Queries(AsyncpgDriver(raw.driver_connection))
 
 
 async def _counts(engine: AsyncEngine) -> tuple[int, int]:
@@ -76,21 +49,23 @@ async def _counts(engine: AsyncEngine) -> tuple[int, int]:
 
 
 @pytest.fixture
-async def probe_engine() -> AsyncGenerator[AsyncEngine]:
-    """Пустая база со схемой pgqueuer и таблицей-заглушкой вместо `entries`."""
-    await _admin(f'DROP DATABASE IF EXISTS "{PROBE_DB}"')
-    await _admin(f'CREATE DATABASE "{PROBE_DB}"')
+async def probe_engine(migrated_database: str) -> AsyncGenerator[AsyncEngine]:
+    """Мигрированная база плюс таблица-заглушка вместо `entries`.
 
-    engine = create_async_engine(_url(PROBE_DB))
+    Заглушка, а не `entries`, намеренно: здесь проверяется механика стыка,
+    и она не должна зависеть от того, как устроена наша схема.
+    """
+    engine = create_async_engine(migrated_database)
     try:
         async with engine.begin() as connection:
-            raw = await connection.get_raw_connection()
-            await Queries(AsyncpgDriver(raw.driver_connection)).install()
             await connection.execute(text("CREATE TABLE probe (id BIGSERIAL PRIMARY KEY)"))
         yield engine
     finally:
         await engine.dispose()
-        await _admin(f'DROP DATABASE IF EXISTS "{PROBE_DB}"')
+
+
+async def _enqueue_on(session: AsyncSession) -> None:
+    await (await queue_on(session)).enqueue(ENTRYPOINT, b"1")
 
 
 async def test_job_is_invisible_until_the_entry_commits(probe_engine: AsyncEngine) -> None:
@@ -99,7 +74,7 @@ async def test_job_is_invisible_until_the_entry_commits(probe_engine: AsyncEngin
 
     async with factory() as session, session.begin():
         await session.execute(text("INSERT INTO probe DEFAULT VALUES"))
-        await (await _queue_on(session)).enqueue(ENTRYPOINT, b"1")
+        await _enqueue_on(session)
 
         # Ещё не коммит: снаружи не должно быть видно ни записи, ни задания.
         assert await _counts(probe_engine) == (0, 0)
@@ -114,7 +89,7 @@ async def test_rollback_takes_the_job_with_it(probe_engine: AsyncEngine) -> None
     with pytest.raises(RuntimeError):
         async with factory() as session, session.begin():
             await session.execute(text("INSERT INTO probe DEFAULT VALUES"))
-            await (await _queue_on(session)).enqueue(ENTRYPOINT, b"1")
+            await _enqueue_on(session)
             raise RuntimeError("падение между постановкой задания и коммитом")
 
     assert await _counts(probe_engine) == (0, 0)
