@@ -65,5 +65,17 @@ jobs:
       - name: Миграции на пустой базе
         run: uv run alembic upgrade head
 
+      # Единственная защита от расхождения между версией pgqueuer и схемой
+      # в миграции: своей версии схемы библиотека нигде не хранит (ADR-0008).
+      # Забыли ревизию при апгрейде — узнаем здесь, а не в проде.
+      - name: Схема очереди соответствует версии библиотеки
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: brain
+          PGPASSWORD: brain
+          PGDATABASE: brain
+        run: uv run pgq verify --expect present
+
       - name: Тесты с базой
         run: uv run pytest -m integration

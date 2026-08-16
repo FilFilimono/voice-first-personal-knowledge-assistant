@@ -24,6 +24,15 @@ logs:
 dev:
     uv run uvicorn brain.api.app:app --reload --port 8000
 
+# Бот: приём сообщений. Подтверждение приёма должно приходить быстро,
+# поэтому медленная работа живёт в отдельном процессе — see `just worker`.
+bot:
+    uv run python -m brain.adapters.telegram
+
+# Воркер: расшифровка, напоминания, ретеншен аудио.
+worker:
+    uv run pgq run brain.worker:create_app
+
 # Быстрые тесты: без БД, без сети. Это же гоняет Stop-хук.
 test:
     uv run pytest

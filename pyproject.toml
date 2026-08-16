@@ -17,6 +17,12 @@ dependencies = [
     # Очередь и расписание (ADR-0005). Драйвер вынесен в extra: без [asyncpg]
     # библиотека ставится без него и падает на первом подключении.
     "pgqueuer[asyncpg]==1.3.2",
+    # Бот (ADR-0001). Polling: домена и TLS не требует.
+    "aiogram==3.30.0",
+    # HTTP к STT-провайдеру (ADR-0009). SDK провайдера намеренно не берём:
+    # запрос — один POST, а SDK привязал бы core/stt к вендору сильнее,
+    # чем предполагает интерфейс из ADR-0007.
+    "httpx==0.28.1",
 ]
 
 [dependency-groups]
@@ -25,7 +31,6 @@ dev = [
     "mypy==2.3.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
-    "httpx==0.28.1",
 ]
 
 [build-system]
@@ -39,7 +44,12 @@ packages = ["src/brain"]
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-src = ["src", "tests"]
+src = ["src"]
+
+[tool.ruff.lint.isort]
+# `evals` и `tests` лежат в корне, а не внутри `src`, и без этого списка
+# попадают в блок сторонних библиотек.
+known-first-party = ["brain", "evals", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -69,13 +79,22 @@ ignore = [
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src/brain", "tests"]
+# Eval-наборы проверяются наравне с кодом: они меряют качество решений,
+# и ошибка в них выглядит как ухудшение модели.
+files = ["src/brain", "tests", "evals"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 # Alembic-миграции — сгенерированный код с динамическими импортами.
 module = "brain.storage.migrations.*"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+# asyncpg не поставляет py.typed. Обычно к нему обращается SQLAlchemy, а не мы;
+# напрямую он нужен ровно в одном месте — воркеру, который подключается
+# к базе в обход ORM, потому что pgqueuer умеет только сырое соединение.
+module = "asyncpg.*"
+ignore_missing_imports = true
 
 # --- pytest ---
 [tool.pytest.ini_options]
