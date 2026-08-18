@@ -160,6 +160,154 @@ def test_past_date_moves_to_next_year() -> None:
     assert (parsed.fire_at.year, parsed.fire_at.month) == (2027, 3)
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("напомни в 7 вечера уйти с офиса", (19, 0)),
+        ("напомни в 7:40 вечера уйти с офиса", (19, 40)),
+        ("напомни в 8 утра выпить таблетки", (8, 0)),
+        ("напомни в 9 часов вечера позвонить маме", (21, 0)),
+        ("напомни в 11 вечера поставить телефон на зарядку", (23, 0)),
+        ("напомни в час дня пообедать", (13, 0)),
+        ("напомни в час ночи закрыть ноутбук", (1, 0)),
+        ("напомни в 2 ночи проверить бэкап", (2, 0)),
+        ("напомни в полдень пообедать", (12, 0)),
+        ("напомни в полночь подвести итоги", (0, 0)),
+    ],
+)
+def test_time_of_day(text: str, expected: tuple[int, int]) -> None:
+    """Вслух говорят «в 7 вечера», а не «в 19:00».
+
+    Пока этого не было, «напомни уйти с офиса в 7:40 вечера» либо не разбиралось
+    вовсе, либо уехало бы на 7:40 утра — на двенадцать часов раньше нужного.
+    """
+    parsed = _parse(text)
+
+    assert parsed is not None, "напоминание не разобрано"
+    assert (parsed.fire_at.hour, parsed.fire_at.minute) == expected
+
+
+def test_daypart_does_not_shift_a_24_hour_time() -> None:
+    """«в 19:40 вечера» — уже вечер. Прибавлять двенадцать нельзя."""
+    parsed = _parse("напомни в 19:40 вечера уйти домой")
+
+    assert parsed is not None
+    assert (parsed.fire_at.hour, parsed.fire_at.minute) == (19, 40)
+
+
+def test_daypart_leaves_no_trace_in_the_text() -> None:
+    parsed = _parse("напомни в 7 вечера уйти с офиса")
+
+    assert parsed is not None
+    assert parsed.text == "уйти с офиса"
+
+
+def test_bare_hour_that_already_passed_means_tomorrow() -> None:
+    """«в 7» без уточнения, сказанное в девять утра, — это завтра.
+
+    Правило неоднозначности: молча поставить напоминание в прошлое хуже,
+    чем ошибиться на сутки вперёд, — в прошлом оно просто не сработает.
+    """
+    parsed = _parse("напомни в 7 позвонить в банк")
+
+    assert parsed is not None
+    assert (parsed.fire_at.day, parsed.fire_at.hour) == (16, 7)
+
+
+def test_bare_hour_still_ahead_means_today() -> None:
+    parsed = _parse("напомни в 19 позвонить в банк")
+
+    assert parsed is not None
+    assert (parsed.fire_at.day, parsed.fire_at.hour) == (15, 19)
+
+
+def test_daypart_moves_a_passed_hour_to_tomorrow_too() -> None:
+    """«в 8 утра», сказанное в девять утра, — тоже про завтра."""
+    parsed = _parse("напомни в 8 утра выпить таблетки")
+
+    assert parsed is not None
+    assert (parsed.fire_at.day, parsed.fire_at.hour) == (16, 8)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_hour"),
+    [
+        ("напомни в среду вечером собрать вещи", 19),
+        ("напомни в среду утром позвонить в банк", 9),
+        ("напомни завтра днём заехать в сервис", 14),
+    ],
+)
+def test_daypart_without_an_hour_sets_a_sensible_one(text: str, expected_hour: int) -> None:
+    """«в среду вечером» — время названо, пусть и не по часам."""
+    parsed = _parse(text)
+
+    assert parsed is not None, "напоминание не разобрано"
+    assert parsed.fire_at.hour == expected_hour
+
+
+def test_end_of_day() -> None:
+    parsed = _parse("напомни в конце дня отправить отчёт")
+
+    assert parsed is not None
+    assert (parsed.fire_at.day, parsed.fire_at.hour) == (15, 18)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "напомни за 10 минут до 15:00 пойти домой",
+        "напомни за десять минут до 15:00 пойти домой",
+        "напомни за минут 10 до 15:00 пойти домой",
+    ],
+)
+def test_lead_time_before_a_named_hour(text: str) -> None:
+    """«за 10 минут до 15:00» — это 14:50."""
+    parsed = _parse(text)
+
+    assert parsed is not None, "напоминание не разобрано"
+    assert (parsed.fire_at.hour, parsed.fire_at.minute) == (14, 50)
+
+
+def test_lead_time_before_a_daypart_hour() -> None:
+    """«за полчаса до 7 вечера» — половина седьмого вечера."""
+    parsed = _parse("напомни за полчаса до 7 вечера собраться")
+
+    assert parsed is not None
+    assert (parsed.fire_at.hour, parsed.fire_at.minute) == (18, 30)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Живая речь: форма глагола другая, а между триггером и временем
+        # стоят посторонние слова.
+        "напомни мне уйти с офиса в 19:40",
+        "напомнить мне уйти с офиса в 19:40",
+        "напомните мне уйти с офиса в 19:40",
+        "я хочу чтобы ты мне напомнил уйти с офиса в 19:40",
+        "слушай, напоминай мне уйти с офиса в 19:40",
+    ],
+)
+def test_trigger_catches_the_root_in_any_form_and_any_place(text: str) -> None:
+    """Триггер цепляется за корень «напомн», а не за одну форму в начале строки.
+
+    Речь всегда кривая: расшифровка отдаёт «чтобы ты мне напомнил», а не
+    «напомни». Якорь на начало строки и жёсткая форма глагола отсекали
+    ровно то, как владелец говорит на самом деле.
+    """
+    parsed = _parse(text)
+
+    assert parsed is not None, "напоминание не разобрано"
+    assert (parsed.fire_at.hour, parsed.fire_at.minute) == (19, 40)
+
+
+def test_words_between_the_trigger_and_the_time_survive() -> None:
+    parsed = _parse("напомни мне уйти с офиса в 19:40")
+
+    assert parsed is not None
+    assert parsed.text == "уйти с офиса"
+
+
 def test_thought_without_the_trigger_word_is_not_a_reminder() -> None:
     assert _parse("завтра в 10 встреча, надо подготовиться") is None
     assert _parse("через час буду дома") is None

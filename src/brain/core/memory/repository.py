@@ -6,8 +6,9 @@
 """
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from brain.core.ports import Transcription
 from brain.storage.db import session_scope
@@ -75,6 +76,49 @@ async def get_transcript(entry_id: int) -> str | None:
 async def get_reminder(reminder_id: int) -> Reminder | None:
     async with session_scope() as session:
         return await session.get(Reminder, reminder_id)
+
+
+async def entry_by_ack_message(chat_id: int, ack_message_id: int) -> tuple[int, str] | None:
+    """Запись, чьё подтверждение приёма — это сообщение, и её текущий текст.
+
+    Так находится запись, к которой относится ответ владельца на вопрос
+    «когда напомнить?»: вопрос — это отредактированное подтверждение приёма,
+    а его идентификатор лежит в `meta` с момента вставки. Отдельная таблица
+    ожидающих вопросов не нужна, и кнопки переживают перезапуск бота.
+
+    Текст берётся так же, как везде: расшифровка, если она есть, иначе
+    `raw_text` — у голосовой записи своего текста нет.
+    """
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(Entry.id, func.coalesce(_latest_transcript(), Entry.raw_text))
+                .where(
+                    Entry.meta["chat_id"].astext == str(chat_id),
+                    Entry.meta["ack_message_id"].astext == str(ack_message_id),
+                )
+                .order_by(Entry.id.desc())
+                .limit(1)
+            )
+        ).first()
+    if row is None or row[1] is None:
+        return None
+    return int(row[0]), str(row[1])
+
+
+def _latest_transcript() -> Any:
+    """Последняя расшифровка записи — подзапрос, а не join.
+
+    Перепрогон другой моделью добавляет строку, поэтому «текущая» это всегда
+    «последняя», и join дал бы столько строк, сколько было прогонов.
+    """
+    return (
+        select(Transcript.text)
+        .where(Transcript.source_entry_id == Entry.id)
+        .order_by(Transcript.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
 
 
 async def has_reminder(entry_id: int) -> bool:

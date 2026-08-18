@@ -135,6 +135,30 @@ async def test_unparsed_time_is_not_stored_as_an_ordinary_thought(audio_dir: Pat
     assert "не понял, когда напомнить" in shown.lower()
 
 
+async def test_voice_without_the_trigger_word_is_questioned(audio_dir: Path) -> None:
+    """Голос — главный источник просьб без слова «напомни».
+
+    Расшифровка записи 27 съела «На» у «Напомни», и осталось «Помни не уйти
+    в 7:40 вечера». Голосовой путь обязан спросить так же, как текстовый:
+    молча положить в архив — та самая дыра.
+    """
+    notifier = FakeNotifier()
+    entry_id = await _capture_voice(audio_dir)
+
+    await _transcribe(entry_id, "Помни не уйти в 7:40 вечера.", notifier)
+
+    assert notifier.asked, "голосовой путь промолчал"
+    _, _, shown, asked_about = notifier.asked[0]
+    assert asked_about == entry_id
+    assert "Похоже на напоминание" in shown
+    assert "19:40" in shown
+    # Расшифровка при этом видна: вопрос её не вытесняет.
+    assert "Помни не уйти" in shown
+
+    # Вопрос — это вопрос: напоминание появится только после ответа.
+    assert await repository.get_reminder(1) is None
+
+
 async def test_ordinary_voice_note_says_nothing_about_reminders(audio_dir: Path) -> None:
     """Обычная мысль остаётся обычной мыслью: ни обещаний, ни извинений."""
     notifier = FakeNotifier()

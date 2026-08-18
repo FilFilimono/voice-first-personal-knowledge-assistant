@@ -8,7 +8,9 @@ whitelist, те же обработчики. Иначе проверялись �
 к Telegram, и время каждого из них.
 """
 
+import asyncio
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,10 +19,12 @@ from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     DeleteMessage,
     EditMessageText,
+    GetMe,
+    GetUpdates,
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import Chat, Message, Update, User, Voice
+from aiogram.types import CallbackQuery, Chat, Message, Update, User, Voice
 
 OWNER_ID = 111
 STRANGER_ID = 222
@@ -62,6 +66,24 @@ class FakeSession(BaseSession):
             for call in self.calls
             if hasattr(call.method, "text")
         ]
+
+    def last_buttons(self) -> list[tuple[str, str]]:
+        """Кнопки под последним сообщением: подпись и то, что вернётся в ответ.
+
+        Пусто — кнопок не было. Отличать «кнопок нет» от «кнопки другие»
+        обязательно: открытый вопрос «когда напомнить?» ждёт свободного текста,
+        и кнопка под ним обещала бы не то.
+        """
+        for call in reversed(self.calls):
+            markup = getattr(call.method, "reply_markup", None)
+            if markup is None:
+                continue
+            return [
+                (button.text, button.callback_data or "")
+                for row in markup.inline_keyboard
+                for button in row
+            ]
+        return []
 
     async def close(self) -> None:
         return None
@@ -121,5 +143,109 @@ def make_update(message: Message, update_id: int = 1) -> Update:
     return Update(update_id=update_id, message=message)
 
 
+def make_reply_update(
+    text: str,
+    *,
+    reply_to_message_id: int,
+    update_id: int = 2,
+    user_id: int = OWNER_ID,
+) -> Update:
+    """Ответ владельца **на сообщение бота** — так приходит ответ на вопрос.
+
+    Связка держится на `reply_to_message`: идентификатор сообщения, на которое
+    отвечают, — это подтверждение приёма, а оно записано в `entries.meta`.
+    """
+    message = make_message(message_id=970, text=text, user_id=user_id)
+    return Update(
+        update_id=update_id,
+        message=message.model_copy(
+            update={
+                "reply_to_message": Message(
+                    message_id=reply_to_message_id,
+                    date=datetime.now(UTC),
+                    chat=Chat(id=CHAT_ID, type="private"),
+                    from_user=User(id=999, is_bot=True, first_name="Brain"),
+                    text="Похоже на напоминание.",
+                )
+            }
+        ),
+    )
+
+
+def make_callback_update(
+    data: str,
+    *,
+    message_id: int,
+    update_id: int = 3,
+    user_id: int = OWNER_ID,
+) -> Update:
+    """Нажатие кнопки под сообщением бота."""
+    return Update(
+        update_id=update_id,
+        callback_query=CallbackQuery(
+            id=f"cb-{update_id}",
+            from_user=User(id=user_id, is_bot=False, first_name="Владелец"),
+            chat_instance="chat-instance",
+            data=data,
+            message=Message(
+                message_id=message_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=CHAT_ID, type="private"),
+                from_user=User(id=999, is_bot=True, first_name="Brain"),
+                text="Похоже на напоминание.",
+            ),
+        ),
+    )
+
+
 def make_bot(session: FakeSession) -> Bot:
     return Bot(token="123:test-token", session=session)
+
+
+class PollingSession(FakeSession):
+    """Транспорт для настоящего цикла `start_polling`.
+
+    Нужен потому, что подтверждение апдейта делает не наш код, а цикл aiogram:
+    он двигает `offset`, и следующий запрос `getUpdates` говорит Telegram
+    «эти можешь забыть». Проверять это на своей имитации цикла бессмысленно —
+    имитация подтвердит ровно то, что мы про неё думаем.
+
+    Сессия запоминает каждый `getUpdates` вместе с тем, сколько записей к тому
+    моменту уже дошло до базы. По этой паре и видно, подтверждаются апдейты
+    до записи или после.
+    """
+
+    def __init__(self, updates: list[Update], stored: Callable[[], int]) -> None:
+        super().__init__()
+        self._updates = updates
+        self._stored = stored
+        # (offset, сколько записей сохранено к моменту запроса)
+        self.polls: list[tuple[int, int]] = []
+        self.confirmed = asyncio.Event()
+
+    async def make_request(
+        self,
+        bot: Bot,
+        method: TelegramMethod[Any],
+        timeout: int | None = None,
+    ) -> Any:
+        if isinstance(method, GetMe):
+            return User(id=1, is_bot=True, first_name="Brain", username="brain_bot")
+
+        if isinstance(method, GetUpdates):
+            offset = method.offset or 0
+            self.polls.append((offset, self._stored()))
+            if offset == 0:
+                return self._updates
+            # Апдейты кончились, а offset уехал вперёд — значит пачка уже
+            # подтверждена. Дальше держим долгий опрос, пока тест не остановит.
+            self.confirmed.set()
+            await asyncio.sleep(LONG_POLL)
+            return []
+
+        return await super().make_request(bot, method, timeout)
+
+
+# Столько «висит» долгий опрос после того, как апдейты кончились. Тест
+# столько не ждёт — он снимает задачу, как только увидел подтверждение.
+LONG_POLL = 3600

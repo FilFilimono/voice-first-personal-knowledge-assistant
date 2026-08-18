@@ -20,19 +20,24 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
 from brain.adapters.telegram import status_text
+from brain.adapters.telegram.notifier import CALLBACK_PREFIX, NO, yes_no_keyboard
 from brain.config import Settings
 from brain.core import ingest
 from brain.core import status as core_status
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
+from brain.core.scheduler import reminders
 
 logger = logging.getLogger(__name__)
 
 ACK = "Принял."
+STORED = "Записал."
 CAPTURE_FAILED = "Не смог сохранить — повторите, пожалуйста."
+ALREADY_SCHEDULED = "Это напоминание уже заведено."
+QUESTION_LOST = "Не нашёл запись, к которой был вопрос — посмотрите логи."
 PRIVATE_VOICE_REFUSED = (
     "Приватный режим — только текст.\n"
     "Расшифровка идёт через внешний сервис, поэтому голосовое пришлось бы "
@@ -127,6 +132,12 @@ def build_router(settings: Settings) -> Router:
 
     @router.message(F.text)
     async def text(message: Message) -> None:
+        # Ответ на вопрос бота — это реплика диалога, а не новая мысль.
+        # Проверяется до подтверждения приёма: «сегодня в 19:00» не должно
+        # ни лечь в архив, ни получить «Записал.».
+        if await _answered_a_question(message):
+            return
+
         ack = await message.answer(ACK)
 
         if message.text is None:  # pragma: no cover — исключено фильтром F.text
@@ -157,6 +168,99 @@ def build_router(settings: Settings) -> Router:
             await ack.delete()
             return
 
+        if result.ask is reminders.Ask.CONFIRM and result.entry_id is not None:
+            # Время уже разобрано — остаётся подтвердить. Открытый вопрос
+            # («когда напомнить?») кнопок не получает: ответ там свободный,
+            # и кнопка под ним обещала бы не то.
+            await ack.edit_text(result.reply, reply_markup=yes_no_keyboard(result.entry_id))
+            return
+
         await ack.edit_text(result.reply)
 
+    async def _answered_a_question(message: Message) -> bool:
+        """Разобрать ответ на «когда напомнить?». `False` — это не ответ.
+
+        Запись ищется по сообщению, на которое отвечают: вопрос — это
+        отредактированное подтверждение приёма, и его идентификатор лежит
+        в `entries.meta`. Поэтому ни таблицы ожидающих вопросов, ни состояния
+        в памяти процесса не нужно.
+        """
+        replied_to = message.reply_to_message
+        if replied_to is None or message.text is None:
+            return False
+
+        found = await repository.entry_by_ack_message(message.chat.id, replied_to.message_id)
+        if found is None:
+            return False
+
+        entry_id, subject = found
+        if await repository.has_reminder(entry_id):
+            return False
+
+        async with capture_transaction() as uow:
+            outcome = await reminders.schedule_confirmed(
+                uow,
+                entry_id=entry_id,
+                chat_id=message.chat.id,
+                subject=subject,
+                when=message.text,
+                timezone=settings.brain_timezone,
+                now=datetime.now(UTC),
+            )
+
+        await replied_to.edit_text(_answered(outcome))
+        return True
+
+    @router.callback_query(F.data.startswith(f"{CALLBACK_PREFIX}:"))
+    async def answer_question(callback: CallbackQuery) -> None:
+        """Нажатие «Да» или «Нет» под вопросом «это напоминание?»."""
+        await callback.answer()
+
+        if callback.data is None or callback.message is None:  # pragma: no cover — фильтр выше
+            return
+
+        _, answer, raw_entry_id = callback.data.split(":", maxsplit=2)
+        entry_id = int(raw_entry_id)
+        question = callback.message
+
+        if not isinstance(question, Message):  # pragma: no cover — слишком старое сообщение
+            return
+
+        if answer == NO:
+            await question.edit_text(STORED)
+            return
+
+        # Нажать кнопку можно сколько угодно раз: она живёт в переписке вечно.
+        # Второе напоминание об одном и том же раздражает сильнее, чем его
+        # отсутствие, — та же причина, что и у повтора задания расшифровки.
+        if await repository.has_reminder(entry_id):
+            await question.edit_text(ALREADY_SCHEDULED)
+            return
+
+        found = await repository.entry_by_ack_message(question.chat.id, question.message_id)
+        if found is None:
+            logger.error("ответ на вопрос без записи: entry_id=%s", entry_id)
+            await question.edit_text(QUESTION_LOST)
+            return
+
+        _, subject = found
+        async with capture_transaction() as uow:
+            outcome = await reminders.schedule_confirmed(
+                uow,
+                entry_id=entry_id,
+                chat_id=question.chat.id,
+                # «Да» означает «время в записи верное» — оттуда его и берём.
+                subject=subject,
+                when=subject,
+                timezone=settings.brain_timezone,
+                now=datetime.now(UTC),
+            )
+
+        await question.edit_text(_answered(outcome))
+
     return router
+
+
+def _answered(outcome: reminders.ScheduleOutcome) -> str:
+    """Что показать вместо вопроса, когда на него ответили."""
+    return f"⏰ {outcome.message}" if outcome.created else outcome.message

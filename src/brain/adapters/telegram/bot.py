@@ -46,12 +46,47 @@ def build_dispatcher(settings: Settings) -> Dispatcher:
 
     Middleware вешается на внешний уровень: чужое сообщение не должно доходить
     ни до одного обработчика, включая команды.
+
+    И на нажатия кнопок тоже. Проверка одна и та же — middleware смотрит
+    в `event_from_user`, который aiogram заполняет и для нажатий, — но
+    повесить её надо отдельно: пропустив это, мы отдали бы чужому право
+    заводить напоминания в чужом архиве.
     """
     dispatcher = Dispatcher()
     whitelist = WhitelistMiddleware(settings.telegram_allowed_user_ids)
     dispatcher.message.outer_middleware(whitelist)
+    dispatcher.callback_query.outer_middleware(whitelist)
     dispatcher.include_router(build_router(settings))
     return dispatcher
+
+
+# Апдейты обрабатываются по одному, а не пачкой параллельных задач.
+#
+# Причина не в нагрузке. Telegram считает апдейт доставленным не тогда, когда
+# мы его обработали, а тогда, когда цикл опроса запросил следующую пачку
+# с увеличенным `offset`, — после этого апдейт не вернётся никогда. При
+# умолчании aiogram (`handle_as_tasks=True`) обработчик уходит в фоновую
+# задачу, а `offset` двигается сразу: подтверждение обгоняет запись в базу.
+# Пачка, накопленная за ночь с закрытым ноутбуком, подтверждается за
+# миллисекунды, а пишется секундами — и всё, что не успело, пропадает.
+#
+# Последовательная обработка делает подтверждение честным: `offset` уезжает
+# вперёд только после того, как обработчик закончил. Цена — сообщения
+# записываются в затылок друг другу; при одном пользователе это не цена.
+#
+# Оборванный на полпути апдейт останется неподтверждённым и придёт снова —
+# доставка становится «хотя бы раз» вместо «не более раза». Повтор ловит
+# дедупликация по `chat_id:message_id`, которая для этого и заведена.
+HANDLE_AS_TASKS = False
+
+
+async def poll(dispatcher: Dispatcher, bot: Bot) -> None:
+    """Опрашивать Telegram, пока не остановят.
+
+    Отдельно от `run` ради теста: проверять долговечность приёма имеет смысл
+    только на настоящем цикле aiogram — подтверждает апдейты именно он.
+    """
+    await dispatcher.start_polling(bot, handle_as_tasks=HANDLE_AS_TASKS)
 
 
 async def run() -> None:
@@ -66,7 +101,7 @@ async def run() -> None:
 
     logger.info("бот запущен: окружение %s", settings.brain_env)
     try:
-        await dispatcher.start_polling(bot)
+        await poll(dispatcher, bot)
     finally:
         await bot.session.close()
         await dispose_engine()

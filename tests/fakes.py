@@ -52,6 +52,8 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
         self.edited: list[tuple[int, int, str]] = []
+        # Заданные вопросы с кнопками: чат, сообщение, текст, запись.
+        self.asked: list[tuple[int, int, str, int]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         self.sent.append((chat_id, text))
@@ -59,6 +61,9 @@ class FakeNotifier:
 
     async def edit(self, chat_id: int, message_id: int, text: str) -> None:
         self.edited.append((chat_id, message_id, text))
+
+    async def ask_yes_no(self, chat_id: int, message_id: int, text: str, *, entry_id: int) -> None:
+        self.asked.append((chat_id, message_id, text, entry_id))
 
 
 class StubTranscriber:

@@ -19,8 +19,9 @@
 """
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from brain.core import stt
 from brain.core.memory import audio as audio_store
@@ -30,10 +31,17 @@ from brain.core.ports import AudioSource, Notifier, Transcriber
 from brain.core.scheduler import reminders
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
 from brain.storage.models.entry import Entry
+from brain.storage.models.reminder import Reminder
 
 logger = logging.getLogger(__name__)
 
 VOICE_MIME = "audio/ogg"
+
+# Насколько напоминание должно опоздать, чтобы называть это просрочкой.
+# Две минуты отделяют настоящее опоздание от обычной задержки очереди:
+# в базе сработавшие вовремя отстают на десятые доли секунды, а то, что
+# ждало поднятия воркера, — на десятки минут.
+OVERDUE_AFTER = timedelta(minutes=2)
 
 ENTRY_GONE = "Запись потерялась — такого быть не должно, посмотрите логи."
 TOO_LONG = "Голосовое слишком длинное, я такое не расшифровываю. Разбейте на части."
@@ -64,7 +72,7 @@ async def transcribe(
         # мог упасть между сохранением расшифровки и постановкой напоминания,
         # и тогда повтор это единственный шанс его завести.
         reminder = await _schedule_reminder(entry, chat_id, existing)
-        await notifier.edit(chat_id, ack_message_id, _reply(existing, reminder))
+        await _show(notifier, chat_id, ack_message_id, entry.id, existing, reminder)
         return
 
     audio = await _audio_bytes(entry.audio_path, entry.meta.get("file_id"), audio_source)
@@ -93,16 +101,44 @@ async def transcribe(
     # Голосом «напомни через 3 минуты» говорят чаще, чем текстом, — на ходу
     # только так и получается.
     reminder = await _schedule_reminder(entry, chat_id, transcription.text)
-    await notifier.edit(chat_id, ack_message_id, _reply(transcription.text, reminder))
+    await _show(notifier, chat_id, ack_message_id, entry.id, transcription.text, reminder)
 
 
-def _reply(transcript: str, reminder: reminders.ScheduleOutcome | None) -> str:
-    """Расшифровка плюс судьба напоминания — одним сообщением."""
+# Значок перед судьбой напоминания. Разные намеренно: ⏰ значит «сделано»,
+# ⚠️ — «услышал „напомни“, но не понял когда», ❓ — «спрашиваю, ответьте».
+MARKS = {
+    reminders.Ask.NOTHING: "⚠️",
+    reminders.Ask.CONFIRM: "❓",
+    reminders.Ask.WHEN: "❓",
+}
+
+
+async def _show(
+    notifier: Notifier,
+    chat_id: int,
+    ack_message_id: int,
+    entry_id: int,
+    transcript: str,
+    reminder: reminders.ScheduleOutcome | None,
+) -> None:
+    """Показать расшифровку и судьбу напоминания — одним сообщением.
+
+    Голос — главный источник просьб без слова «напомни»: расшифровка теряет
+    начало слова чаще, чем клавиатура. Поэтому вопрос задаётся и здесь,
+    и ровно теми же кнопками, что в боте.
+    """
     if reminder is None:
-        return transcript
+        await notifier.edit(chat_id, ack_message_id, transcript)
+        return
 
-    mark = "⏰" if reminder.created else "⚠️"
-    return f"{transcript}\n\n{mark} {reminder.message}"
+    mark = "⏰" if reminder.created else MARKS[reminder.ask]
+    text = f"{transcript}\n\n{mark} {reminder.message}"
+
+    if reminder.ask is reminders.Ask.CONFIRM:
+        await notifier.ask_yes_no(chat_id, ack_message_id, text, entry_id=entry_id)
+        return
+
+    await notifier.edit(chat_id, ack_message_id, text)
 
 
 async def _schedule_reminder(
@@ -159,7 +195,29 @@ async def remind(*, reminder_id: int, chat_id: int, notifier: Notifier) -> None:
         logger.info("напоминание %s уже отправлено", reminder_id)
         return
 
-    await notifier.send(chat_id, f"⏰ {reminder.text}")
+    await notifier.send(chat_id, await _reminder_text(reminder))
+
+
+async def _reminder_text(reminder: Reminder) -> str:
+    """Текст напоминания, а к нему — признание, если оно опоздало.
+
+    Просроченное напоминание не теряется: pgqueuer берёт задание, как только
+    воркер поднимается, потому что срок у него уже наступил. Но приходит оно
+    молча, и владелец читает «⏰ уйти домой» как «пора» — хотя пора было час
+    назад. Так 17 августа напоминание на 20:00 пришло в 20:46 и выглядело
+    обычным: воркер в этот момент лежал.
+
+    Время показывается в таймзоне записи, а не сервера: напоминание про
+    «19:40» должно и опоздать про 19:40.
+    """
+    late = datetime.now(UTC) - reminder.fire_at
+    if late < OVERDUE_AFTER:
+        return f"⏰ {reminder.text}"
+
+    entry = await repository.get_entry(reminder.source_entry_id)
+    timezone = ZoneInfo(entry.timezone) if entry is not None else UTC
+    due = reminder.fire_at.astimezone(timezone)
+    return f"⏰ {reminder.text}\n\n⚠️ Просрочено: должно было прийти {due:%d.%m в %H:%M}."
 
 
 async def clean_audio(*, retention_days: int) -> int:

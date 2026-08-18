@@ -59,6 +59,9 @@ class CaptureResult:
     # Повторная доставка того же сообщения. Записи не прибавилось,
     # и говорить об этом не надо: владелец отправлял сообщение один раз.
     duplicate: bool = False
+    # Запись похожа на напоминание, но слова «напомни» в ней не было.
+    # Адаптер решает, как спросить: кнопками или открытым вопросом.
+    ask: reminders.Ask = reminders.Ask.NOTHING
 
 
 def dedup_key(chat_id: int, message_id: int) -> str:
@@ -116,9 +119,10 @@ async def capture_text(
     )
 
     if reminder is not None:
-        # Сюда попадают оба исхода: и заведённое напоминание, и признание
-        # «не понял, когда». Второе обязано быть видно — см. `reminders.schedule`.
-        return CaptureResult(reply=reminder.message, entry_id=entry_id)
+        # Сюда попадают все исходы: заведённое напоминание, признание «не понял,
+        # когда» и вопрос к записи без слова «напомни». Каждый обязан быть
+        # виден — см. `reminders.schedule`.
+        return CaptureResult(reply=reminder.message, entry_id=entry_id, ask=reminder.ask)
 
     return CaptureResult(
         reply="Записал приватно." if is_private else "Записал.",
