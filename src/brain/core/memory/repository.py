@@ -190,6 +190,24 @@ def latest_transcript() -> Any:
     )
 
 
+def latest_transcript_id() -> Any:
+    """Идентификатор той же самой последней расшифровки.
+
+    Нужен разметке по единицам: единица хранится отрезком, а отрезок обязан
+    помнить, над каким текстом посчитан (ADR-0012). Отдельным подзапросом,
+    а не вторым полем в `latest_transcript()`, потому что скалярный подзапрос
+    возвращает один столбец, — но правило «последняя это последняя» здесь
+    то же самое, и менять их надо вместе.
+    """
+    return (
+        select(Transcript.id)
+        .where(Transcript.source_entry_id == Entry.id)
+        .order_by(Transcript.id.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+
+
 async def has_reminder(entry_id: int) -> bool:
     """Заводили ли уже напоминание по этой записи.
 

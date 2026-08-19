@@ -12,7 +12,7 @@
 владелец читал бы в боте `two_hypotheses`.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,9 @@ class Shown:
     alternative_type: AnnotationType | None
     state: AnnotationState
     topics: list[str]
+    # Сводный набор типов записи: одно голосовое содержит и мысль, и задачу
+    # (ADR-0012). Пусто — показывается один `type`, как было до Фазы 3.
+    types: list[AnnotationType] = field(default_factory=list)
     reminder_at: datetime | None = None
     reminder_text: str | None = None
     timezone: str = "UTC"
@@ -70,7 +73,11 @@ def _annotation_line(shown: Shown) -> str:
     if shown.state is AnnotationState.UNCLEAR:
         return UNCLEAR
 
-    line = f"📌 {NAMES[shown.type]}"
+    # Набор типов, а не один: «подумал вслух, а потом решил» — это две вещи
+    # в одной записи, и показать надо обе (ADR-0012). Порядок — как в записи.
+    types = shown.types or [shown.type]
+    line = "📌 " + " + ".join(NAMES[type_] for type_ in types)
+
     if shown.state is AnnotationState.TWO_HYPOTHESES and shown.alternative_type is not None:
         line += f" (или {NAMES[shown.alternative_type]} — уточню вечером)"
     if shown.topics:

@@ -153,7 +153,11 @@ async def test_old_entry_is_annotated_silently(migrated_database: str) -> None:
 
     assert notifier.annotated == []
     # Разметка при этом сделана — молчит только бот.
-    assert await _rows(migrated_database, select(Topic.name)) == [("поиск по архиву",)]
+    # Только темы, заведённые разметкой: базовые приходят миграцией и своей
+    # записи-источника не имеют (ADR-0011, «Обновление»).
+    assert await _rows(
+        migrated_database, select(Topic.name).where(Topic.source_entry_id.is_not(None))
+    ) == [("поиск по архиву",)]
 
 
 async def test_wrong_button_opens_the_list_of_types(

@@ -18,6 +18,7 @@ from brain.storage.models.private_mode import PrivateModeChange
 from brain.storage.models.reminder import Reminder, ReminderTrigger
 from brain.storage.models.topic import EntryTopic, Topic, normalize
 from brain.storage.models.transcript import Transcript
+from brain.storage.models.unit import EntryUnit
 
 __all__ = [
     "DIMENSIONS",
@@ -32,6 +33,7 @@ __all__ = [
     "EntryOverride",
     "EntrySource",
     "EntryTopic",
+    "EntryUnit",
     "LlmCall",
     "OverrideAction",
     "PrivateModeChange",

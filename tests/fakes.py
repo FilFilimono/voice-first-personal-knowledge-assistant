@@ -290,11 +290,42 @@ class ScriptedModel:
 
 
 def answer(*items: tuple[int, str, list[str]]) -> dict[str, Any]:
-    """Ответ прогона: тройки «запись, тип, темы»."""
+    """Ответ прогона: тройки «запись, тип, темы». Одна единица на запись.
+
+    Цитата начала первой единицы не ищется в тексте никогда — начало записи
+    это ноль, что бы модель ни процитировала (`units.locate`). Поэтому здесь
+    можно поставить что угодно, и это не упрощение теста, а свойство правила.
+    """
     return {
         "items": [
-            {"id": entry_id, "type": type_, "topics": topics, "entities": []}
+            {
+                "id": entry_id,
+                "units": [{"start": "начало записи", "type": type_}],
+                "topics": topics,
+                "entities": [],
+            }
             for entry_id, type_, topics in items
+        ]
+    }
+
+
+def answer_units(
+    entry_id: int, *units: tuple[str, str], topics: list[str] | None = None
+) -> dict[str, Any]:
+    """Ответ прогона про одну запись из нескольких единиц.
+
+    Пары «цитата начала, тип». Первая цитата не ищется, остальные обязаны
+    найтись в тексте записи — иначе нарезка не сойдётся, и это ровно то,
+    что проверяет часть тестов.
+    """
+    return {
+        "items": [
+            {
+                "id": entry_id,
+                "units": [{"start": start, "type": type_} for start, type_ in units],
+                "topics": topics or [],
+                "entities": [],
+            }
         ]
     }
 

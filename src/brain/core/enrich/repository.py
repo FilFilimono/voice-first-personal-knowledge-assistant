@@ -15,13 +15,16 @@ from datetime import datetime
 
 from sqlalchemy import delete, func, insert, select
 
-from brain.core.memory.repository import is_private_now, latest_transcript
+from brain.core.enrich.units import MergedUnit
+from brain.core.memory.repository import is_private_now, latest_transcript, latest_transcript_id
 from brain.core.ports import EntryText
 from brain.storage.db import session_scope
 from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
 from brain.storage.models.entry import Entry
+from brain.storage.models.llm_call import LlmCall
 from brain.storage.models.reminder import Reminder
 from brain.storage.models.topic import EntryTopic, Topic, normalize
+from brain.storage.models.unit import EntryUnit
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +77,25 @@ async def entries_needing_annotation(limit: int) -> list[EntryText]:
     return [EntryText(entry_id=int(row[0]), text=str(row[1]), is_private=False) for row in rows]
 
 
+async def transcript_ids(entry_ids: list[int]) -> dict[int, int | None]:
+    """Какой расшифровкой сейчас представлена каждая запись.
+
+    Отдельным запросом, а не полем в `EntryText`: `EntryText` — это граница
+    ядра (`core/ports.py`), и её видят ещё расшифровка с поиском, которым
+    идентификатор расшифровки не нужен. Один лишний запрос на пачку дешевле
+    поля, которое всем приходится игнорировать.
+    """
+    if not entry_ids:
+        return {}
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Entry.id, latest_transcript_id()).where(Entry.id.in_(entry_ids))
+            )
+        ).all()
+    return {int(row[0]): (int(row[1]) if row[1] is not None else None) for row in rows}
+
+
 async def known_topics() -> list[KnownTopic]:
     """Все темы архива, в порядке появления."""
     async with session_scope() as session:
@@ -101,6 +123,8 @@ async def save_annotation(
     model: str,
     existing_topic_ids: list[int],
     new_topics: list[NewTopic],
+    units: list[MergedUnit],
+    transcript_id: int | None,
 ) -> int:
     """Сохранить разметку записи со всем, что из неё следует. Одной транзакцией.
 
@@ -129,6 +153,29 @@ async def save_annotation(
         )
         if annotation_id is None:  # pragma: no cover — INSERT ... RETURNING без строки
             raise RuntimeError("разметка не вставилась")
+
+        if units:
+            # Единицы привязаны к этой строке разметки, а не к записи: перепрогон
+            # добавляет разметку новой строкой (как расшифровка), и его единицы
+            # ложатся рядом со старыми, а не поверх них. «Текущие единицы» —
+            # это единицы последней разметки, и спрашиваются они так же.
+            await session.execute(
+                insert(EntryUnit),
+                [
+                    {
+                        "source_entry_id": entry_id,
+                        "source_transcript_id": transcript_id,
+                        "annotation_id": annotation_id,
+                        "ordinal": ordinal,
+                        "span_start": unit.start,
+                        "span_end": unit.end,
+                        "type": unit.type,
+                        "alternative_type": unit.alternative_type,
+                        "state": unit.state,
+                    }
+                    for ordinal, unit in enumerate(units)
+                ],
+            )
 
         topic_ids = list(existing_topic_ids)
         for topic in new_topics:
@@ -250,6 +297,158 @@ async def latest_annotation(entry_id: int) -> Annotation | None:
     return found
 
 
+@dataclass(frozen=True, slots=True)
+class Regeneralization:
+    """Что осталось от списка тем после переобобщения."""
+
+    topics_after: int
+    removed: list[str]
+
+
+async def entries_since_last(purpose: str) -> int:
+    """Сколько записей появилось после последнего удавшегося вызова с таким назначением.
+
+    Временем прошлого прохода служит `llm_calls`, а не своя колонка и не журнал
+    очереди: строка там пишется внутри двери наружу и забыть её невозможно
+    (ADR-0004), а задание может исчезнуть, исчерпав попытки. Считать по данным —
+    то же правило, по которому живут `just reindex` и `just reenrich`.
+    """
+    async with session_scope() as session:
+        since = await session.scalar(
+            select(func.max(LlmCall.created_at)).where(
+                LlmCall.purpose == purpose, LlmCall.succeeded.is_(True)
+            )
+        )
+        statement = select(func.count()).select_from(Entry)
+        if since is not None:
+            statement = statement.where(Entry.created_at > since)
+        return int(await session.scalar(statement) or 0)
+
+
+async def recent_entries(limit: int) -> list[EntryText]:
+    """Последние записи с текстом — пачка, на которой считается переобобщение.
+
+    Приватные не попадают сюда вовсе, как и в разметку: их текст наружу
+    не уходит (инвариант 5), и тем у них не бывает.
+    """
+    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Entry.id, text_of)
+                .where(text_of.is_not(None), ~is_private_now())
+                .order_by(Entry.id.desc())
+                .limit(limit)
+            )
+        ).all()
+    return [
+        EntryText(entry_id=int(row[0]), text=str(row[1]), is_private=False)
+        for row in reversed(rows)
+    ]
+
+
+async def replace_topics(
+    assignments: dict[int, list[str]],
+    *,
+    vectors: dict[str, list[float]],
+    embedding_model: str,
+) -> Regeneralization:
+    """Переписать привязку тем целиком и убрать темы, которыми никто не пользуется.
+
+    Одной транзакцией: упав посередине, мы получили бы архив, у части которого
+    темы новые, а у части старые, — и отличить одно от другого было бы нечем.
+
+    **Базовые темы не удаляются.** У них нет записи-источника, потому что
+    их завела миграция, а не запись: пустая базовая тема — это список, которому
+    пока не из чего наполниться, а не мусор.
+    """
+    async with session_scope() as session:
+        by_slug = {
+            str(row[1]): int(row[0])
+            for row in (await session.execute(select(Topic.id, Topic.slug))).all()
+        }
+
+        for entry_id, names in assignments.items():
+            topic_ids: list[int] = []
+            for name in names:
+                slug = normalize(name)
+                if slug not in by_slug:
+                    created = await session.scalar(
+                        insert(Topic)
+                        .values(
+                            source_entry_id=entry_id,
+                            name=name,
+                            slug=slug,
+                            reason="заведена переобобщением: несколько записей про одно",
+                            embedding=vectors.get(name),
+                            embedding_model=embedding_model if name in vectors else None,
+                        )
+                        .returning(Topic.id)
+                    )
+                    if created is None:  # pragma: no cover — INSERT ... RETURNING без строки
+                        continue
+                    by_slug[slug] = int(created)
+                topic_ids.append(by_slug[slug])
+
+            annotation_id = await session.scalar(
+                select(Annotation.id)
+                .where(Annotation.source_entry_id == entry_id)
+                .order_by(Annotation.id.desc())
+                .limit(1)
+            )
+            if annotation_id is None:
+                # Запись ещё не размечена — привязать тему не к чему.
+                # Её разберёт разметка, а следующий проход подхватит.
+                continue
+
+            await session.execute(delete(EntryTopic).where(EntryTopic.source_entry_id == entry_id))
+            if topic_ids:
+                await session.execute(
+                    insert(EntryTopic),
+                    [
+                        {
+                            "source_entry_id": entry_id,
+                            "topic_id": topic_id,
+                            "annotation_id": int(annotation_id),
+                        }
+                        for topic_id in dict.fromkeys(topic_ids)
+                    ],
+                )
+
+        used = select(EntryTopic.topic_id).distinct().scalar_subquery()
+        removed = (
+            await session.scalars(
+                delete(Topic)
+                .where(Topic.source_entry_id.is_not(None), Topic.id.not_in(used))
+                .returning(Topic.name)
+            )
+        ).all()
+        left = await session.scalar(select(func.count()).select_from(Topic)) or 0
+
+    return Regeneralization(topics_after=int(left), removed=[str(name) for name in removed])
+
+
+async def unit_types_of(annotation_id: int) -> list[AnnotationType]:
+    """Типы единиц этого разбора, по порядку и без повторов.
+
+    Это и есть «сводный набор типов записи» из ADR-0012. Отдельной колонки
+    под него нет намеренно: свод целиком выводится из единиц, а вторая копия
+    однажды разойдётся с первой — ровно как разошлась бы таблица перевода
+    типов, от которой отказался ADR-0011.
+    """
+    async with session_scope() as session:
+        rows = await session.scalars(
+            select(EntryUnit.type)
+            .where(EntryUnit.annotation_id == annotation_id)
+            .order_by(EntryUnit.ordinal)
+        )
+    seen: list[AnnotationType] = []
+    for type_ in rows:
+        if type_ not in seen:
+            seen.append(type_)
+    return seen
+
+
 async def topics_of(entry_id: int) -> list[str]:
     """Имена тем записи — то, что показывают владельцу."""
     async with session_scope() as session:
@@ -272,6 +471,9 @@ async def drop_annotations(entry_id: int) -> int:
     """
     async with session_scope() as session:
         await session.execute(delete(EntryTopic).where(EntryTopic.source_entry_id == entry_id))
+        # Единицы уходят вместе с разметкой каскадом, а не строкой здесь:
+        # удаление разметки бывает в двух местах, и второе про единицы забыло
+        # бы. Поймано тестом, а не рассуждением.
         removed = (
             await session.scalars(
                 delete(Annotation)

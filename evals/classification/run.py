@@ -130,13 +130,13 @@ async def judge(labelled: list[Labelled], *, model_name: str | None, batch: int)
                         purpose="eval-classification",
                     )
                 ).data,
-                {entry.entry_id for entry in entries},
+                {entry.entry_id: entry.text for entry in entries},
             )
             for _ in range(service.RUNS)
         ]
 
         for item in chunk:
-            merged = service._merge([run.get(item.entry_id) for run in runs])
+            merged = service._merge([run.get(item.entry_id) for run in runs], texts[item.entry_id])
             judged.append(
                 Judged(
                     entry_id=item.entry_id,

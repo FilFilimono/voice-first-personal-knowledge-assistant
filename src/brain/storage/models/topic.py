@@ -46,9 +46,13 @@ class Topic(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    # На какой записи тема появилась. Инвариант 4 без исключений.
-    source_entry_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("entries.id", ondelete="RESTRICT"), nullable=False, index=True
+    # На какой записи тема появилась. NULL — базовая тема: она не появилась
+    # на записи, а задана решением владельца до того, как записи были вообще.
+    # Инвариант 4 говорит про производные записи, а базовая тема не производная;
+    # отдельного флага «базовая» нет намеренно — два способа сказать одно и то же
+    # однажды разойдутся (ADR-0011, блок «Обновление»).
+    source_entry_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("entries.id", ondelete="RESTRICT"), nullable=True, index=True
     )
 
     name: Mapped[str] = mapped_column(Text, nullable=False)

@@ -196,6 +196,8 @@ async def test_status_reports_the_worker_first(
         jobs_failed=0,
         next_reminder=None,
         private_mode=False,
+        topics=9,
+        archive_age_days=60,
     )
 
     async def fake_collect() -> SystemStatus:

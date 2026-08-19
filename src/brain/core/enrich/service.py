@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from brain.core import llm
-from brain.core.enrich import candidates, prompt, repository
+from brain.core.enrich import candidates, prompt, repository, units
 from brain.core.ports import Embedder, EntryText, LanguageModel
 from brain.core.retrieval.embeddings import embed_topic_names
 from brain.storage.models.annotation import AnnotationState, AnnotationType
@@ -61,7 +61,10 @@ TOPIC_LIST_LIMIT = 150
 class Item:
     """Что один прогон сказал про одну запись."""
 
-    type: AnnotationType
+    units: list[units.Unit]
+    # Сошлась ли нарезка. Не сошлась — единица одна на всю запись, и запись
+    # уедет в «не понял»: это отказ, а не запись без переключений (ADR-0012).
+    segmented: bool
     topics: list[str]
     entities: list[str]
     reason: str | None
@@ -71,6 +74,7 @@ class Item:
 class Merged:
     """Что из двух прогонов получилось."""
 
+    units: list[units.MergedUnit]
     type: AnnotationType
     alternative_type: AnnotationType | None
     state: AnnotationState
@@ -114,10 +118,12 @@ async def annotate_pending(
     system = prompt.build_system([topic.name for topic in known])
     by_slug = {topic.slug: topic for topic in known}
 
+    texts = {entry.entry_id: entry.text for entry in entries}
     runs = [await _run(model, entries, system) for _ in range(RUNS)]
 
     merged = {
-        entry.entry_id: _merge([run.get(entry.entry_id) for run in runs]) for entry in entries
+        entry.entry_id: _merge([run.get(entry.entry_id) for run in runs], texts[entry.entry_id])
+        for entry in entries
     }
 
     # Вектора новых тем считаются один раз на пачку: одну и ту же тему могут
@@ -129,6 +135,9 @@ async def annotate_pending(
         if normalize(name) not in by_slug
     }
     vectors = await _topic_vectors(embedder, list(fresh.values()))
+
+    # Над каким текстом посчитаны отрезки. Спрашивается один раз на пачку.
+    transcripts = await repository.transcript_ids([entry.entry_id for entry in entries])
 
     saved: list[int] = []
     for entry_id, result in merged.items():
@@ -156,6 +165,8 @@ async def annotate_pending(
             model=model.model,
             existing_topic_ids=existing,
             new_topics=new_topics,
+            units=result.units,
+            transcript_id=transcripts.get(entry_id),
         )
         saved.append(entry_id)
 
@@ -190,31 +201,45 @@ async def _run(
         temperature=TEMPERATURE,
         purpose=PURPOSE,
     )
-    return _parse(completion.data, {entry.entry_id for entry in entries})
+    return _parse(completion.data, {entry.entry_id: entry.text for entry in entries})
 
 
-def _parse(data: dict[str, Any], expected: set[int]) -> dict[int, Item | None]:
+def _parse(data: dict[str, Any], texts: dict[int, str]) -> dict[int, Item | None]:
     """Разобрать ответ прогона, не принимая чужие идентификаторы за свои.
 
     Модель может вернуть запись, которой в пачке не было, — и это не курьёз:
     в пачке идентификаторы идут подряд, и ошибиться на единицу легко. Молча
     приняв такой ответ, мы приписали бы разметку чужой записи.
+
+    Здесь же цитаты начал превращаются в отрезки. Не сошлись — запись получает
+    одну единицу на всё и поедет в «не понял»: см. `units.locate`.
     """
     items: dict[int, Item | None] = {}
     for raw in data.get("items", []):
         try:
             entry_id = int(raw["id"])
-            type_ = AnnotationType(raw["type"])
+            starts = [
+                (str(unit["start"]), AnnotationType(unit["type"])) for unit in raw["units"] or []
+            ]
         except (KeyError, TypeError, ValueError):
             logger.warning("разметка не разобрана: %s", str(raw)[:200])
             continue
 
-        if entry_id not in expected:
+        if entry_id not in texts:
             logger.warning("модель вернула запись %s, которой в пачке не было", entry_id)
             continue
+        if not starts:
+            logger.warning("модель не вернула ни одной единицы для записи %s", entry_id)
+            continue
+
+        text = texts[entry_id]
+        located = units.locate(text, starts)
+        if located is None:
+            logger.info("запись %s: нарезка не сошлась, беру запись целиком", entry_id)
 
         items[entry_id] = Item(
-            type=type_,
+            units=located if located is not None else units.whole(text, starts[0][1]),
+            segmented=located is not None,
             topics=[str(name) for name in raw.get("topics", []) if str(name).strip()],
             entities=[str(name) for name in raw.get("entities", []) if str(name).strip()],
             reason=(str(raw["new_topic_reason"]) if raw.get("new_topic_reason") else None),
@@ -222,31 +247,61 @@ def _parse(data: dict[str, Any], expected: set[int]) -> dict[int, Item | None]:
     return items
 
 
-def _merge(items: list[Item | None]) -> Merged:
-    """Свести прогоны в одну разметку. Правило целиком — в ADR-0011."""
+def _merge(items: list[Item | None], text: str) -> Merged:
+    """Свести прогоны в одну разметку. Правило целиком — в ADR-0011 и ADR-0012.
+
+    Состояние считается **по единице**, а состояние записи собирается из них:
+    одна запись может содержать бесспорную задачу и спорную мысль, и называть
+    её целиком спорной было бы неправдой в обе стороны.
+    """
     first, second = items[0], items[1]
 
     if first is None or second is None:
-        # Пропуск записи прогоном — единственный источник «не понял» в Фазе 3,
-        # и это сказано вслух в ADR-0011. Тип берётся у того прогона, который
-        # ответил; если молчали оба, честнее всего `noise`: система не поняла,
-        # что это за запись, и разбирать в ней нечего.
+        # Пропуск записи прогоном — источник «не понял», как и было в ADR-0011.
+        # Разметка берётся у того прогона, который ответил; если молчали оба,
+        # честнее всего `noise`: система не поняла, что это за запись.
         answered = first or second
         logger.info("прогон пропустил запись: состояние «не понял»")
+        fallback = answered.units if answered else units.whole(text or " ", AnnotationType.NOISE)
+        unclear = [
+            units.MergedUnit(
+                start=unit.start,
+                end=unit.end,
+                type=unit.type,
+                alternative_type=None,
+                state=AnnotationState.UNCLEAR,
+            )
+            for unit in fallback
+        ]
+        type_, alternative = units.summary(unclear)
         return Merged(
-            type=answered.type if answered else AnnotationType.NOISE,
-            alternative_type=None,
+            units=unclear,
+            type=type_,
+            alternative_type=alternative,
             state=AnnotationState.UNCLEAR,
             topics=[],
             entities=answered.entities if answered else [],
             reason=None,
         )
 
-    agreed = first.type is second.type
+    merged_units = units.merge(first.units, second.units)
+    type_, alternative = units.summary(merged_units)
+
+    # Не сошлась нарезка хотя бы у одного прогона — запись целиком «не понял».
+    # Типы при этом сохраняются: они могут быть верны, а вот утверждать, что
+    # разбор полный, оснований нет.
+    if not (first.segmented and second.segmented):
+        state = AnnotationState.UNCLEAR
+    elif any(unit.state is AnnotationState.TWO_HYPOTHESES for unit in merged_units):
+        state = AnnotationState.TWO_HYPOTHESES
+    else:
+        state = AnnotationState.SURE
+
     return Merged(
-        type=first.type,
-        alternative_type=None if agreed else second.type,
-        state=AnnotationState.SURE if agreed else AnnotationState.TWO_HYPOTHESES,
+        units=merged_units,
+        type=type_,
+        alternative_type=alternative,
+        state=state,
         topics=_agreed(first.topics, second.topics),
         entities=_agreed(first.entities, second.entities),
         reason=first.reason or second.reason,

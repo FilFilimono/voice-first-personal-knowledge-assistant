@@ -21,6 +21,7 @@ from brain.core.enrich.repository import (
     rows_for_reply,
     topics_of,
     unannotated_count,
+    unit_types_of,
 )
 from brain.core.enrich.service import PURPOSE, Outcome, annotate_pending
 
@@ -39,4 +40,5 @@ __all__ = [
     "rows_for_reply",
     "topics_of",
     "unannotated_count",
+    "unit_types_of",
 ]

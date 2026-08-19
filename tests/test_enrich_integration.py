@@ -7,6 +7,8 @@
 5. одна и та же новая тема в одной пачке заводится один раз, а не дважды
 6. размеченная запись больше в пачку не попадает
 7. записи размечаются той моделью, которой размечались, — провенанс на месте
+8. запись из мысли и события получает **две единицы**, а не одну метку
+9. единицы уходят вместе с разметкой, когда запись делают приватной
 
 Тексты берутся из **живого архива** по номерам записей: разметка разбирает
 живую речь с ошибками расшифровки, и «похожая» строка из головы ломает код
@@ -25,8 +27,9 @@ from brain.core.enrich import repository, service
 from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
 from brain.storage.models.entry import Entry, EntryKind, EntrySource
 from brain.storage.models.topic import EntryTopic, Topic
+from brain.storage.models.unit import EntryUnit
 from tests import archive as archive_module
-from tests.fakes import ScriptedModel, StubEmbedder, answer
+from tests.fakes import ScriptedModel, StubEmbedder, answer, answer_units
 
 pytestmark = pytest.mark.integration
 
@@ -145,7 +148,11 @@ async def test_topic_needs_both_runs(
     )
     await service.annotate_pending(model, StubEmbedder(), limit=25)
 
-    topics = await _rows(migrated_database, select(Topic.name))
+    # Базовые темы заводятся миграцией и записи-источника не имеют, поэтому
+    # спрашиваются только те, что завела разметка (ADR-0011, «Обновление»).
+    topics = await _rows(
+        migrated_database, select(Topic.name).where(Topic.source_entry_id.is_not(None))
+    )
     assert [row[0] for row in topics] == ["разработка бота"]
 
 
@@ -163,7 +170,10 @@ async def test_same_new_topic_in_one_batch_is_created_once(
 
     await service.annotate_pending(model, StubEmbedder(), limit=25)
 
-    topics = await _rows(migrated_database, select(Topic.id, Topic.name))
+    topics = await _rows(
+        migrated_database,
+        select(Topic.id, Topic.name).where(Topic.source_entry_id.is_not(None)),
+    )
     assert len(topics) == 1
     links = await _rows(migrated_database, select(EntryTopic.source_entry_id))
     assert len(links) == 2
@@ -219,3 +229,66 @@ async def test_unannotated_count_falls_to_zero(
     await service.annotate_pending(model, StubEmbedder(), limit=25)
 
     assert await repository.unannotated_count() == 0
+
+
+async def test_entry_gets_a_unit_per_type_not_one_label(
+    migrated_database: str, archive: list[archive_module.Entry]
+) -> None:
+    """Главное, ради чего написан ADR-0012.
+
+    Запись 8 живого архива — «во вторник в 9:00 у меня экзамен по ГАИ» плюс
+    «я пока не чувствую себя уверенно». Событие и мысль в одной записи;
+    до ADR-0012 вторая половина не доходила до владельца вовсе.
+
+    Цитата начала берётся **из живого текста**, а не придумывается: цитата
+    из головы найдётся не там или не найдётся вовсе — ровно та ошибка,
+    из-за которой напоминания дважды чинились в Фазе 1.
+    """
+    ids = await _load_live(migrated_database, archive, (8,))
+    entry_id = ids[8]
+    text = archive_module.entry(archive, 8).text
+    second_half = text[text.index(".") + 2 :][:20]
+
+    model = ScriptedModel([answer_units(entry_id, ("начало", "event"), (second_half, "thought"))])
+    await service.annotate_pending(model, StubEmbedder(), limit=25)
+
+    units = await _rows(
+        migrated_database,
+        select(
+            EntryUnit.ordinal, EntryUnit.type, EntryUnit.span_start, EntryUnit.span_end
+        ).order_by(EntryUnit.ordinal),
+    )
+    assert [row[1] for row in units] == [AnnotationType.EVENT, AnnotationType.THOUGHT]
+    # Единицы покрывают запись целиком и встык — дыра означала бы потерянный текст.
+    assert units[0][2] == 0
+    assert units[0][3] == units[1][2]
+    assert units[-1][3] == len(text)
+
+    annotation = await repository.latest_annotation(entry_id)
+    assert annotation is not None
+    assert await repository.unit_types_of(annotation.id) == [
+        AnnotationType.EVENT,
+        AnnotationType.THOUGHT,
+    ]
+
+
+async def test_units_go_away_with_their_annotation(
+    migrated_database: str, archive: list[archive_module.Entry]
+) -> None:
+    """Кнопка «сделать приватной» удаляет разметку — единицы обязаны уйти с ней.
+
+    Держались бы они внешним ключом — падала бы вся ретроактивная приватность,
+    то есть путь инварианта 5. Каскад проверяется здесь, а не в модели: то,
+    что написано в `ondelete`, значит что-то только на живой базе.
+    """
+    ids = await _load_live(migrated_database, archive, (8,))
+    entry_id = ids[8]
+    model = ScriptedModel([answer((entry_id, "event", []))])
+    await service.annotate_pending(model, StubEmbedder(), limit=25)
+
+    assert await _rows(migrated_database, select(EntryUnit.id)) != []
+
+    removed = await repository.drop_annotations(entry_id)
+
+    assert removed == 1
+    assert await _rows(migrated_database, select(EntryUnit.id)) == []

@@ -27,6 +27,7 @@ from brain.storage.db import session_scope
 from brain.storage.models.annotation import AnnotationState
 from brain.storage.models.entry import Entry, EntryKind
 from brain.storage.models.reminder import Reminder
+from brain.storage.models.topic import Topic
 from brain.storage.models.transcript import Transcript
 
 
@@ -76,6 +77,11 @@ class SystemStatus:
     jobs_failed: int
     next_reminder: NextReminder | None
     private_mode: bool
+    # Чем система пока не может быть полезна и почему. Механизмы возврата
+    # из vision предполагают архив, которого ещё нет: они не ломаются,
+    # а тихо ничего не делают, и отличить это от поломки владелец не может.
+    topics: int
+    archive_age_days: int
 
 
 def _waiting(counts: dict[AnnotationState, int]) -> int:
@@ -128,6 +134,11 @@ async def collect() -> SystemStatus:
         # Именно так и было до 18 августа 2026.
         trigrams = await session.scalar(text("SELECT array_length(show_trgm('кошка'), 1)"))
 
+        topics = await session.scalar(select(func.count()).select_from(Topic)) or 0
+        # Возраст архива, а не число записей: «нужна неделя» — это про время,
+        # и двадцать записей за один вечер недели не делают.
+        oldest = await session.scalar(select(func.min(Entry.created_at)))
+
         last_beat = await session.scalar(
             text("SELECT last_run FROM pgqueuer_schedules WHERE entrypoint = :name"),
             {"name": HEARTBEAT},
@@ -159,4 +170,6 @@ async def collect() -> SystemStatus:
             None if upcoming is None else NextReminder(fire_at=upcoming[0], text=upcoming[1])
         ),
         private_mode=await repository.is_private_mode(),
+        topics=int(topics),
+        archive_age_days=0 if oldest is None else (datetime.now(UTC) - oldest).days,
     )

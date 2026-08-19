@@ -38,6 +38,8 @@ from brain.core.scheduler.queue import (
     HEARTBEAT,
     HEARTBEAT_SCHEDULE,
     INDEX,
+    REGENERALIZE,
+    REGENERALIZE_SCHEDULE,
     REMINDER,
     TRANSCRIBE,
 )
@@ -178,6 +180,15 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     @pgq.sm.schedule(AUDIO_RETENTION, AUDIO_RETENTION_SCHEDULE)
     async def clean_audio(schedule: Schedule) -> None:
         await jobs.clean_audio(retention_days=settings.audio_retention_days)
+
+    @pgq.sm.schedule(REGENERALIZE, REGENERALIZE_SCHEDULE)
+    async def regeneralize(schedule: Schedule) -> None:
+        """Переобобщение тем. Срабатывает по накоплению, а не по расписанию.
+
+        Расписание здесь только повод посмотреть: сам проход считает, сколько
+        записей появилось с прошлого раза, и на трёх новых не делает ничего.
+        """
+        await jobs.regeneralize_topics(model=model, embedder=embedder)
 
     @pgq.sm.schedule(HEARTBEAT, HEARTBEAT_SCHEDULE)
     async def heartbeat(schedule: Schedule) -> None:

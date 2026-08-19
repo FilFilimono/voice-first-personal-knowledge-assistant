@@ -33,6 +33,10 @@ def _status(
     jobs_failed: int = 0,
     next_reminder: NextReminder | None = None,
     private_mode: bool = False,
+    # По умолчанию архив уже взрослый: большинство тестов проверяют не разгон,
+    # а обычную работу, и блок «система разгоняется» им только мешал бы.
+    topics: int = 9,
+    archive_age_days: int = 60,
 ) -> SystemStatus:
     last_beat = None if silent_for is None else datetime.now(UTC) - silent_for
     return SystemStatus(
@@ -47,6 +51,8 @@ def _status(
         jobs_failed=jobs_failed,
         next_reminder=next_reminder,
         private_mode=private_mode,
+        topics=topics,
+        archive_age_days=archive_age_days,
     )
 
 
@@ -116,3 +122,39 @@ def test_reminder_is_shown_in_the_owners_timezone() -> None:
 def test_private_mode_is_visible() -> None:
     assert "🔒" in render(_status(private_mode=True), timezone=TIMEZONE)
     assert "🔓" in render(_status(private_mode=False), timezone=TIMEZONE)
+
+
+def test_warming_up_block_explains_what_waits_for_content() -> None:
+    """Молчащий механизм и сломанный снаружи неотличимы — поэтому объясняем."""
+    report = render(_status(entries=39, topics=2, archive_age_days=4), timezone=TIMEZONE)
+
+    assert "📊 Система пока разгоняется" in report
+    assert "Записей: 39, тем: 2, архиву 4 дня." in report
+    assert "• пересказ недели — нужна неделя записей, пока 4 дня" in report
+    assert "• напоминания о старом — доставать пока нечего, архиву 4 дня" in report
+
+
+def test_warming_up_says_nothing_about_links() -> None:
+    """Про связи правды пока нет: порог из ADR-0006 пропускает 37% всех пар.
+
+    Написать «пока рано» было бы неправдой — они не молчат, а сработают
+    слишком часто. Молчим до тех пор, пока инструмент не выбран.
+    """
+    report = render(_status(entries=39, topics=2, archive_age_days=4), timezone=TIMEZONE)
+
+    assert "связ" not in report.lower()
+    assert "переклик" not in report.lower()
+
+
+def test_grown_archive_has_no_warming_up_block() -> None:
+    """Блок исчезает сам: разгон кончился — про него больше не пишем."""
+    report = render(_status(entries=400, topics=20, archive_age_days=90), timezone=TIMEZONE)
+
+    assert "разгоняется" not in report
+
+
+def test_days_are_declined_like_russian_words() -> None:
+    """«архиву 1 дней» читается как поломка, даже когда всё работает."""
+    for days, expected in ((1, "1 день"), (2, "2 дня"), (5, "5 дней"), (11, "11 дней")):
+        report = render(_status(archive_age_days=days, topics=1), timezone=TIMEZONE)
+        assert f"архиву {expected}" in report

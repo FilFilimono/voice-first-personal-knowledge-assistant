@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from brain.core import enrich as enrichment
 from brain.core import stt
+from brain.core.enrich import regeneralize as regeneralization
 from brain.core.memory import audio as audio_store
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
@@ -336,6 +337,7 @@ async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
             type=annotation.type,
             alternative_type=annotation.alternative_type,
             state=annotation.state,
+            types=await enrichment.unit_types_of(annotation.id),
             topics=await enrichment.topics_of(row.entry_id),
             reminder_at=row.reminder_at,
             reminder_text=row.reminder_text,
@@ -356,3 +358,23 @@ async def clean_audio(*, retention_days: int) -> int:
     if removed:
         logger.info("удалено файлов аудио по ретеншену: %s", removed)
     return removed
+
+
+async def regeneralize_topics(*, model: LanguageModel, embedder: Embedder) -> int:
+    """Переобобщить темы, если накопилось достаточно записей. Иначе — не звать модель.
+
+    Срабатывание считается по данным, а не по расписанию: расписание здесь
+    только повод посмотреть. Проход на трёх новых записях стоил бы столько же,
+    сколько на сорока, и не дал бы ничего — обобщать снова было бы не из чего.
+    """
+    accumulated = await regeneralization.due()
+    if accumulated < regeneralization.EVERY:
+        logger.info(
+            "переобобщение пропущено: с прошлого прохода %s записей из %s",
+            accumulated,
+            regeneralization.EVERY,
+        )
+        return 0
+
+    outcome = await regeneralization.regeneralize(model, embedder)
+    return outcome.topics_after
