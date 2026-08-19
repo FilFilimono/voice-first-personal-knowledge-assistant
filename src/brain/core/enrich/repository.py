@@ -1,0 +1,322 @@
+"""Чтение и запись разметки.
+
+Отдельно от `service.py` намеренно: там правило, по которому из двух прогонов
+получается одна разметка, здесь — SQL. Смешав их, мы получили бы файл, где
+самое интересное тонет среди вставок.
+
+**Приватность здесь спрашивается всегда через `is_private_now()`.** Запись,
+сделанную приватной задним числом, колонка `entries.is_private` по-прежнему
+считает обычной — таблица не правится (инвариант 3). Разметка такой записи
+удаляется кнопкой и не должна появиться снова при следующем проходе.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from sqlalchemy import delete, func, insert, select
+
+from brain.core.memory.repository import is_private_now, latest_transcript
+from brain.core.ports import EntryText
+from brain.storage.db import session_scope
+from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
+from brain.storage.models.entry import Entry
+from brain.storage.models.reminder import Reminder
+from brain.storage.models.topic import EntryTopic, Topic, normalize
+
+
+@dataclass(frozen=True, slots=True)
+class KnownTopic:
+    """Тема, как её видит разметка."""
+
+    id: int
+    name: str
+    slug: str
+    # Вектор названия мог не посчитаться: провайдер эмбеддингов лежал в момент
+    # заведения темы. Отбор кандидатов обязан знать об этом — тему без вектора
+    # он не найдёт никогда и должен показывать её всегда.
+    embedding_missing: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class NewTopic:
+    """Тема, которой ещё нет. Заводится только с обоснованием (ADR-0011)."""
+
+    name: str
+    reason: str | None
+    embedding: list[float] | None
+    embedding_model: str | None
+
+
+async def entries_needing_annotation(limit: int) -> list[EntryText]:
+    """Записи, которые ещё не размечены. Считается по данным, а не по очереди.
+
+    Так же устроены `just reindex` и `just requeue-transcripts`, и по той же
+    причине: задание может исчезнуть — из-за исчерпанных попыток, из-за падения
+    между записью и постановкой, — а данные остаются.
+
+    Приватные не попадают сюда вовсе: их разметки не бывает (инвариант 5,
+    ADR-0002). Дверь в `core/llm` проверит это ещё раз, но приватная запись
+    не должна доходить до двери — она должна не попадать в пачку.
+    """
+    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    annotated = select(Annotation.id).where(Annotation.source_entry_id == Entry.id).exists()
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Entry.id, text_of)
+                .where(text_of.is_not(None), ~is_private_now(), ~annotated)
+                .order_by(Entry.id)
+                .limit(limit)
+            )
+        ).all()
+
+    return [EntryText(entry_id=int(row[0]), text=str(row[1]), is_private=False) for row in rows]
+
+
+async def known_topics() -> list[KnownTopic]:
+    """Все темы архива, в порядке появления."""
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Topic.id, Topic.name, Topic.slug, Topic.embedding.is_(None)).order_by(
+                    Topic.id
+                )
+            )
+        ).all()
+    return [
+        KnownTopic(id=int(r[0]), name=str(r[1]), slug=str(r[2]), embedding_missing=bool(r[3]))
+        for r in rows
+    ]
+
+
+async def save_annotation(
+    *,
+    entry_id: int,
+    type_: AnnotationType,
+    alternative_type: AnnotationType | None,
+    state: AnnotationState,
+    entities: list[str],
+    provider: str,
+    model: str,
+    existing_topic_ids: list[int],
+    new_topics: list[NewTopic],
+) -> int:
+    """Сохранить разметку записи со всем, что из неё следует. Одной транзакцией.
+
+    Вместе с разметкой пишутся новые темы и привязка тем к записи. Раздельными
+    транзакциями это писать нельзя: упав между ними, мы получили бы разметку
+    без тем и никакого следа о том, что так вышло, — или тему, которую никто
+    не приписал. Это та же дыра, что с расшифровкой без задания на индексацию,
+    только тише.
+
+    Привязка тем перезаписывается целиком: перепрогон обязан быть идемпотентным
+    ровно так же, как пересчёт чанков.
+    """
+    async with session_scope() as session:
+        annotation_id = await session.scalar(
+            insert(Annotation)
+            .values(
+                source_entry_id=entry_id,
+                type=type_,
+                alternative_type=alternative_type,
+                state=state,
+                entities=entities,
+                provider=provider,
+                model=model,
+            )
+            .returning(Annotation.id)
+        )
+        if annotation_id is None:  # pragma: no cover — INSERT ... RETURNING без строки
+            raise RuntimeError("разметка не вставилась")
+
+        topic_ids = list(existing_topic_ids)
+        for topic in new_topics:
+            slug = normalize(topic.name)
+            # Тема могла появиться в этой же пачке — на соседней записи.
+            # Поэтому не «проверим и вставим», а вставка с разрешением конфликта:
+            # проверка перед вставкой пропустила бы обе.
+            existing = await session.scalar(select(Topic.id).where(Topic.slug == slug))
+            if existing is not None:
+                topic_ids.append(int(existing))
+                continue
+
+            created = await session.scalar(
+                insert(Topic)
+                .values(
+                    source_entry_id=entry_id,
+                    name=topic.name,
+                    slug=slug,
+                    reason=topic.reason,
+                    embedding=topic.embedding,
+                    embedding_model=topic.embedding_model,
+                )
+                .returning(Topic.id)
+            )
+            if created is not None:
+                topic_ids.append(int(created))
+
+        await session.execute(delete(EntryTopic).where(EntryTopic.source_entry_id == entry_id))
+        if topic_ids:
+            await session.execute(
+                insert(EntryTopic),
+                [
+                    {
+                        "source_entry_id": entry_id,
+                        "topic_id": topic_id,
+                        "annotation_id": annotation_id,
+                    }
+                    for topic_id in dict.fromkeys(topic_ids)
+                ],
+            )
+
+    return int(annotation_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyRow:
+    """Всё, что нужно, чтобы пересобрать сообщение владельцу."""
+
+    entry_id: int
+    chat_id: int | None
+    ack_message_id: int | None
+    created_at: datetime
+    timezone: str
+    kind: str
+    text: str
+    reminder_at: datetime | None
+    reminder_text: str | None
+
+
+async def rows_for_reply(entry_ids: list[int]) -> list[ReplyRow]:
+    """Данные для сообщения о готовой разметке.
+
+    Собирается запросом, а не дописыванием к тому, что уже показано: текст
+    подтверждения живёт в Telegram, прочитать его нельзя — только заменить.
+    Значит, всё, что там было, надо уметь восстановить из базы.
+    """
+    if not entry_ids:
+        return []
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(
+                    Entry.id,
+                    Entry.meta["chat_id"].astext,
+                    Entry.meta["ack_message_id"].astext,
+                    Entry.created_at,
+                    Entry.timezone,
+                    Entry.kind,
+                    func.coalesce(latest_transcript(), Entry.raw_text),
+                    Reminder.fire_at,
+                    Reminder.text,
+                )
+                .outerjoin(Reminder, Reminder.source_entry_id == Entry.id)
+                .where(Entry.id.in_(entry_ids))
+                .order_by(Entry.id)
+            )
+        ).all()
+
+    return [
+        ReplyRow(
+            entry_id=int(row[0]),
+            chat_id=int(row[1]) if row[1] else None,
+            ack_message_id=int(row[2]) if row[2] else None,
+            created_at=row[3],
+            timezone=str(row[4]),
+            kind=str(row[5]),
+            text=str(row[6] or ""),
+            reminder_at=row[7],
+            reminder_text=row[8],
+        )
+        for row in rows
+    ]
+
+
+async def latest_annotation(entry_id: int) -> Annotation | None:
+    """Текущая разметка записи — последняя по времени.
+
+    Перепрогон другой моделью добавляет строку, а не правит старую, поэтому
+    «текущая» это всегда «последняя», а не «единственная».
+    """
+    async with session_scope() as session:
+        found: Annotation | None = await session.scalar(
+            select(Annotation)
+            .where(Annotation.source_entry_id == entry_id)
+            .order_by(Annotation.id.desc())
+            .limit(1)
+        )
+    return found
+
+
+async def topics_of(entry_id: int) -> list[str]:
+    """Имена тем записи — то, что показывают владельцу."""
+    async with session_scope() as session:
+        rows = await session.scalars(
+            select(Topic.name)
+            .join(EntryTopic, EntryTopic.topic_id == Topic.id)
+            .where(EntryTopic.source_entry_id == entry_id)
+            .order_by(Topic.id)
+        )
+    return list(rows)
+
+
+async def drop_annotations(entry_id: int) -> int:
+    """Убрать разметку записи целиком — вместе с привязкой тем.
+
+    Зовётся кнопкой «сделать приватной»: у приватной записи аннотаций не бывает
+    (ADR-0002, инвариант схемы 4). Темы, заведённые этой записью, при этом
+    остаются: имя темы — не текст записи, и удаление сломало бы привязки других
+    записей. Это названо вслух в тексте, который видит владелец.
+    """
+    async with session_scope() as session:
+        await session.execute(delete(EntryTopic).where(EntryTopic.source_entry_id == entry_id))
+        removed = (
+            await session.scalars(
+                delete(Annotation)
+                .where(Annotation.source_entry_id == entry_id)
+                .returning(Annotation.id)
+            )
+        ).all()
+    return len(removed)
+
+
+async def counts_by_state() -> dict[AnnotationState, int]:
+    """Сколько записей в каком состоянии — по текущей разметке каждой.
+
+    Нужно `/status`: «две гипотезы» и «не понял» — это очередь на вечерний
+    разбор, и её размер должен быть виден с телефона, а не только в базе.
+    """
+    latest = (
+        select(
+            Annotation.source_entry_id,
+            func.max(Annotation.id).label("id"),
+        )
+        .group_by(Annotation.source_entry_id)
+        .subquery()
+    )
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Annotation.state, func.count())
+                .join(latest, latest.c.id == Annotation.id)
+                .group_by(Annotation.state)
+            )
+        ).all()
+    return {AnnotationState(row[0]): int(row[1]) for row in rows}
+
+
+async def unannotated_count() -> int:
+    """Сколько записей ещё ждут разметки."""
+    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    annotated = select(Annotation.id).where(Annotation.source_entry_id == Entry.id).exists()
+
+    async with session_scope() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(Entry)
+            .where(text_of.is_not(None), ~is_private_now(), ~annotated)
+        )
+    return int(count or 0)

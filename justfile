@@ -54,6 +54,15 @@ requeue-transcripts *args:
 reindex *args:
     uv run python -m brain.maintenance reindex {{args}}
 
+# Записи без разметки. Список считается по данным, а не по журналу очереди.
+reenrich *args:
+    uv run python -m brain.maintenance reenrich {{args}}
+
+# Прогон eval классификации: accuracy, матрица ошибок, доля ошибок среди
+# «уверен». Разметку набора делает владелец — иначе меряем модель моделью.
+eval-classification *args:
+    uv run python -m evals.classification.run {{args}}
+
 # Прогон eval-набора ретривала: recall@5, MRR и recall по каналам.
 # Без числа отсюда Фаза 2 не закрыта.
 eval-retrieval *args:

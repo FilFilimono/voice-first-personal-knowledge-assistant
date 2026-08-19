@@ -7,7 +7,7 @@
 
 from sqlalchemy import delete, func, insert, select
 
-from brain.core.memory.repository import latest_transcript
+from brain.core.memory.repository import is_private_now, latest_transcript
 from brain.storage.db import session_scope
 from brain.storage.models.chunk import Chunk
 from brain.storage.models.entry import Entry
@@ -77,8 +77,14 @@ async def entries_needing_index() -> list[int]:
     - у обычной (не приватной) записи есть чанк без вектора;
     - у приватной записи в чанке вектор есть — этого быть не должно вовсе,
       и пересчёт его уберёт.
+
+    Приватность берётся `is_private_now()`, а не из колонки. Разница
+    не косметическая: запись, сделанную приватной задним числом, кнопка чистит
+    сразу, но по колонке она осталась обычной — и первый же пересчёт вернул бы
+    ей вектор, то есть отправил бы текст наружу второй раз.
     """
     text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    is_private = is_private_now()
     has_chunks = select(Chunk.id).where(Chunk.source_entry_id == Entry.id).exists()
     missing_vector = (
         select(Chunk.id)
@@ -96,9 +102,7 @@ async def entries_needing_index() -> list[int]:
             select(Entry.id)
             .where(
                 text_of.is_not(None),
-                ~has_chunks
-                | (~Entry.is_private & missing_vector)
-                | (Entry.is_private & stray_vector),
+                ~has_chunks | (~is_private & missing_vector) | (is_private & stray_vector),
             )
             .order_by(Entry.id)
         )

@@ -19,10 +19,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
 
+from brain.core import enrich
 from brain.core.memory import repository
 from brain.core.retrieval import repository as retrieval
 from brain.core.scheduler.queue import HEARTBEAT, HEARTBEAT_STALE_MINUTES
 from brain.storage.db import session_scope
+from brain.storage.models.annotation import AnnotationState
 from brain.storage.models.entry import Entry, EntryKind
 from brain.storage.models.reminder import Reminder
 from brain.storage.models.transcript import Transcript
@@ -64,11 +66,26 @@ class SystemStatus:
     entries: int
     voice_without_transcript: int
     entries_without_index: int
+    # Не размечено и ждёт вечернего разбора. Две разные беды: первая означает,
+    # что разметка отстаёт или лежит, вторая — что модель сомневается, и это
+    # нормальная работа, а не поломка.
+    entries_without_annotation: int
+    waiting_for_review: int
     trigrams_work: bool
     jobs_queued: int
     jobs_failed: int
     next_reminder: NextReminder | None
     private_mode: bool
+
+
+def _waiting(counts: dict[AnnotationState, int]) -> int:
+    """Сколько записей ждут вечернего разбора.
+
+    Это «две гипотезы» плюс «не понял» — оба состояния означают, что разметка
+    сохранена, но спорна (vision, «модель подтверждений»). Складываются они
+    намеренно: для владельца это одна очередь, а не две.
+    """
+    return counts.get(AnnotationState.TWO_HYPOTHESES, 0) + counts.get(AnnotationState.UNCLEAR, 0)
 
 
 async def collect() -> SystemStatus:
@@ -133,6 +150,8 @@ async def collect() -> SystemStatus:
         entries=int(entries),
         voice_without_transcript=int(voice_without_transcript),
         entries_without_index=len(await retrieval.entries_needing_index()),
+        entries_without_annotation=await enrich.unannotated_count(),
+        waiting_for_review=_waiting(await enrich.counts_by_state()),
         trigrams_work=bool(trigrams),
         jobs_queued=int(queue.active),
         jobs_failed=int(queue.failed),

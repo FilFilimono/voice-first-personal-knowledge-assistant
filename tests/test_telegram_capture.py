@@ -189,6 +189,8 @@ async def test_status_reports_the_worker_first(
         entries=7,
         voice_without_transcript=2,
         entries_without_index=0,
+        entries_without_annotation=0,
+        waiting_for_review=0,
         trigrams_work=True,
         jobs_queued=2,
         jobs_failed=0,

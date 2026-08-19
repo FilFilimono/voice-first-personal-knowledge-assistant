@@ -23,15 +23,25 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 import brain.core.retrieval.embeddings as embeddings
+from brain.adapters.telegram import notifier as notifier_module
 from brain.adapters.telegram import search_text, status_text
-from brain.adapters.telegram.notifier import CALLBACK_PREFIX, NO, yes_no_keyboard
+from brain.adapters.telegram.notifier import (
+    ANNOTATION_PREFIX,
+    CALLBACK_PREFIX,
+    NO,
+    PRIVATE,
+    SET,
+    WRONG,
+    yes_no_keyboard,
+)
 from brain.config import Settings
-from brain.core import ingest
+from brain.core import enrich, ingest
 from brain.core import status as core_status
-from brain.core.memory import repository
+from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import search
 from brain.core.scheduler import reminders
+from brain.storage.models.annotation import AnnotationType
 
 logger = logging.getLogger(__name__)
 
@@ -293,9 +303,72 @@ def build_router(settings: Settings) -> Router:
 
         await question.edit_text(_answered(outcome))
 
+    @router.callback_query(F.data.startswith(f"{ANNOTATION_PREFIX}:"))
+    async def annotation_button(callback: CallbackQuery) -> None:
+        """Нажатия под готовым разбором: «не туда», выбор типа, «приватная»."""
+        await callback.answer()
+
+        if callback.data is None or callback.message is None:  # pragma: no cover — фильтр выше
+            return
+
+        message = callback.message
+        if not isinstance(message, Message):  # pragma: no cover — слишком старое сообщение
+            return
+
+        _, action, *rest = callback.data.split(":")
+
+        if action == WRONG:
+            # Список типов вместо текущего разбора. Текст остаётся прежним —
+            # выбирать тип, не видя записи, невозможно.
+            await message.edit_reply_markup(
+                reply_markup=notifier_module.type_keyboard(int(rest[0]), enrich.NAMES)
+            )
+            return
+
+        if action == SET:
+            type_value, entry_id = rest[0], int(rest[1])
+            chosen = AnnotationType(type_value)
+            was = await overrides.reclassify(entry_id, to=chosen)
+            await message.edit_text(_reclassified(chosen, was), reply_markup=None)
+            return
+
+        if action == PRIVATE:
+            result = await overrides.make_private(int(rest[0]))
+            await message.edit_text(_made_private(result), reply_markup=None)
+
     return router
 
 
 def _answered(outcome: reminders.ScheduleOutcome) -> str:
     """Что показать вместо вопроса, когда на него ответили."""
     return f"⏰ {outcome.message}" if outcome.created else outcome.message
+
+
+def _reclassified(chosen: AnnotationType, was: AnnotationType | None) -> str:
+    """Что показать после поправки типа.
+
+    Прежний тип называется вслух: поправка — это то, из чего потом считается
+    качество разметки, и владелец должен видеть, что именно он поправил,
+    а не только чем заменил.
+    """
+    name = enrich.NAMES[chosen]
+    if was is None or was is chosen:
+        return f"📌 {name}"
+    return f"📌 {name} (было: {enrich.NAMES[was]})"
+
+
+def _made_private(result: overrides.MadePrivate) -> str:
+    """Что показать после «сделать приватной».
+
+    Главное здесь — вторая строка. ADR-0002 разрешает ретроактивную приватность
+    ровно с условием: бот обязан сказать, что текст уже уходил наружу, а не
+    делать вид, что всё вернулось как было. Отозвать это нельзя, и молчать
+    об этом — значит обещать приватность, которой нет.
+    """
+    lines = ["🔒 Записана как приватная. Наружу больше не уйдёт."]
+    if result.went_outside:
+        lines.append(
+            "Но текст уже уходил во внешнюю модель раньше — этого не отозвать. "
+            f"Убрал: векторов {result.cleared_vectors}, разметок {result.removed_annotations}."
+        )
+    return "\n\n".join(lines)

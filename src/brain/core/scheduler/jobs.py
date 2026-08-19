@@ -23,14 +23,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from brain.core import enrich as enrichment
 from brain.core import stt
 from brain.core.memory import audio as audio_store
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
-from brain.core.ports import AudioSource, Embedder, Notifier, Transcriber, Transcription
+from brain.core.ports import (
+    AudioSource,
+    Embedder,
+    LanguageModel,
+    Notifier,
+    Transcriber,
+    Transcription,
+)
 from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
-from brain.core.scheduler.queue import INDEX
+from brain.core.scheduler.queue import ENRICH, INDEX
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
 from brain.storage.models.entry import Entry
 from brain.storage.models.reminder import Reminder
@@ -84,7 +92,9 @@ async def transcribe(
             transcriber,
             audio=audio,
             mime_type=VOICE_MIME,
-            is_private=entry.is_private,
+            # Приватность спрашивается заново, а не берётся из колонки: с Фазы 3
+            # её включают задним числом, и `entries` при этом не меняется.
+            is_private=await repository.is_entry_private(entry_id),
             duration_sec=entry.duration_sec,
             max_duration_sec=max_duration_sec,
         )
@@ -151,10 +161,15 @@ async def _store_transcript(
     видно отсутствие ответа, здесь не видно ничего.
     """
     already_reminded = await repository.has_reminder(entry.id)
+    is_private = await repository.is_entry_private(entry.id)
 
     async with capture_transaction() as uow:
         await uow.add_transcript(entry.id, transcription)
         await uow.enqueue(INDEX, {"entry_id": entry.id})
+        # Разметка ставится здесь, а не при приёме: при приёме у голосовой
+        # записи текста ещё нет, а размечать нечем.
+        if not is_private:
+            await uow.enqueue(ENRICH, {"entry_id": entry.id})
 
         if already_reminded:
             return None
@@ -260,6 +275,78 @@ async def index(*, entry_id: int, embedder: Embedder) -> None:
     """
     chunks = await index_entry(embedder, entry_id=entry_id)
     logger.info("запись %s проиндексирована: чанков %s", entry_id, chunks)
+
+
+async def enrich(
+    *,
+    entry_id: int,
+    model: LanguageModel,
+    embedder: Embedder,
+    notifier: Notifier,
+    limit: int,
+) -> int:
+    """Разметить всё, что ждёт разметки. Вернуть число размеченных записей.
+
+    Задание приходит на конкретную запись, а размечается пачка: обработчик
+    забирает всё неразмеченное разом (ADR-0011). Поэтому второе задание,
+    пришедшее следом, чаще всего не найдёт работы — и это нормально, а не сбой.
+    """
+    outcome = await enrichment.annotate_pending(model, embedder, limit=limit)
+    if outcome.annotated == 0:
+        logger.info("разметка: пачку уже разобрало соседнее задание (запись %s)", entry_id)
+        return 0
+
+    await _show_annotations(notifier, outcome.entry_ids)
+    return int(outcome.annotated)
+
+
+# Насколько свежей должна быть запись, чтобы бот дописал к подтверждению приёма
+# разметку. Старая размечается молча, и это не экономия: править сообщение
+# недельной давности значит переписывать переписку задним числом. Первый же
+# проход разбирает весь накопленный архив — и всё это были бы правки старых
+# сообщений, о которых никто не просил.
+ACK_WINDOW = timedelta(hours=1)
+
+
+async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
+    """Дописать разметку к подтверждению приёма — там, где это уместно.
+
+    Сообщение пересобирается из данных целиком: текст подтверждения живёт
+    в Telegram, прочитать его нельзя. Поэтому расшифровка, напоминание
+    и разметка достаются из базы и складываются заново — см. `enrich/reply.py`.
+    """
+    rows = await enrichment.rows_for_reply(entry_ids)
+    now = datetime.now(UTC)
+
+    for row in rows:
+        if row.chat_id is None or row.ack_message_id is None:
+            continue
+        if now - row.created_at > ACK_WINDOW:
+            continue
+
+        annotation = await enrichment.latest_annotation(row.entry_id)
+        if annotation is None:  # pragma: no cover — только что размечали
+            continue
+
+        shown = enrichment.Shown(
+            # У голосовой записи показывается расшифровка — она и была
+            # на этом месте до разметки. У текстовой — «Записал.»: повторять
+            # владельцу его же слова незачем, он их только что набрал.
+            body=row.text if row.kind == "voice" else enrichment.STORED,
+            type=annotation.type,
+            alternative_type=annotation.alternative_type,
+            state=annotation.state,
+            topics=await enrichment.topics_of(row.entry_id),
+            reminder_at=row.reminder_at,
+            reminder_text=row.reminder_text,
+            timezone=row.timezone,
+        )
+        await notifier.show_annotation(
+            row.chat_id,
+            row.ack_message_id,
+            enrichment.render(shown),
+            entry_id=row.entry_id,
+        )
 
 
 async def clean_audio(*, retention_days: int) -> int:

@@ -8,23 +8,36 @@ autogenerate в Alembic сравнивает состояние базы, и м�
 (ADR-0008).
 """
 
+from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
 from brain.storage.models.base import Base
 from brain.storage.models.chunk import DIMENSIONS, FTS_CONFIG, Chunk
 from brain.storage.models.entry import Entry, EntryKind, EntrySource
+from brain.storage.models.llm_call import LlmCall
+from brain.storage.models.override import EntryOverride, OverrideAction
 from brain.storage.models.private_mode import PrivateModeChange
 from brain.storage.models.reminder import Reminder, ReminderTrigger
+from brain.storage.models.topic import EntryTopic, Topic, normalize
 from brain.storage.models.transcript import Transcript
 
 __all__ = [
     "DIMENSIONS",
     "FTS_CONFIG",
+    "Annotation",
+    "AnnotationState",
+    "AnnotationType",
     "Base",
     "Chunk",
     "Entry",
     "EntryKind",
+    "EntryOverride",
     "EntrySource",
+    "EntryTopic",
+    "LlmCall",
+    "OverrideAction",
     "PrivateModeChange",
     "Reminder",
     "ReminderTrigger",
+    "Topic",
     "Transcript",
+    "normalize",
 ]

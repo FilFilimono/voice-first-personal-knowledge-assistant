@@ -19,6 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 TRANSCRIBE = "transcribe"
 REMINDER = "reminder"
 INDEX = "index-entry"
+# Разметка. Задание ставится на конкретную запись, но обработчик забирает
+# всё неразмеченное разом (ADR-0011): при простое это пачка из одной штуки,
+# при всплеске — настоящая пачка. Поэтому в нагрузке идентификатор записи
+# лежит только ради лога — обработчику он не нужен.
+ENRICH = "enrich-entry"
 AUDIO_RETENTION = "audio-retention"
 HEARTBEAT = "heartbeat"
 

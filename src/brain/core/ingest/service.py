@@ -20,7 +20,7 @@ from pathlib import Path
 
 from brain.core.ports import CaptureUnitOfWork, EntryDraft
 from brain.core.scheduler import reminders
-from brain.core.scheduler.queue import INDEX, TRANSCRIBE
+from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
 from brain.storage.models.entry import EntryKind, EntrySource
 
 # Расширение сохраняется как есть: Telegram отдаёт OGG/Opus, провайдер
@@ -114,6 +114,14 @@ async def capture_text(
     # Приватная запись индексируется тоже: у неё будут чанки и полнотекст,
     # не будет только вектора (инвариант 5).
     await uow.enqueue(INDEX, {"entry_id": entry_id})
+
+    # Разметка — там же и тем же способом. Приватной записи задание не ставится:
+    # у неё разметки не бывает вовсе (инвариант 5), и задание было бы холостым.
+    # Настоящий отбор всё равно делает обработчик — он собирает пачку запросом,
+    # в котором приватность и так есть; здесь мы экономим пустой проход, а не
+    # обеспечиваем приватность.
+    if not is_private:
+        await uow.enqueue(ENRICH, {"entry_id": entry_id})
 
     reminder = await reminders.schedule(
         uow,

@@ -152,3 +152,32 @@ def _forget_settings_between_tests() -> Iterator[None]:
     """Кэш настроек не должен протекать между тестами."""
     yield
     get_settings.cache_clear()
+
+
+# База, которой нет. Быстрый тест, случайно дошедший до Postgres, обязан
+# упереться в неё, а не в рабочий архив.
+NOWHERE = "postgresql+asyncpg://nobody@127.0.0.1:1/there-is-no-database"
+
+
+@pytest.fixture(autouse=True)
+def _no_database_in_fast_tests(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Быстрый тест не ходит в базу. Теперь это не договорённость, а факт.
+
+    Найдено 19 августа 2026 при мутационной проверке: учёт стоимости
+    (`core/llm/accounting`) живёт внутри двери наружу и пишет строку на каждый
+    вызов модели. Значит, любой быстрый тест этой двери открывает сессию —
+    и открывает её к **рабочей** базе, потому что адрес берётся из `.env`.
+    Спасло только то, что таблицы `llm_calls` там ещё не было: `record`
+    глотает свои ошибки нарочно, чтобы не ронять разметку из-за статистики.
+    То есть тест писал бы в живой архив молча.
+
+    Поэтому у быстрых тестов адрес базы подменяется на несуществующий. Это
+    та же мысль, что и у одноразовой базы для интеграционных: тест не имеет
+    права трогать то, что нельзя восстановить.
+    """
+    if request.node.get_closest_marker("integration") is None:
+        monkeypatch.setenv("DATABASE_URL", NOWHERE)
+        get_settings.cache_clear()
+    yield

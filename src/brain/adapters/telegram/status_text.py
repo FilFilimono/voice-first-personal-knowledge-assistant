@@ -37,6 +37,17 @@ def render(status: SystemStatus, *, timezone: str) -> str:
     if status.entries_without_index:
         lines.append(f"🔍 Не в поиске: {status.entries_without_index} — поставить: just reindex")
 
+    if status.entries_without_annotation:
+        lines.append(
+            f"🏷 Без разметки: {status.entries_without_annotation} — поставить: just reenrich"
+        )
+
+    if status.waiting_for_review:
+        # Это не поломка, а нормальная работа: модель колеблется или не поняла.
+        # Показывается затем, что вечерний разбор придёт в Фазе 4, и до тех пор
+        # очередь на него растёт молча.
+        lines.append(f"🤔 Ждут разбора: {status.waiting_for_review}")
+
     if not status.trigrams_work:
         # Третий канал поиска молчит, а первые два работают: выдача становится
         # хуже, но не пустой, и заметить это без строки здесь невозможно.

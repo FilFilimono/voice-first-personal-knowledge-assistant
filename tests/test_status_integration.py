@@ -116,11 +116,12 @@ async def test_counts_reflect_the_archive(engine: AsyncEngine, tmp_path: Path) -
 
     assert collected.entries == 3
     assert collected.voice_without_transcript == 1
-    # Три задания: две текстовые записи поставили индексацию, голосовая —
-    # расшифровку. Свою индексацию она поставит потом, вместе с расшифровкой:
-    # текста у неё сейчас нет.
-    assert collected.jobs_queued == 3
+    # Пять заданий: каждая текстовая запись поставила индексацию и разметку,
+    # голосовая — расшифровку. Свои индексацию и разметку она поставит потом,
+    # вместе с расшифровкой: текста у неё сейчас нет, размечать нечего.
+    assert collected.jobs_queued == 5
     assert collected.entries_without_index == 2
+    assert collected.entries_without_annotation == 2
     assert collected.jobs_failed == 0
 
 

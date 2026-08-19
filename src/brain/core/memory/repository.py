@@ -8,11 +8,12 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import ColumnElement, func, insert, select, update
 
 from brain.core.ports import Transcription
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry, EntryKind
+from brain.storage.models.override import EntryOverride, OverrideAction
 from brain.storage.models.private_mode import PrivateModeChange
 from brain.storage.models.reminder import Reminder
 from brain.storage.models.transcript import Transcript
@@ -73,6 +74,45 @@ async def get_transcript(entry_id: int) -> str | None:
     return text
 
 
+def is_private_now() -> ColumnElement[bool]:
+    """Приватна ли запись **сейчас** — выражение для запроса, а не значение.
+
+    До Фазы 3 ответом была колонка `entries.is_private`, и этого хватало.
+    Теперь приватность включается задним числом кнопкой «сделать приватной»,
+    а `entries` не правится (инвариант 3) — значит, состояние живёт в двух
+    местах сразу: в колонке и в последней поправке.
+
+    Это ровно та цена, которую назвал ADR-0003 («актуальная запись — не
+    `SELECT * FROM entries`»), и он же сказал, чем платить: читать состояние
+    в одном месте. Место — здесь. Всё, что решает, уходить ли тексту наружу,
+    обязано спрашивать эту функцию, а не колонку: индексация, поиск, разметка.
+
+    Обратной поправки нет, поэтому «последняя строка» сводится к «есть хоть
+    одна». Появится «снять приватность» — здесь понадобится именно последняя,
+    и это единственное место, которое придётся поправить.
+    """
+    return Entry.is_private | (
+        select(EntryOverride.id)
+        .where(
+            EntryOverride.source_entry_id == Entry.id,
+            EntryOverride.action == OverrideAction.MAKE_PRIVATE,
+        )
+        .exists()
+    )
+
+
+async def is_entry_private(entry_id: int) -> bool:
+    """Приватна ли запись сейчас — значением, а не выражением.
+
+    Нужна воркеру: у него на руках объект `Entry`, и соблазн спросить
+    `entry.is_private` велик. Колонка отвечает на другой вопрос — «была ли
+    запись приватной в момент приёма», — и с Фазы 3 это уже не одно и то же.
+    """
+    async with session_scope() as session:
+        private = await session.scalar(select(is_private_now()).where(Entry.id == entry_id))
+    return bool(private)
+
+
 async def entry_text(entry_id: int) -> tuple[str, bool] | None:
     """Текущий текст записи и её приватность. `None`, если текста ещё нет.
 
@@ -83,12 +123,13 @@ async def entry_text(entry_id: int) -> tuple[str, bool] | None:
 
     Приватность возвращается рядом с текстом намеренно. Тот, кто собирается
     считать эмбеддинг, обязан узнать про неё из того же запроса, а не сходить
-    за ней отдельно и забыть.
+    за ней отдельно и забыть. И считается она **сейчас** (`is_private_now`),
+    а не по колонке: с Фазы 3 приватность включается задним числом.
     """
     async with session_scope() as session:
         row = (
             await session.execute(
-                select(func.coalesce(latest_transcript(), Entry.raw_text), Entry.is_private).where(
+                select(func.coalesce(latest_transcript(), Entry.raw_text), is_private_now()).where(
                     Entry.id == entry_id
                 )
             )

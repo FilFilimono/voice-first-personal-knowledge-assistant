@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
-from brain.core.ports import EntryDraft, ReminderDraft, Transcription
+from brain.core.ports import Completion, EntryDraft, ReminderDraft, Transcription
 from brain.core.stt.errors import TranscriptionError
 from brain.storage.models.chunk import DIMENSIONS
 
@@ -61,6 +61,9 @@ class FakeNotifier:
         self.edited: list[tuple[int, int, str]] = []
         # Заданные вопросы с кнопками: чат, сообщение, текст, запись.
         self.asked: list[tuple[int, int, str, int]] = []
+        # Показанная разметка — то же самое, но с кнопками «не туда»
+        # и «сделать приватной».
+        self.annotated: list[tuple[int, int, str, int]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         self.sent.append((chat_id, text))
@@ -71,6 +74,11 @@ class FakeNotifier:
 
     async def ask_yes_no(self, chat_id: int, message_id: int, text: str, *, entry_id: int) -> None:
         self.asked.append((chat_id, message_id, text, entry_id))
+
+    async def show_annotation(
+        self, chat_id: int, message_id: int, text: str, *, entry_id: int
+    ) -> None:
+        self.annotated.append((chat_id, message_id, text, entry_id))
 
 
 class StubTranscriber:
@@ -223,6 +231,72 @@ class RecordedEmbedder:
                 f"вектор не посчитан ({kind}): {text[:60]!r}. "
                 "Добавьте текст в список запросов теста — он досчитается сам."
             ) from None
+
+
+class ScriptedModel:
+    """Модель, отвечающая по сценарию и считающая вызовы.
+
+    Считать вызовы здесь важнее, чем отвечать: два главных утверждения про
+    разметку — «пачка уходит одним вызовом на прогон» и «приватная запись
+    наружу не уходит» — проверяются именно счётчиком, а не содержимым ответа.
+
+    Сценарий — список ответов на прогоны. Кончился — повторяется последний:
+    два прогона одной пачки должны отвечать по-разному только там, где тест
+    проверяет расхождение.
+    """
+
+    def __init__(self, script: list[dict[str, Any]]) -> None:
+        self._script = script
+        self.prompts: list[str] = []
+        self.systems: list[str] = []
+        self.checked = 0
+
+    @property
+    def provider(self) -> str:
+        return "stub"
+
+    @property
+    def model(self) -> str:
+        return "stub-flash-lite"
+
+    @property
+    def tier(self) -> str:
+        return "cheap"
+
+    @property
+    def calls(self) -> int:
+        return len(self.prompts)
+
+    async def check_available(self) -> None:
+        self.checked += 1
+
+    async def complete(
+        self,
+        *,
+        system: str,
+        prompt: str,
+        schema: Mapping[str, Any],
+        temperature: float,
+    ) -> Completion:
+        self.systems.append(system)
+        self.prompts.append(prompt)
+        index = min(len(self.prompts) - 1, len(self._script) - 1)
+        return Completion(
+            data=self._script[index],
+            input_tokens=10,
+            output_tokens=10,
+            latency_ms=1,
+        )
+
+
+def answer(*items: tuple[int, str, list[str]]) -> dict[str, Any]:
+    """Ответ прогона: тройки «запись, тип, темы»."""
+    return {
+        "items": [
+            {"id": entry_id, "type": type_, "topics": topics, "entities": []}
+            for entry_id, type_, topics in items
+        ]
+    }
 
 
 class FakeAudioSource:

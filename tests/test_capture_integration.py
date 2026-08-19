@@ -25,7 +25,7 @@ from brain.core import ingest
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.scheduler import jobs
-from brain.core.scheduler.queue import REMINDER, TRANSCRIBE
+from brain.core.scheduler.queue import ENRICH, INDEX, REMINDER, TRANSCRIBE
 from tests.fakes import FailingTranscriber, FakeAudioSource, FakeNotifier, StubTranscriber
 
 pytestmark = pytest.mark.integration
@@ -88,6 +88,13 @@ async def _capture_voice(audio_dir: Path, message_id: int = 20) -> int | None:
     return result.entry_id
 
 
+async def _entrypoints(engine: AsyncEngine) -> list[str]:
+    """Какие задания стоят в очереди — в порядке постановки."""
+    async with engine.connect() as connection:
+        rows = await connection.execute(text("SELECT entrypoint FROM pgqueuer ORDER BY id"))
+    return [str(row[0]) for row in rows]
+
+
 # --- Инвариант 7 ---
 
 
@@ -133,6 +140,32 @@ async def test_job_payload_holds_identifiers_only(engine: AsyncEngine, tmp_path:
 
 
 # --- Дедупликация и неизменяемость ---
+
+
+async def test_text_entry_queues_index_and_enrich_together(engine: AsyncEngine) -> None:
+    """Индексация и разметка ставятся в той же транзакции, что запись.
+
+    Инвариант 7 распространяется на разметку буквально так же: запись
+    без задания — это запись, которую никогда не разберут, и узнать об этом
+    было бы неоткуда.
+    """
+    async with capture_transaction() as uow:
+        await ingest.capture_text(
+            uow, _text("мысль про темы"), is_private=False, timezone=TIMEZONE, now=NOW
+        )
+        assert await _entrypoints(engine) == []
+
+    assert await _entrypoints(engine) == [INDEX, ENRICH]
+
+
+async def test_private_text_is_indexed_but_not_enriched(engine: AsyncEngine) -> None:
+    """У приватной записи есть поиск, но нет разметки (ADR-0002, инвариант 5)."""
+    async with capture_transaction() as uow:
+        await ingest.capture_text(
+            uow, _text("приватная мысль"), is_private=True, timezone=TIMEZONE, now=NOW
+        )
+
+    assert await _entrypoints(engine) == [INDEX]
 
 
 async def test_redelivered_update_does_not_create_a_second_entry(

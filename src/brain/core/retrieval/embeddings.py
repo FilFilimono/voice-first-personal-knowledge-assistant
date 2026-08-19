@@ -54,6 +54,23 @@ async def embed_entry_chunks(
     return await embedder.embed_documents(texts)
 
 
+async def embed_topic_names(embedder: Embedder, names: list[str]) -> list[list[float]]:
+    """Посчитать вектора названий тем.
+
+    Отдельная дверь, а не вызов провайдера напрямую, — чтобы весь текст,
+    уходящий наружу, уходил через этот файл и был здесь виден списком.
+
+    Проверки приватности тут нет, и это не пропуск. Имя темы — не текст записи,
+    а обобщение вроде «подготовка к CV»; и главное, темы заводятся только
+    на **размеченных** записях, а приватные до разметки не доходят вовсе
+    (см. `core/enrich/repository.entries_needing_annotation`). Если этот порядок
+    когда-нибудь изменится, проверку надо будет добавить сюда, а не у вызывающего.
+    """
+    if not names:
+        return []
+    return await embedder.embed_documents(names)
+
+
 __all__ = [
     "Embedder",
     "EmbeddingError",
@@ -61,4 +78,5 @@ __all__ = [
     "ProviderUnavailableError",
     "build_embedder",
     "embed_entry_chunks",
+    "embed_topic_names",
 ]

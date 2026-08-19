@@ -41,6 +41,7 @@ from datetime import datetime
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from brain.core.memory.repository import is_private_now
 from brain.core.ports import Embedder
 from brain.storage.db import session_scope
 from brain.storage.models.chunk import FTS_CONFIG, Chunk
@@ -231,7 +232,10 @@ async def _load(entry_ids: Sequence[int], rankings: dict[str, list[int]]) -> lis
                     Entry.id,
                     Entry.created_at,
                     Entry.timezone,
-                    Entry.is_private,
+                    # Замочек в выдаче обязан показывать нынешнее состояние:
+                    # запись, сделанную приватной задним числом, колонка
+                    # по-прежнему считает обычной (инвариант 3).
+                    is_private_now(),
                     Chunk.text,
                 )
                 .join(Chunk, Chunk.source_entry_id == Entry.id)

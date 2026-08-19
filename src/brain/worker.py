@@ -29,11 +29,12 @@ import brain.core.retrieval.embeddings as embeddings
 from brain.adapters.telegram.audio import TelegramAudioSource
 from brain.adapters.telegram.notifier import TelegramNotifier
 from brain.config import get_runtime_settings
-from brain.core import stt
+from brain.core import llm, stt
 from brain.core.scheduler import jobs
 from brain.core.scheduler.queue import (
     AUDIO_RETENTION,
     AUDIO_RETENTION_SCHEDULE,
+    ENRICH,
     HEARTBEAT,
     HEARTBEAT_SCHEDULE,
     INDEX,
@@ -87,6 +88,7 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     audio_source = TelegramAudioSource(bot)
     transcriber = stt.build_transcriber(settings)
     embedder = embeddings.build_embedder(settings)
+    model = llm.build_model(settings)
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
@@ -96,7 +98,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     async def _check(what: str, setting: str, check: Callable[[], Awaitable[None]]) -> None:
         try:
             await check()
-        except (stt.ProviderUnavailableError, embeddings.ProviderUnavailableError) as error:
+        except (
+            stt.ProviderUnavailableError,
+            embeddings.ProviderUnavailableError,
+            llm.ProviderUnavailableError,
+        ) as error:
             await bot.session.close()
             await connection.close()
             raise SystemExit(
@@ -113,6 +119,15 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
         f"эмбеддингов {embedder.provider}/{embedder.model}",
         "EMBEDDING_MODEL",
         embedder.check_available,
+    )
+    # Третья проверка — по той же причине, что первые две, плюс одна своя:
+    # она заодно проверяет структурированный ответ. Модель может отвечать
+    # на generateContent и не уметь responseSchema, и выяснять это на первой
+    # пачке было бы поздно — записи к тому моменту уже накопились.
+    await _check(
+        f"разметки {model.provider}/{model.model}",
+        "ENRICH_MODEL",
+        model.check_available,
     )
 
     pgq = PgQueuer(AsyncpgDriver(connection))
@@ -139,6 +154,17 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     async def index(job: Job) -> None:
         payload = payload_of(job)
         await jobs.index(entry_id=payload["entry_id"], embedder=embedder)
+
+    @pgq.qm.entrypoint(ENRICH, executor_factory=retry_executor, on_failure="hold")
+    async def enrich(job: Job) -> None:
+        payload = payload_of(job)
+        await jobs.enrich(
+            entry_id=payload["entry_id"],
+            model=model,
+            embedder=embedder,
+            notifier=notifier,
+            limit=settings.enrich_batch_limit,
+        )
 
     @pgq.qm.entrypoint(REMINDER, executor_factory=retry_executor, on_failure="hold")
     async def remind(job: Job) -> None:
