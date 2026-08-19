@@ -62,8 +62,16 @@ class FakeNotifier:
         # Заданные вопросы с кнопками: чат, сообщение, текст, запись.
         self.asked: list[tuple[int, int, str, int]] = []
         # Показанная разметка — то же самое, но с кнопками «не туда»
-        # и «сделать приватной».
+        # и «сделать приватной». Четвёртое поле — предлагали ли завести петлю.
         self.annotated: list[tuple[int, int, str, int]] = []
+        self.loop_offers: list[int] = []
+        # Касания Фазы 4. Разделены по способу отправки, а не свалены в `sent`:
+        # «пришло беззвучно» и «пришло с кнопками» — разные утверждения,
+        # и тесты обязаны уметь их различать.
+        self.mornings: list[tuple[int, str, list[int], int | None]] = []
+        self.stuck_loops: list[int | None] = []
+        self.evenings: list[tuple[int, str, list[int]]] = []
+        self.quiet: list[tuple[int, str]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         self.sent.append((chat_id, text))
@@ -76,9 +84,39 @@ class FakeNotifier:
         self.asked.append((chat_id, message_id, text, entry_id))
 
     async def show_annotation(
-        self, chat_id: int, message_id: int, text: str, *, entry_id: int
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        entry_id: int,
+        offer_loop: bool = False,
     ) -> None:
         self.annotated.append((chat_id, message_id, text, entry_id))
+        if offer_loop:
+            self.loop_offers.append(entry_id)
+
+    async def send_morning(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        commitment_ids: list[int],
+        loop_id: int | None,
+        loop_stuck: bool = False,
+    ) -> int:
+        self.mornings.append((chat_id, text, list(commitment_ids), loop_id))
+        if loop_stuck:
+            self.stuck_loops.append(loop_id)
+        return 2000 + len(self.mornings)
+
+    async def send_evening(self, chat_id: int, text: str, *, entry_ids: list[int]) -> int:
+        self.evenings.append((chat_id, text, list(entry_ids)))
+        return 3000 + len(self.evenings)
+
+    async def send_quietly(self, chat_id: int, text: str) -> int:
+        self.quiet.append((chat_id, text))
+        return 4000 + len(self.quiet)
 
 
 class StubTranscriber:

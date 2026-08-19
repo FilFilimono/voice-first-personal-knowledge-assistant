@@ -1,0 +1,120 @@
+"""Журнал касаний — включая те, которых не было.
+
+Главное про эту таблицу: **молчание здесь такая же строка, как отправка.**
+Без этого решение «нечего сказать — молчим» (`vision.md` §7.0, принцип 3)
+нереализуемо: снаружи молчание системы и её смерть выглядят одинаково, и все
+восемь дыр Фаз 1–2 прятались ровно в этом. Строка с `silence_reason` даёт
+`/status` возможность ответить «сводка сегодня промолчала, потому что нечего
+сказать» вместо «сводки не было».
+
+Отсюда же берётся бюджет трёх инициативных касаний в сутки: он считается
+запросом к этой таблице в таймзоне владельца, а не счётчиком в памяти —
+счётчик не пережил бы перезапуск воркера, а перезапуск бывает чаще, чем сутки.
+
+**Строка на слот в сутки, и это держит база.** Тик просыпается каждые пять
+минут; писать на каждом тике значило бы 288 строк в день вместо четырёх.
+Поэтому уникальность по `(slot, local_date)`: слот, у которого сегодня уже есть
+строка — отправленная или молчаливая, — трогать больше нечем. Двойное
+срабатывание при перезапуске воркера упирается в базу, а не в проверку в коде,
+которую можно забыть.
+
+**Реактивные сообщения сюда не пишутся.** Ответ на запись владелец вызвал сам,
+он вне бюджета и вне ритма; журнал реактивных был бы второй копией `entries`.
+"""
+
+import enum
+from datetime import date, datetime
+from typing import Any
+
+from sqlalchemy import BigInteger, Date, DateTime, Enum, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from brain.storage.models.base import Base
+
+
+class TouchSlot(enum.StrEnum):
+    """Какое из касаний. Слоты из `vision.md` §7."""
+
+    MORNING = "morning"
+    # Всплывание старого. Дневное касание единственное, поэтому слот так
+    # и называется — по времени, а не по механизму: если днём когда-нибудь
+    # появится второй механизм, он будет конкурировать за этот же слот.
+    DAY = "day"
+    EVENING = "evening"
+    WEEKLY = "weekly"
+
+
+class TouchCategory(enum.StrEnum):
+    """Категория из `vision.md` §7. Определяет, считается ли касание в бюджет.
+
+    Реактивной категории здесь нет намеренно: реактивные сообщения в журнал
+    не попадают вовсе (см. модуль).
+    """
+
+    # Напоминания и всё, о чём владелец просил сам. Вне бюджета, приходит
+    # со звуком. Пока журналом не пользуется — у напоминаний своя таблица.
+    ORDERED = "ordered"
+    # Утренняя сводка — своя категория, вне бюджета: она про сегодняшний день.
+    MORNING = "morning"
+    # Единственная категория в бюджете: три касания в сутки.
+    INITIATIVE = "initiative"
+
+
+class SilenceReason(enum.StrEnum):
+    """Почему касание не отправлено.
+
+    Значений ровно три, и все три действительно записываются. «Ещё не время»
+    и «уже отправляли» сюда не входят: в обоих случаях строка не пишется вовсе
+    — первое потому, что момент слота не наступил, второе потому, что строка
+    за сегодня уже есть и уникальность не даст завести вторую.
+    """
+
+    # Механизм отработал и ничего не нашёл. Это основной режим Фазы 4
+    # на маленьком архиве, а не редкий угол (ADR-0013).
+    NOTHING_TO_SAY = "nothing_to_say"
+    # Пауза или «сегодня выходной».
+    QUIET = "quiet"
+    # Бюджет инициативных касаний на сутки исчерпан.
+    OVER_BUDGET = "over_budget"
+
+
+class Touch(Base):
+    """Одно касание — состоявшееся или намеренно не состоявшееся."""
+
+    __tablename__ = "touches"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    slot: Mapped[TouchSlot] = mapped_column(
+        Enum(TouchSlot, name="touch_slot", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+    )
+    category: Mapped[TouchCategory] = mapped_column(
+        Enum(TouchCategory, name="touch_category", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+    )
+
+    # Сутки владельца, а не сервера. Отдельной колонкой, а не выражением
+    # над `created_at`: «сколько касаний было сегодня» спрашивается на каждом
+    # тике, и приведение к таймзоне в запросе означало бы приведение всей
+    # таблицы. Плюс именно по этой колонке держится уникальность слота в сутки,
+    # а уникальность по выражению читалась бы хуже, чем по колонке.
+    local_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    # Пусто — значит промолчали. Тогда заполнен `silence_reason`, и наоборот:
+    # одно из двух всегда есть, это проверяется constraint'ом в миграции.
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    silence_reason: Mapped[SilenceReason | None] = mapped_column(
+        Enum(SilenceReason, name="silence_reason", values_callable=lambda e: [m.value for m in e]),
+        nullable=True,
+    )
+
+    # Что именно ушло: идентификаторы дел, петли, записи. Схемы у него нет
+    # и запросов по нему тоже — читается глазами, когда что-то пошло не так.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (UniqueConstraint("slot", "local_date", name="uq_touches_slot_date"),)

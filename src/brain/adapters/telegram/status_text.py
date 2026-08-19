@@ -11,7 +11,8 @@
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
-from brain.core.status import SystemStatus
+from brain.core.status import SystemStatus, Touches
+from brain.storage.models.touch import SilenceReason
 
 ALIVE = "✅ Воркер жив"
 DEAD = "🔴 Воркер молчит"
@@ -58,6 +59,9 @@ def render(status: SystemStatus, *, timezone: str) -> str:
         # Упавшие не исчезают, а ждут решения — поэтому им место в отчёте
         # вместе с командой, которая их возвращает.
         lines.append(f"❌ Упало: {status.jobs_failed} — вернуть: just failed, just requeue <id>")
+
+    lines.append("")
+    lines.extend(_touches(status, timezone=timezone))
 
     lines.append("")
     lines.append(_reminder(status, timezone=timezone))
@@ -122,6 +126,63 @@ def _warming_up(status: SystemStatus) -> list[str]:
         "Ждёт наполнения:",
         *waiting,
     ]
+
+
+# Почему сводка промолчала — словами. Это ровно то, ради чего в журнале
+# касаний вообще есть строки с молчанием: без них «сводки не было» означало бы
+# и «сказать нечего», и «воркер лежал», и различить их было бы нечем.
+SILENCE = {
+    SilenceReason.NOTHING_TO_SAY: "нечего было сказать",
+    SilenceReason.QUIET: "вы просили молчать",
+    SilenceReason.OVER_BUDGET: "бюджет касаний исчерпан",
+}
+
+
+def _touches(status: SystemStatus, *, timezone: str) -> list[str]:
+    """Что сегодня было с касаниями.
+
+    Первой строкой — утренняя сводка, и у неё три разных состояния, а не два:
+    пришла · промолчала и вот почему · **не дошла до решения вовсе**. Третье
+    означает, что воркер не работал в нужный час, и отличается от второго
+    отсутствием строки в журнале.
+    """
+    touches = status.touches
+    lines = [_morning(touches, timezone=timezone)]
+
+    if touches.quiet_until is not None:
+        until = touches.quiet_until.astimezone(ZoneInfo(timezone))
+        lines.append(f"🔇 Молчу до {until:%d.%m %H:%M} — снять: /resume")
+
+    hanging = []
+    if touches.open_commitments:
+        hanging.append(f"дел {touches.open_commitments}")
+    if touches.open_loops:
+        hanging.append(f"открытых вопросов {touches.open_loops}")
+    if hanging:
+        lines.append(f"📌 Висит: {', '.join(hanging)}")
+
+    lines.append(f"💬 Касаний сегодня: {touches.spent} из {touches.budget}")
+
+    if touches.auto_resolved:
+        # Владельцу об этом не сообщают уведомлением (`vision.md` §7.0,
+        # принцип 2), но спросить он вправе — и здесь ответ.
+        lines.append(f"🕗 Зафиксировано само по сроку: {touches.auto_resolved}")
+
+    return lines
+
+
+def _morning(touches: Touches, *, timezone: str) -> str:
+    """Строка про утреннюю сводку — три состояния, а не два."""
+    if touches.morning is None:
+        return "☀️ Сводки сегодня ещё не было"
+
+    if touches.morning.sent_at is not None:
+        sent = touches.morning.sent_at.astimezone(ZoneInfo(timezone))
+        return f"☀️ Сводка пришла в {sent:%H:%M}"
+
+    reason = touches.morning.silence_reason
+    explained = SILENCE.get(reason, "без объяснения") if reason else "без объяснения"
+    return f"☀️ Сводка сегодня промолчала: {explained}"
 
 
 def _days(days: int) -> str:

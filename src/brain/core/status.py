@@ -19,15 +19,15 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
 
-from brain.core import enrich
+from brain.core import digest, enrich
 from brain.core.memory import repository
 from brain.core.retrieval import repository as retrieval
 from brain.core.scheduler.queue import HEARTBEAT, HEARTBEAT_STALE_MINUTES
 from brain.storage.db import session_scope
-from brain.storage.models.annotation import AnnotationState
 from brain.storage.models.entry import Entry, EntryKind
 from brain.storage.models.reminder import Reminder
 from brain.storage.models.topic import Topic
+from brain.storage.models.touch import Touch, TouchSlot
 from brain.storage.models.transcript import Transcript
 
 
@@ -60,6 +60,28 @@ class NextReminder:
 
 
 @dataclass(frozen=True, slots=True)
+class Touches:
+    """Что сегодня было с касаниями — включая то, чего не было.
+
+    Существует ровно затем, чтобы молчание было отличимо от смерти. Решение
+    «нечего сказать — молчим» (`vision.md` §7.0) без этой строки означало бы,
+    что владелец не может узнать, работает ли Фаза 4 вообще.
+    """
+
+    # Что случилось с утренней сводкой сегодня. `None` — момент ещё не настал
+    # или воркер до него не дожил, и это разные беды: вторая видна по пульсу.
+    morning: Touch | None
+    spent: int
+    budget: int
+    quiet_until: datetime | None
+    open_commitments: int
+    open_loops: int
+    # Сколько записей зафиксировалось само. Владельцу об этом не сообщают
+    # (`vision.md` §7.0, принцип 2) — но спросить он вправе.
+    auto_resolved: int
+
+
+@dataclass(frozen=True, slots=True)
 class SystemStatus:
     """Срез состояния на момент запроса."""
 
@@ -82,19 +104,33 @@ class SystemStatus:
     # а тихо ничего не делают, и отличить это от поломки владелец не может.
     topics: int
     archive_age_days: int
+    touches: Touches
 
 
-def _waiting(counts: dict[AnnotationState, int]) -> int:
-    """Сколько записей ждут вечернего разбора.
+async def _touches(now: datetime, timezone: str) -> Touches:
+    """Что сегодня было с касаниями. Собирается отдельно — это про Фазу 4.
 
-    Это «две гипотезы» плюс «не понял» — оба состояния означают, что разметка
-    сохранена, но спорна (vision, «модель подтверждений»). Складываются они
-    намеренно: для владельца это одна очередь, а не две.
+    Утренняя сводка спрашивается по **сегодняшнему** дню владельца, а не
+    «последняя вообще»: вопрос, ради которого строка существует, звучит как
+    «а сегодня-то она была?».
     """
-    return counts.get(AnnotationState.TWO_HYPOTHESES, 0) + counts.get(AnnotationState.UNCLEAR, 0)
+    day = digest.slots.local_date(now, timezone)
+    today = await digest.touches.of_day(day)
+    budget = await digest.touches.budget(day)
+    open_commitments, open_loops = await digest.service.counts()
+
+    return Touches(
+        morning=today.get(TouchSlot.MORNING),
+        spent=budget.spent,
+        budget=budget.limit,
+        quiet_until=await digest.quiet.until(now),
+        open_commitments=open_commitments,
+        open_loops=open_loops,
+        auto_resolved=await digest.evening.auto_resolved_count(),
+    )
 
 
-async def collect() -> SystemStatus:
+async def collect(timezone: str) -> SystemStatus:
     """Собрать состояние. Один проход по базе, никаких внешних вызовов."""
     async with session_scope() as session:
         entries = await session.scalar(select(func.count()).select_from(Entry)) or 0
@@ -162,7 +198,11 @@ async def collect() -> SystemStatus:
         voice_without_transcript=int(voice_without_transcript),
         entries_without_index=len(await retrieval.entries_needing_index()),
         entries_without_annotation=await enrich.unannotated_count(),
-        waiting_for_review=_waiting(await enrich.counts_by_state()),
+        # Считается через вечерний разбор, а не по состоянию разметки: с Фазы 4
+        # спорная запись уходит из очереди, когда с ней разобрались, — а состояние
+        # в `annotations` при этом не меняется, потому что разметка это то, что
+        # модель действительно сказала.
+        waiting_for_review=await digest.evening.waiting_count(),
         trigrams_work=bool(trigrams),
         jobs_queued=int(queue.active),
         jobs_failed=int(queue.failed),
@@ -172,4 +212,5 @@ async def collect() -> SystemStatus:
         private_mode=await repository.is_private_mode(),
         topics=int(topics),
         archive_age_days=0 if oldest is None else (datetime.now(UTC) - oldest).days,
+        touches=await _touches(datetime.now(UTC), timezone),
     )

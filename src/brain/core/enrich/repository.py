@@ -15,6 +15,7 @@ from datetime import datetime
 
 from sqlalchemy import delete, func, insert, select
 
+from brain.core.digest import commitments
 from brain.core.enrich.units import MergedUnit
 from brain.core.memory.repository import is_private_now, latest_transcript, latest_transcript_id
 from brain.core.ports import EntryText
@@ -125,17 +126,22 @@ async def save_annotation(
     new_topics: list[NewTopic],
     units: list[MergedUnit],
     transcript_id: int | None,
+    text: str,
 ) -> int:
     """Сохранить разметку записи со всем, что из неё следует. Одной транзакцией.
 
-    Вместе с разметкой пишутся новые темы и привязка тем к записи. Раздельными
-    транзакциями это писать нельзя: упав между ними, мы получили бы разметку
-    без тем и никакого следа о том, что так вышло, — или тему, которую никто
-    не приписал. Это та же дыра, что с расшифровкой без задания на индексацию,
-    только тише.
+    Вместе с разметкой пишутся новые темы, привязка тем к записи и дела,
+    выведенные из единиц типа «задача». Раздельными транзакциями это писать
+    нельзя: упав между ними, мы получили бы разметку без тем и никакого следа
+    о том, что так вышло, — или тему, которую никто не приписал. Это та же дыра,
+    что с расшифровкой без задания на индексацию, только тише.
 
     Привязка тем перезаписывается целиком: перепрогон обязан быть идемпотентным
-    ровно так же, как пересчёт чанков.
+    ровно так же, как пересчёт чанков. Дела — наоборот, не перезаписываются:
+    у них своя жизнь после разметки, и закрытое дело не должно воскресать
+    при `just reenrich` (ADR-0013, ось 3).
+
+    `text` нужен делам: они хранят снимок своего куска, а не только отрезок.
     """
     async with session_scope() as session:
         annotation_id = await session.scalar(
@@ -175,6 +181,12 @@ async def save_annotation(
                     }
                     for ordinal, unit in enumerate(units)
                 ],
+            )
+
+            # Дела заводятся здесь же и по тем же единицам. Порядок важен:
+            # `create_in` читает единицы из этой транзакции, а не из базы.
+            await commitments.create_in(
+                session, entry_id=entry_id, annotation_id=int(annotation_id), text=text
             )
 
         topic_ids = list(existing_topic_ids)

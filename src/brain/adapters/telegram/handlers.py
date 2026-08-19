@@ -17,14 +17,15 @@
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 import brain.core.retrieval.embeddings as embeddings
+from brain.adapters.telegram import digest_keyboards, search_text, status_text
 from brain.adapters.telegram import notifier as notifier_module
-from brain.adapters.telegram import search_text, status_text
 from brain.adapters.telegram.notifier import (
     ANNOTATION_PREFIX,
     CALLBACK_PREFIX,
@@ -35,13 +36,16 @@ from brain.adapters.telegram.notifier import (
     yes_no_keyboard,
 )
 from brain.config import Settings
-from brain.core import enrich, ingest
+from brain.core import digest, enrich, ingest
 from brain.core import status as core_status
 from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import search
 from brain.core.scheduler import reminders
 from brain.storage.models.annotation import AnnotationType
+from brain.storage.models.commitment import CommitmentState
+from brain.storage.models.loop import LoopStatus
+from brain.storage.models.override import OverrideAction
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +73,19 @@ HELP = (
     "/private on — приватный режим: записи не уходят наружу, голосовые "
     "не принимаются\n"
     "/private off — обычный режим\n"
-    "/private — что сейчас"
+    "/private — что сейчас\n\n"
+    "/pause — замолчать на неделю\n"
+    "/dayoff — сегодня выходной\n"
+    "/resume — снова говорить"
 )
+
+# Тексты про тишину. Главное в них — вторая строка: система обязана сказать,
+# что именно продолжит приходить. Иначе «замолчи» читается как «выключить»,
+# и владелец перестанет им пользоваться из страха пропустить напоминание.
+PAUSED = "🔇 Молчу до {until:%d.%m}.\n\nНапоминания, которые вы поставили, будут приходить."
+DAY_OFF = "🔇 Сегодня выходной.\n\nНапоминания, которые вы поставили, будут приходить."
+RESUMED = "🔊 Снова говорю."
+NOT_QUIET = "Я и так не молчу."
 
 
 def build_router(settings: Settings) -> Router:
@@ -85,7 +100,7 @@ def build_router(settings: Settings) -> Router:
     @router.message(Command("status"))
     async def status(message: Message) -> None:
         """Что сейчас происходит — чтобы не лезть в терминал с телефона."""
-        collected = await core_status.collect()
+        collected = await core_status.collect(settings.brain_timezone)
         await message.answer(status_text.render(collected, timezone=settings.brain_timezone))
 
     @router.message(Command("private"))
@@ -104,6 +119,29 @@ def build_router(settings: Settings) -> Router:
             if enabled
             else "Приватный режим выключен."
         )
+
+    @router.message(Command("pause"))
+    async def pause(message: Message) -> None:
+        """«Замолчи на неделю» (`vision.md` §7)."""
+        until = await digest.quiet.pause(datetime.now(UTC))
+        await message.answer(
+            PAUSED.format(until=until.astimezone(ZoneInfo(settings.brain_timezone)))
+        )
+
+    @router.message(Command("dayoff"))
+    async def day_off(message: Message) -> None:
+        """«Сегодня выходной» — до полуночи у владельца, а не в UTC."""
+        await digest.quiet.day_off(datetime.now(UTC), settings.brain_timezone)
+        await message.answer(DAY_OFF)
+
+    @router.message(Command("resume"))
+    async def resume(message: Message) -> None:
+        now = datetime.now(UTC)
+        if not await digest.quiet.is_quiet(now):
+            await message.answer(NOT_QUIET)
+            return
+        await digest.quiet.resume(now)
+        await message.answer(RESUMED)
 
     @router.message(Command("find"))
     async def find(message: Message, command: CommandObject) -> None:
@@ -336,7 +374,109 @@ def build_router(settings: Settings) -> Router:
             result = await overrides.make_private(int(rest[0]))
             await message.edit_text(_made_private(result), reply_markup=None)
 
+    @router.callback_query(F.data.startswith(f"{digest_keyboards.DEED_PREFIX}:"))
+    async def close_commitment(callback: CallbackQuery) -> None:
+        """«Сделал» или «неактуально» под делом в утренней сводке.
+
+        Текст сводки не переписывается: в ней несколько дел, и стирать весь
+        список из-за одного нажатия нельзя. Ответом служит всплывающая
+        подсказка — её видит только владелец и только сейчас.
+        """
+        if callback.data is None:  # pragma: no cover — фильтр выше
+            return
+
+        _, action, raw_id = callback.data.split(":", maxsplit=2)
+        state = CommitmentState.DONE if action == digest_keyboards.DONE else CommitmentState.DROPPED
+        closed = await digest.commitments.close(int(raw_id), state, now=datetime.now(UTC))
+        await callback.answer(_closed_deed(state) if closed else ALREADY_CLOSED)
+
+    @router.callback_query(F.data.startswith(f"{digest_keyboards.LOOP_PREFIX}:"))
+    async def loop_button(callback: CallbackQuery) -> None:
+        """Кнопки петли: заведение под разбором и ответы в утренней сводке."""
+        if callback.data is None or callback.message is None:  # pragma: no cover — фильтр выше
+            return
+
+        _, action, raw_id = callback.data.split(":", maxsplit=2)
+        identifier = int(raw_id)
+
+        if action == digest_keyboards.NEW:
+            # Здесь `raw_id` — это запись, а не петля: кнопка живёт под разбором.
+            created = await digest.loops.create_from_entry(identifier)
+            await callback.answer(LOOP_CREATED if created else LOOP_NOT_FOUND, show_alert=True)
+            return
+
+        await callback.answer(await _answer_loop(action, identifier))
+
+    @router.callback_query(F.data.startswith(f"{digest_keyboards.EVENING_PREFIX}:"))
+    async def evening_button(callback: CallbackQuery) -> None:
+        """Кнопки вечернего разбора: «ок», «не туда» и выбор типа."""
+        if callback.data is None or callback.message is None:  # pragma: no cover — фильтр выше
+            return
+
+        message = callback.message
+        parts = callback.data.split(":")
+        action = parts[1]
+
+        if action == digest_keyboards.OK:
+            await digest.evening.settle(int(parts[2]), action=OverrideAction.CONFIRM)
+            await callback.answer(SETTLED)
+            return
+
+        if action == digest_keyboards.WRONG:
+            # Список типов вместо кнопок пачки. Текст сообщения остаётся:
+            # выбирать тип, не видя записи, невозможно.
+            if isinstance(message, Message):
+                await message.edit_reply_markup(
+                    reply_markup=digest_keyboards.evening_types_keyboard(
+                        int(parts[2]), enrich.NAMES
+                    )
+                )
+            await callback.answer()
+            return
+
+        if action == digest_keyboards.SET:
+            chosen = AnnotationType(parts[2])
+            await overrides.reclassify(int(parts[3]), to=chosen)
+            await callback.answer(f"📌 {enrich.NAMES[chosen]}")
+
     return router
+
+
+ALREADY_CLOSED = "Уже закрыто."
+SETTLED = "Принял."
+LOOP_CREATED = "🔁 Завёл открытый вопрос. Буду возвращаться к нему."
+LOOP_NOT_FOUND = "Не нашёл открытого вопроса в этой записи — возможно, её переразметили."
+LOOP_ANSWERS = {
+    digest_keyboards.CLOSED: "🔁 Закрыл.",
+    digest_keyboards.IRRELEVANT: "🔁 Убрал как неактуальное.",
+    digest_keyboards.THINKING: "🔁 Вернусь через две недели.",
+    digest_keyboards.REPHRASE: (
+        "🔁 Закрыл. Запишите мысль заново, как она звучит сейчас — "
+        "новая формулировка получит свой разбор."
+    ),
+}
+
+
+async def _answer_loop(action: str, loop_id: int) -> str:
+    """Что сделать с петлёй и что сказать в ответ.
+
+    «Переформулирую» закрывает петлю и просит записать мысль заново, а не
+    открывает поле ввода. В этой системе способ что-то сказать — записать это:
+    новая формулировка, пришедшая обычной записью, получит разметку, связи
+    и своё подтверждение петли, а введённая в ответ на кнопку не получила бы
+    ничего из этого.
+    """
+    if action == digest_keyboards.THINKING:
+        await digest.loops.still_thinking(loop_id, now=datetime.now(UTC))
+    elif action == digest_keyboards.IRRELEVANT:
+        await digest.loops.settle(loop_id, LoopStatus.IRRELEVANT)
+    else:
+        await digest.loops.settle(loop_id, LoopStatus.CLOSED)
+    return LOOP_ANSWERS.get(action, "🔁 Готово.")
+
+
+def _closed_deed(state: CommitmentState) -> str:
+    return "✓ Закрыл." if state is CommitmentState.DONE else "✕ Убрал как неактуальное."
 
 
 def _answered(outcome: reminders.ScheduleOutcome) -> str:

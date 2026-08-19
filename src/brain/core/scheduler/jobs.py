@@ -23,8 +23,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from brain.core import digest, stt
 from brain.core import enrich as enrichment
-from brain.core import stt
 from brain.core.enrich import regeneralize as regeneralization
 from brain.core.memory import audio as audio_store
 from brain.core.memory import repository
@@ -41,6 +41,7 @@ from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
 from brain.core.scheduler.queue import ENRICH, INDEX
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
+from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.entry import Entry
 from brain.storage.models.reminder import Reminder
 
@@ -329,6 +330,7 @@ async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
         if annotation is None:  # pragma: no cover — только что размечали
             continue
 
+        types = await enrichment.unit_types_of(annotation.id)
         shown = enrichment.Shown(
             # У голосовой записи показывается расшифровка — она и была
             # на этом месте до разметки. У текстовой — «Записал.»: повторять
@@ -337,7 +339,7 @@ async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
             type=annotation.type,
             alternative_type=annotation.alternative_type,
             state=annotation.state,
-            types=await enrichment.unit_types_of(annotation.id),
+            types=types,
             topics=await enrichment.topics_of(row.entry_id),
             reminder_at=row.reminder_at,
             reminder_text=row.reminder_text,
@@ -348,7 +350,28 @@ async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
             row.ack_message_id,
             enrichment.render(shown),
             entry_id=row.entry_id,
+            # Модель нашла открытый вопрос — предлагаем завести петлю. Именно
+            # предлагаем: петля заводится только нажатием (`vision.md` §5.2),
+            # а спрашивать отдельным сообщением нельзя — одна запись стоит
+            # одного уведомления.
+            offer_loop=AnnotationType.LOOP in types,
         )
+
+
+async def touch(*, notifier: Notifier, chat_id: int, timezone: str) -> list[str]:
+    """Тик касаний. Возвращает слоты, по которым что-то ушло.
+
+    Молчание — обычный исход, а не сбой: на молодом архиве сказать чаще всего
+    нечего (ADR-0013). Почему это не молчание системы вообще — потому что
+    каждый такой тик оставляет строку в журнале, и `/status` умеет объяснить,
+    почему сводки сегодня не было.
+    """
+    sent = await digest.tick(
+        now=datetime.now(UTC), timezone=timezone, chat_id=chat_id, notifier=notifier
+    )
+    if sent:
+        logger.info("касания отправлены: %s", ", ".join(slot.value for slot in sent))
+    return [slot.value for slot in sent]
 
 
 async def clean_audio(*, retention_days: int) -> int:

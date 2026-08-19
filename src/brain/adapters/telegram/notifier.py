@@ -9,6 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from brain.adapters.telegram import digest_keyboards
 from brain.storage.models.annotation import AnnotationType
 
 logger = logging.getLogger(__name__)
@@ -56,26 +57,36 @@ def annotation_data(action: str, entry_id: int) -> str:
     return f"{ANNOTATION_PREFIX}:{action}:{entry_id}"
 
 
-def annotation_keyboard(entry_id: int) -> InlineKeyboardMarkup:
-    """Две кнопки под готовым разбором.
+def annotation_keyboard(entry_id: int, *, offer_loop: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки под готовым разбором.
 
     «Не туда» открывает список типов, а не правит что-то само: нажатие без
     указания верного типа сказало бы «модель ошиблась» и ничего не дало бы
     ни архиву, ни eval'у. Два нажатия вместо одного — цена за то, чтобы
     поправка была материалом, а не жалобой.
+
+    Третья кнопка появляется, когда разметка нашла открытый вопрос. Петля
+    заводится только с подтверждением (`vision.md` §5.2), но спрашивать
+    отдельным сообщением нельзя: одна запись стоит одного уведомления.
     """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows = [
+        [
+            InlineKeyboardButton(text="Не туда", callback_data=annotation_data(WRONG, entry_id)),
+            InlineKeyboardButton(
+                text="🔒 Приватная", callback_data=annotation_data(PRIVATE, entry_id)
+            ),
+        ]
+    ]
+    if offer_loop:
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="Не туда", callback_data=annotation_data(WRONG, entry_id)
-                ),
-                InlineKeyboardButton(
-                    text="🔒 Приватная", callback_data=annotation_data(PRIVATE, entry_id)
-                ),
+                    text="🔁 Открытый вопрос",
+                    callback_data=digest_keyboards.loop_data(digest_keyboards.NEW, entry_id),
+                )
             ]
-        ]
-    )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def type_keyboard(entry_id: int, names: dict[AnnotationType, str]) -> InlineKeyboardMarkup:
@@ -122,16 +133,66 @@ class TelegramNotifier:
         await self._edit(chat_id, message_id, text, markup=yes_no_keyboard(entry_id))
 
     async def show_annotation(
-        self, chat_id: int, message_id: int, text: str, *, entry_id: int
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        entry_id: int,
+        offer_loop: bool = False,
     ) -> None:
-        """Дописать разметку к подтверждению приёма и повесить две кнопки.
+        """Дописать разметку к подтверждению приёма и повесить кнопки.
 
         Это по-прежнему то же самое сообщение: одна запись стоит одного
         уведомления, и разбор — не повод его удваивать. Правка сообщения
         в Telegram уведомления не шлёт, так что появление разметки владельца
         не дёргает.
         """
-        await self._edit(chat_id, message_id, text, markup=annotation_keyboard(entry_id))
+        await self._edit(
+            chat_id,
+            message_id,
+            text,
+            markup=annotation_keyboard(entry_id, offer_loop=offer_loop),
+        )
+
+    async def send_morning(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        commitment_ids: list[int],
+        loop_id: int | None,
+        loop_stuck: bool = False,
+    ) -> int:
+        """Утренняя сводка. Со звуком: это единственный якорь дня.
+
+        Утренняя сводка — отдельная категория, не инициативная (`vision.md` §7),
+        и правило «инициативные беззвучно» на неё не распространяется. Сводка,
+        пришедшая беззвучно, не была бы якорем.
+        """
+        message = await self._bot.send_message(
+            chat_id,
+            text,
+            reply_markup=digest_keyboards.morning_keyboard(
+                commitment_ids, loop_id, loop_stuck=loop_stuck
+            ),
+        )
+        return message.message_id
+
+    async def send_evening(self, chat_id: int, text: str, *, entry_ids: list[int]) -> int:
+        """Вечерний разбор. Беззвучно: это инициативное касание."""
+        message = await self._bot.send_message(
+            chat_id,
+            text,
+            reply_markup=digest_keyboards.evening_keyboard(entry_ids),
+            disable_notification=True,
+        )
+        return message.message_id
+
+    async def send_quietly(self, chat_id: int, text: str) -> int:
+        """Беззвучно и без кнопок: всплывшая запись, недельное ревью."""
+        message = await self._bot.send_message(chat_id, text, disable_notification=True)
+        return message.message_id
 
     async def _edit(
         self, chat_id: int, message_id: int, text: str, *, markup: InlineKeyboardMarkup | None

@@ -70,7 +70,7 @@ async def _capture(body: str, message_id: int = 10) -> None:
 
 async def test_worker_is_dead_when_it_never_reported(engine: AsyncEngine) -> None:
     """Пустая таблица расписаний — воркер не запускался ни разу."""
-    collected = await status.collect()
+    collected = await status.collect(TIMEZONE)
 
     assert not collected.worker.alive
     assert collected.worker.last_beat is None
@@ -79,14 +79,14 @@ async def test_worker_is_dead_when_it_never_reported(engine: AsyncEngine) -> Non
 async def test_fresh_beat_means_alive(engine: AsyncEngine) -> None:
     await _beat(engine, ago=timedelta(seconds=5))
 
-    assert (await status.collect()).worker.alive
+    assert (await status.collect(TIMEZONE)).worker.alive
 
 
 async def test_stale_beat_means_dead(engine: AsyncEngine) -> None:
     """Ровно тот случай 16 августа: бот отвечает, воркер лежит."""
     await _beat(engine, ago=timedelta(minutes=30))
 
-    collected = await status.collect()
+    collected = await status.collect(TIMEZONE)
 
     assert not collected.worker.alive
     assert collected.worker.silent_for is not None
@@ -112,7 +112,7 @@ async def test_counts_reflect_the_archive(engine: AsyncEngine, tmp_path: Path) -
             audio_dir=tmp_path,
         )
 
-    collected = await status.collect()
+    collected = await status.collect(TIMEZONE)
 
     assert collected.entries == 3
     assert collected.voice_without_transcript == 1
@@ -135,7 +135,7 @@ async def test_failed_jobs_are_counted_separately(engine: AsyncEngine) -> None:
             )
         )
 
-    collected = await status.collect()
+    collected = await status.collect(TIMEZONE)
 
     assert collected.jobs_failed == 1
     assert collected.jobs_queued == 0
@@ -145,7 +145,7 @@ async def test_next_reminder_is_the_earliest_unfired(engine: AsyncEngine) -> Non
     await _capture("напомни через 3 часа про созвон", message_id=10)
     await _capture("напомни через 1 час выпить воды", message_id=11)
 
-    collected = await status.collect()
+    collected = await status.collect(TIMEZONE)
 
     assert collected.next_reminder is not None
     assert "выпить воды" in collected.next_reminder.text
@@ -155,12 +155,12 @@ async def test_fired_reminders_are_not_shown(engine: AsyncEngine) -> None:
     await _capture("напомни через 1 час выпить воды", message_id=11)
     assert await repository.mark_reminder_fired(1)
 
-    assert (await status.collect()).next_reminder is None
+    assert (await status.collect(TIMEZONE)).next_reminder is None
 
 
 async def test_private_mode_is_reported(engine: AsyncEngine) -> None:
-    assert not (await status.collect()).private_mode
+    assert not (await status.collect(TIMEZONE)).private_mode
 
     await repository.switch_private_mode(enabled=True)
 
-    assert (await status.collect()).private_mode
+    assert (await status.collect(TIMEZONE)).private_mode

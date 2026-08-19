@@ -9,15 +9,29 @@
 5. напоминание показывается в таймзоне владельца, а не в UTC сервера
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 from brain.adapters.telegram.status_text import render
-from brain.core.status import NextReminder, SystemStatus, WorkerStatus
+from brain.core.status import NextReminder, SystemStatus, Touches, WorkerStatus
+from brain.storage.models.touch import SilenceReason, Touch, TouchCategory, TouchSlot
 
 TIMEZONE = "Europe/Moscow"
 STALE_AFTER = timedelta(minutes=3)
+
+# Касания по умолчанию: сводки сегодня ещё не было, бюджет цел, тишины нет.
+# Большинство тестов здесь проверяют другое, и разбирать блок касаний им ни к
+# чему; те, что проверяют его, передают своё.
+NO_TOUCHES = Touches(
+    morning=None,
+    spent=0,
+    budget=3,
+    quiet_until=None,
+    open_commitments=0,
+    open_loops=0,
+    auto_resolved=0,
+)
 
 
 def _status(
@@ -37,6 +51,7 @@ def _status(
     # а обычную работу, и блок «система разгоняется» им только мешал бы.
     topics: int = 9,
     archive_age_days: int = 60,
+    touches: Touches | None = None,
 ) -> SystemStatus:
     last_beat = None if silent_for is None else datetime.now(UTC) - silent_for
     return SystemStatus(
@@ -53,6 +68,7 @@ def _status(
         private_mode=private_mode,
         topics=topics,
         archive_age_days=archive_age_days,
+        touches=touches or NO_TOUCHES,
     )
 
 
@@ -158,3 +174,92 @@ def test_days_are_declined_like_russian_words() -> None:
     for days, expected in ((1, "1 день"), (2, "2 дня"), (5, "5 дней"), (11, "11 дней")):
         report = render(_status(archive_age_days=days, topics=1), timezone=TIMEZONE)
         assert f"архиву {expected}" in report
+
+
+# --- Касания: три состояния сводки вместо двух ---
+
+
+def _touch(*, sent_at: datetime | None = None, reason: SilenceReason | None = None) -> Touch:
+    return Touch(
+        slot=TouchSlot.MORNING,
+        category=TouchCategory.MORNING,
+        local_date=date(2026, 8, 20),
+        sent_at=sent_at,
+        silence_reason=reason,
+        payload={},
+    )
+
+
+def test_missing_summary_and_silent_summary_read_differently() -> None:
+    """Три состояния, а не два, и это главное, ради чего журнал заведён.
+
+    «Сводки ещё не было» означает, что до решения не дошли вовсе — например,
+    воркер не работал в нужный час. «Промолчала» означает, что решение принято
+    и всё в порядке. Свести их в одну строку значило бы вернуть ту самую
+    неотличимость молчания от смерти, из-за которой прятались дыры Фаз 1–2.
+    """
+    absent = render(_status(), timezone=TIMEZONE)
+    silent = render(
+        _status(
+            touches=Touches(
+                morning=_touch(reason=SilenceReason.NOTHING_TO_SAY),
+                spent=0,
+                budget=3,
+                quiet_until=None,
+                open_commitments=0,
+                open_loops=0,
+                auto_resolved=0,
+            )
+        ),
+        timezone=TIMEZONE,
+    )
+
+    assert "Сводки сегодня ещё не было" in absent
+    assert "промолчала: нечего было сказать" in silent
+
+
+def test_quiet_period_is_visible_with_the_way_out() -> None:
+    """Тишина без способа её снять читается как поломка."""
+    report = render(
+        _status(
+            touches=Touches(
+                morning=_touch(reason=SilenceReason.QUIET),
+                spent=0,
+                budget=3,
+                quiet_until=datetime(2026, 8, 27, 9, 0, tzinfo=UTC),
+                open_commitments=0,
+                open_loops=0,
+                auto_resolved=0,
+            )
+        ),
+        timezone=TIMEZONE,
+    )
+
+    assert "🔇 Молчу до" in report
+    assert "/resume" in report
+
+
+def test_auto_resolved_debt_is_answerable_but_never_pushed() -> None:
+    """Про долг не сообщают уведомлением, но спросить владелец вправе.
+
+    Это ровно граница принципа 2 из `vision.md` §7.0: запрещено сообщение,
+    а не знание.
+    """
+    report = render(
+        _status(
+            touches=Touches(
+                morning=None,
+                spent=1,
+                budget=3,
+                quiet_until=None,
+                open_commitments=4,
+                open_loops=2,
+                auto_resolved=3,
+            )
+        ),
+        timezone=TIMEZONE,
+    )
+
+    assert "Зафиксировано само по сроку: 3" in report
+    assert "Висит: дел 4, открытых вопросов 2" in report
+    assert "Касаний сегодня: 1 из 3" in report

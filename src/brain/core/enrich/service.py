@@ -167,6 +167,10 @@ async def annotate_pending(
             new_topics=new_topics,
             units=result.units,
             transcript_id=transcripts.get(entry_id),
+            # Текст нужен делам: они хранят снимок своего куска, а не только
+            # отрезок, — иначе сводка перестанет их показывать после перепрогона
+            # расшифровки, сдвинувшего границы.
+            text=texts[entry_id],
         )
         saved.append(entry_id)
 

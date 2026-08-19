@@ -55,8 +55,15 @@ reindex *args:
     uv run python -m brain.maintenance reindex {{args}}
 
 # Записи без разметки. Список считается по данным, а не по журналу очереди.
+# `--stale` — перепрогон разметки, сделанной до ADR-0012: у неё нет смысловых
+# единиц, а из них выводятся дела Фазы 4. Нужна живая модель.
 reenrich *args:
     uv run python -m brain.maintenance reenrich {{args}}
+
+# Дела по уже размеченным единицам — без вызова модели. Разовая операция
+# при переходе на Фазу 4: разметка до неё про дела ничего не знала.
+backfill-commitments *args:
+    uv run python -m brain.maintenance backfill-commitments {{args}}
 
 # Прогон eval классификации: accuracy, матрица ошибок, доля ошибок среди
 # «уверен». Разметку набора делает владелец — иначе меряем модель моделью.
@@ -67,6 +74,11 @@ eval-classification *args:
 # Без числа отсюда Фаза 2 не закрыта.
 eval-retrieval *args:
     uv run python -m evals.retrieval.run {{args}}
+
+# Повтор касаний по прошедшим дням живого архива: что ушло бы и что промолчало.
+# Ничего не пишет и не отправляет. Оценку 1–5 ставит владелец.
+eval-digest *args:
+    uv run python -m evals.digest.replay {{args}}
 
 # Быстрые тесты: без БД, без сети. Это же гоняет Stop-хук.
 test:

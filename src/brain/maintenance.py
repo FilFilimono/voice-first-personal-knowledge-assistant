@@ -23,16 +23,20 @@ import argparse
 import asyncio
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from brain.config import get_runtime_settings
+from brain.core.digest import commitments
 from brain.core.enrich import repository as enrich_repository
+from brain.core.memory.repository import latest_transcript
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import repository as retrieval_repository
 from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
 from brain.storage.db import dispose_engine, session_scope
+from brain.storage.models.annotation import Annotation, AnnotationType
 from brain.storage.models.entry import Entry, EntryKind
 from brain.storage.models.transcript import Transcript
+from brain.storage.models.unit import EntryUnit
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +167,119 @@ async def reenrich(*, dry_run: bool) -> int:
     return len(entries)
 
 
+async def backfill_commitments(*, dry_run: bool) -> int:
+    """Завести дела по единицам, которые уже размечены. **Без вызова модели.**
+
+    Нужна ровно один раз, при переходе на Фазу 4: дело заводится в транзакции
+    разметки (ADR-0013), а разметка, сделанная до Фазы 4, про дела ничего
+    не знала. Перепрогонять её ради этого незачем — единицы уже есть, дело
+    выводится из них кодом, и модель здесь не нужна вовсе.
+
+    Идемпотентна: повторный прогон дублей не заведёт, это держит уникальность
+    по отрезку в базе.
+
+    Записи, у которых **нет единиц вовсе** (разметка до ADR-0012), эта команда
+    не чинит: вывести из них дела нечем. Их список печатается отдельно —
+    им нужна переразметка, то есть `just reenrich --stale` и живая модель.
+    """
+    async with session_scope() as session:
+        latest = (
+            await session.execute(
+                select(Annotation.source_entry_id, func.max(Annotation.id))
+                .group_by(Annotation.source_entry_id)
+                .order_by(Annotation.source_entry_id)
+            )
+        ).all()
+
+    created = 0
+    without_units: list[int] = []
+    for entry_id, annotation_id in latest:
+        async with session_scope() as session:
+            has_units = await session.scalar(
+                select(EntryUnit.id).where(EntryUnit.annotation_id == annotation_id).limit(1)
+            )
+            if has_units is None:
+                without_units.append(int(entry_id))
+                continue
+
+            body = await session.scalar(
+                select(func.coalesce(latest_transcript(), Entry.raw_text)).where(
+                    Entry.id == entry_id
+                )
+            )
+            if dry_run:
+                pending = await session.scalars(
+                    select(EntryUnit.id).where(
+                        EntryUnit.annotation_id == annotation_id,
+                        EntryUnit.type == AnnotationType.TASK,
+                    )
+                )
+                created += len(list(pending))
+                continue
+
+            created += await commitments.create_in(
+                session,
+                entry_id=int(entry_id),
+                annotation_id=int(annotation_id),
+                text=str(body or ""),
+            )
+
+    print(f"Дел {'нашлось бы' if dry_run else 'заведено'}: {created}")
+    if without_units:
+        print(
+            f"\nБез смысловых единиц (разметка до ADR-0012): {len(without_units)} записей.\n"
+            "  " + ", ".join(str(entry_id) for entry_id in without_units) + "\n"
+            "  Им нужна переразметка: just reenrich --stale (нужна живая модель)."
+        )
+    if dry_run:
+        print("\nЭто прогон вхолостую: ничего не записано. Уберите --dry-run.")
+    return created
+
+
+async def reenrich_stale(*, dry_run: bool) -> int:
+    """Поставить переразметку записям, чья разметка сделана до ADR-0012.
+
+    Такая разметка не имеет смысловых единиц, а из них выводятся дела Фазы 4
+    и предложение завести петлю. Отдельно от `reenrich` намеренно: та ставит
+    задания на **неразмеченное**, а это перепрогон уже размеченного — операция
+    другой цены, и путать их нельзя.
+
+    Перепрогон добавляет строку разметки, а не правит старую (ADR-0011), так
+    что откатывать нечего: не понравился результат — предыдущая разметка цела.
+    """
+    async with session_scope() as session:
+        latest = (
+            select(Annotation.source_entry_id, func.max(Annotation.id).label("id"))
+            .group_by(Annotation.source_entry_id)
+            .subquery()
+        )
+        entry_ids = list(
+            await session.scalars(
+                select(latest.c.source_entry_id)
+                .where(~select(EntryUnit.id).where(EntryUnit.annotation_id == latest.c.id).exists())
+                .order_by(latest.c.source_entry_id)
+            )
+        )
+
+    if not entry_ids:
+        print("Разметки без смысловых единиц нет.")
+        return 0
+
+    print(f"Записей с разметкой до ADR-0012: {len(entry_ids)}")
+    print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
+
+    if dry_run:
+        print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
+        return 0
+
+    for entry_id in entry_ids:
+        async with capture_transaction() as uow:
+            await uow.enqueue(ENRICH, {"entry_id": int(entry_id)})
+
+    print(f"\nПоставлено заданий: {len(entry_ids)}. Запустите воркер: just worker")
+    return len(entry_ids)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Эксплуатационные команды Brain")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -196,6 +313,21 @@ async def main() -> None:
         action="store_true",
         help="показать, что было бы сделано, и ничего не менять",
     )
+    annotate.add_argument(
+        "--stale",
+        action="store_true",
+        help="перепрогнать разметку, сделанную до ADR-0012 (без смысловых единиц)",
+    )
+
+    backfill = commands.add_parser(
+        "backfill-commitments",
+        help="завести дела по уже размеченным единицам, без вызова модели",
+    )
+    backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что было бы сделано, и ничего не менять",
+    )
 
     arguments = parser.parse_args()
     get_runtime_settings()
@@ -207,7 +339,12 @@ async def main() -> None:
         elif arguments.command == "reindex":
             await reindex(dry_run=arguments.dry_run)
         elif arguments.command == "reenrich":
-            await reenrich(dry_run=arguments.dry_run)
+            if arguments.stale:
+                await reenrich_stale(dry_run=arguments.dry_run)
+            else:
+                await reenrich(dry_run=arguments.dry_run)
+        elif arguments.command == "backfill-commitments":
+            await backfill_commitments(dry_run=arguments.dry_run)
     finally:
         await dispose_engine()
 

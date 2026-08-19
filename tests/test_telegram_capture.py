@@ -23,7 +23,7 @@ from aiogram import Bot, Dispatcher
 
 from brain.adapters.telegram.bot import COMMANDS, build_dispatcher, register_commands
 from brain.config import Settings
-from brain.core.status import SystemStatus, WorkerStatus
+from brain.core.status import SystemStatus, Touches, WorkerStatus
 from tests.fakes import FakeUnitOfWork
 from tests.telegram_harness import (
     OWNER_ID,
@@ -198,9 +198,18 @@ async def test_status_reports_the_worker_first(
         private_mode=False,
         topics=9,
         archive_age_days=60,
+        touches=Touches(
+            morning=None,
+            spent=0,
+            budget=3,
+            quiet_until=None,
+            open_commitments=0,
+            open_loops=0,
+            auto_resolved=0,
+        ),
     )
 
-    async def fake_collect() -> SystemStatus:
+    async def fake_collect(timezone: str) -> SystemStatus:
         return collected
 
     monkeypatch.setattr("brain.adapters.telegram.handlers.core_status.collect", fake_collect)

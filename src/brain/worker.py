@@ -41,6 +41,8 @@ from brain.core.scheduler.queue import (
     REGENERALIZE,
     REGENERALIZE_SCHEDULE,
     REMINDER,
+    TOUCH,
+    TOUCH_SCHEDULE,
     TRANSCRIBE,
 )
 from brain.storage.db import asyncpg_dsn
@@ -189,6 +191,26 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
         записей появилось с прошлого раза, и на трёх новых не делает ничего.
         """
         await jobs.regeneralize_topics(model=model, embedder=embedder)
+
+    @pgq.sm.schedule(TOUCH, TOUCH_SCHEDULE)
+    async def touch(schedule: Schedule) -> None:
+        """Касания: утренняя сводка, всплывание старого, вечерний разбор, ревью.
+
+        Расписание частое, а сообщений мало: тик смотрит, наступил ли момент
+        какого-нибудь слота у владельца, и почти всегда не делает ничего.
+        Почему не `0 9 * * *` — см. `TOUCH_SCHEDULE`.
+
+        Чат берётся из whitelist: пользователь один (ADR-0003), и в личной
+        переписке `chat_id` совпадает с `user_id`. Пустой whitelist означает,
+        что бот никого не слушает, — тогда и говорить некому.
+        """
+        if not settings.telegram_allowed_user_ids:
+            return
+        await jobs.touch(
+            notifier=notifier,
+            chat_id=settings.telegram_allowed_user_ids[0],
+            timezone=settings.brain_timezone,
+        )
 
     @pgq.sm.schedule(HEARTBEAT, HEARTBEAT_SCHEDULE)
     async def heartbeat(schedule: Schedule) -> None:
