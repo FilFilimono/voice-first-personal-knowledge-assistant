@@ -92,3 +92,23 @@ def test_allowed_user_ids_reject_garbage(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(ConfigError):
         get_settings()
+
+
+def test_empty_quota_setting_means_unknown_not_a_crash() -> None:
+    """`ENRICH_DAILY_QUOTA=` без значения — законный способ сказать «не знаю».
+
+    Найдено при написании ADR-0014: пустая переменная роняла приложение
+    на старте с трейсом pydantic. Мина того же рода, что чинилась в тот день,
+    только с другой стороны — и попала бы она в `.env.example`, то есть
+    к владельцу с первого запуска.
+    """
+    settings = Settings(_env_file=None, enrich_daily_quota="", embedding_daily_quota="  ")
+
+    assert settings.enrich_daily_quota is None
+    assert settings.embedding_daily_quota is None
+
+
+def test_quota_setting_still_parses_a_number() -> None:
+    settings = Settings(_env_file=None, embedding_daily_quota="1000")
+
+    assert settings.embedding_daily_quota == 1000

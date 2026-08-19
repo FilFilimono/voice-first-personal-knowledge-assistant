@@ -97,14 +97,42 @@ class Outcome:
     entry_ids: list[int] = field(default_factory=list)
 
 
+def requests_for(entries: int, *, batch_limit: int) -> int:
+    """Сколько запросов к модели уйдёт на разметку такого числа записей.
+
+    Нужна командам обслуживания: до 20 августа 2026 «поставить разметку
+    на 37 записей» выглядело как 37 запросов, а на деле это две пачки в два
+    прогона — четыре. Разница ровно та, из-за которой в суточную квоту
+    упирались вслепую.
+
+    Два прогона на пачку — не запас, а устройство разметки: состояние
+    считается по их расхождению (ADR-0011).
+    """
+    if entries <= 0:
+        return 0
+    return -(-entries // batch_limit) * RUNS
+
+
 async def annotate_pending(
     model: LanguageModel,
     embedder: Embedder,
     *,
     limit: int,
+    entry_ids: list[int] | None = None,
 ) -> Outcome:
-    """Разметить всё, что ждёт разметки. Вернуть итог прохода."""
-    entries = await repository.entries_needing_annotation(limit)
+    """Разметить всё, что ждёт разметки. Вернуть итог прохода.
+
+    `entry_ids` переключает выборку на **перепрогон явного списка** — записей,
+    у которых разметка уже есть, но устарела. Обычный проход их не видит
+    и видеть не должен: он отбирает неразмеченное. 19 августа 2026 попытка
+    сделать перепрогон обычным проходом поставила 37 заданий, ни одно
+    из которых не нашло бы себе работы.
+    """
+    entries = (
+        await repository.entries_for_reannotation(entry_ids)
+        if entry_ids is not None
+        else await repository.entries_needing_annotation(limit)
+    )
     if not entries:
         return Outcome()
 

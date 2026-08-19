@@ -22,15 +22,20 @@
 import argparse
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 
-from brain.config import get_runtime_settings
+import brain.core.quota as quota
+from brain.config import get_runtime_settings, get_settings
+from brain.core import enrich as enrichment
 from brain.core.digest import commitments
 from brain.core.enrich import repository as enrich_repository
+from brain.core.llm.gemini import CHEAP
 from brain.core.memory.repository import latest_transcript
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import repository as retrieval_repository
+from brain.core.retrieval.gemini import EMBEDDING
 from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
 from brain.storage.db import dispose_engine, session_scope
 from brain.storage.models.annotation import Annotation, AnnotationType
@@ -121,6 +126,9 @@ async def reindex(*, dry_run: bool) -> int:
 
     print(f"Записей без индекса: {len(entry_ids)}")
     print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
+    # Одна запись — один запрос к эмбеддингам: все её чанки уходят одним
+    # батчем. Индексация архива поэтому упирается в квоту раньше разметки.
+    await _report_cost(len(entry_ids), tier=EMBEDDING, limit=get_settings().embedding_daily_quota)
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
@@ -154,6 +162,12 @@ async def reenrich(*, dry_run: bool) -> int:
 
     print(f"Записей без разметки: {len(entries)}")
     print("  " + ", ".join(str(entry.entry_id) for entry in entries))
+    settings = get_settings()
+    await _report_cost(
+        enrichment.requests_for(len(entries), batch_limit=settings.enrich_batch_limit),
+        tier=CHEAP,
+        limit=settings.enrich_daily_quota,
+    )
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
@@ -241,43 +255,71 @@ async def reenrich_stale(*, dry_run: bool) -> int:
 
     Такая разметка не имеет смысловых единиц, а из них выводятся дела Фазы 4
     и предложение завести петлю. Отдельно от `reenrich` намеренно: та ставит
-    задания на **неразмеченное**, а это перепрогон уже размеченного — операция
-    другой цены, и путать их нельзя.
+    задания на **неразмеченное**, а это перепрогон уже размеченного.
+
+    **Задания ставятся пачками с явным списком записей, а не по заданию
+    на запись.** Первая редакция этой команды (19 августа 2026) ставила 37
+    заданий без списка — и они бы ничего не сделали: обработчик отбирает
+    неразмеченное, а у этих записей разметка есть. Нашлось разбором очереди
+    назавтра, `attempts = 0` у всех тридцати семи.
+
+    Заодно это честная цена: 37 записей — четыре запроса к модели, а не 37.
 
     Перепрогон добавляет строку разметки, а не правит старую (ADR-0011), так
     что откатывать нечего: не понравился результат — предыдущая разметка цела.
     """
-    async with session_scope() as session:
-        latest = (
-            select(Annotation.source_entry_id, func.max(Annotation.id).label("id"))
-            .group_by(Annotation.source_entry_id)
-            .subquery()
-        )
-        entry_ids = list(
-            await session.scalars(
-                select(latest.c.source_entry_id)
-                .where(~select(EntryUnit.id).where(EntryUnit.annotation_id == latest.c.id).exists())
-                .order_by(latest.c.source_entry_id)
-            )
-        )
+    entry_ids = await enrich_repository.stale_entry_ids()
 
     if not entry_ids:
         print("Разметки без смысловых единиц нет.")
         return 0
 
+    settings = get_settings()
+    batch = settings.enrich_batch_limit
+    batches = [entry_ids[start : start + batch] for start in range(0, len(entry_ids), batch)]
+    planned = enrichment.requests_for(len(entry_ids), batch_limit=batch)
+
     print(f"Записей с разметкой до ADR-0012: {len(entry_ids)}")
     print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
+    await _report_cost(planned, tier=CHEAP, limit=settings.enrich_daily_quota)
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
         return 0
 
-    for entry_id in entry_ids:
+    for chunk in batches:
         async with capture_transaction() as uow:
-            await uow.enqueue(ENRICH, {"entry_id": int(entry_id)})
+            await uow.enqueue(ENRICH, {"entry_ids": chunk})
 
-    print(f"\nПоставлено заданий: {len(entry_ids)}. Запустите воркер: just worker")
-    return len(entry_ids)
+    print(f"\nПоставлено заданий: {len(batches)}. Запустите воркер: just worker")
+    return len(batches)
+
+
+async def _report_cost(planned: int, *, tier: str, limit: int | None) -> None:
+    """Сказать, во сколько запросов обойдётся команда и хватит ли остатка.
+
+    Появилось после 20 августа 2026: суточная квота кончилась вслепую, потому
+    что расход было неоткуда взять, а цену команды — неоткуда узнать.
+
+    Печатается **до** постановки заданий: предупреждение после того, как всё
+    поставлено, ничего не меняет.
+    """
+    now = datetime.now(UTC)
+    used = await quota.used(now, tier=tier, limit=limit)
+
+    print(f"\nЗапросов к модели уйдёт: {planned}")
+    if used.limit is None:
+        print(f"  Сегодня уже потрачено: {used.spent}. Суточный лимит неизвестен.")
+        return
+
+    left = used.left or 0
+    print(f"  Сегодня потрачено: {used.spent} из {used.limit}, останется {max(0, left - planned)}.")
+    if planned > left:
+        resets = quota.resets_at(now)
+        print(
+            f"  ⚠️  Не хватит: остаток {used.left}. Часть заданий упрётся в квоту\n"
+            f"     и будет ждать сброса — он в {resets:%H:%M %d.%m} по вашему времени."
+        )
 
 
 async def main() -> None:

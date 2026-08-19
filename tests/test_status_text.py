@@ -14,7 +14,8 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from brain.adapters.telegram.status_text import render
-from brain.core.status import NextReminder, SystemStatus, Touches, WorkerStatus
+from brain.core.quota import Usage
+from brain.core.status import NextReminder, Quota, SystemStatus, Touches, WorkerStatus
 from brain.storage.models.touch import SilenceReason, Touch, TouchCategory, TouchSlot
 
 TIMEZONE = "Europe/Moscow"
@@ -23,6 +24,14 @@ STALE_AFTER = timedelta(minutes=3)
 # Касания по умолчанию: сводки сегодня ещё не было, бюджет цел, тишины нет.
 # Большинство тестов здесь проверяют другое, и разбирать блок касаний им ни к
 # чему; те, что проверяют его, передают своё.
+# Квота по умолчанию: израсходована малая часть, и строка про неё молчит.
+# Тесты, которые её проверяют, передают своё.
+QUIET_QUOTA = Quota(
+    embedding=Usage(tier="embedding", spent=3, refused=0, limit=1000),
+    enrich=Usage(tier="cheap", spent=2, refused=0, limit=None),
+    resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC),
+)
+
 NO_TOUCHES = Touches(
     morning=None,
     spent=0,
@@ -52,6 +61,7 @@ def _status(
     topics: int = 9,
     archive_age_days: int = 60,
     touches: Touches | None = None,
+    quota: Quota | None = None,
 ) -> SystemStatus:
     last_beat = None if silent_for is None else datetime.now(UTC) - silent_for
     return SystemStatus(
@@ -69,6 +79,7 @@ def _status(
         topics=topics,
         archive_age_days=archive_age_days,
         touches=touches or NO_TOUCHES,
+        quota=quota or QUIET_QUOTA,
     )
 
 
@@ -263,3 +274,60 @@ def test_auto_resolved_debt_is_answerable_but_never_pushed() -> None:
     assert "Зафиксировано само по сроку: 3" in report
     assert "Висит: дел 4, открытых вопросов 2" in report
     assert "Касаний сегодня: 1 из 3" in report
+
+
+# --- Квота: чтобы в неё не упирались вслепую ---
+
+
+def _quota(spent: int, *, limit: int | None = 1000, refused: int = 0) -> Quota:
+    return Quota(
+        embedding=Usage(tier="embedding", spent=spent, refused=refused, limit=limit),
+        enrich=Usage(tier="cheap", spent=0, refused=0, limit=None),
+        resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC),
+    )
+
+
+def test_quota_is_quiet_while_there_is_plenty_left() -> None:
+    """Пока израсходована малая часть — это не новость.
+
+    Строка, которая каждый день сообщает «всё в порядке», перестаёт читаться
+    ровно к тому дню, когда она нужна. Та же логика, что у остальных разделов
+    `/status`: нечего показать — строки нет.
+    """
+    assert "эмбеддинг" not in render(_status(quota=_quota(12)), timezone=TIMEZONE).lower()
+
+
+def test_quota_appears_when_half_is_gone() -> None:
+    """Половина — момент, когда предупреждение ещё что-то меняет."""
+    report = render(_status(quota=_quota(700)), timezone=TIMEZONE)
+
+    assert "700 из 1000" in report
+
+
+def test_exhausted_quota_says_when_it_comes_back() -> None:
+    """«Кончилась» без «когда вернётся» заставляет гадать.
+
+    Сброс — в полночь по тихоокеанскому времени, показывается в таймзоне
+    владельца: 07:00 UTC это 10:00 в Москве.
+    """
+    report = render(_status(quota=_quota(1000, refused=14)), timezone=TIMEZONE)
+
+    assert "🔴" in report
+    assert "1000 из 1000" in report
+    assert "10:00" in report
+    assert "Отказов сегодня: 14" in report
+
+
+def test_unknown_limit_is_never_shown_as_a_number() -> None:
+    """Лимит, которого мы не знаем, не выдумывается.
+
+    Число из головы читалось бы как измеренное — та же ошибка, из-за которой
+    цены в проекте помечены датой проверки.
+    """
+    report = render(_status(quota=_quota(40, limit=None)), timezone=TIMEZONE)
+    line = report.split("Запросов к эмбеддингам")[1].splitlines()[0]
+
+    assert "лимит неизвестен" in line
+    # Единственное число в строке — израсходованное. Остатка нет, потому что
+    # он неизвестен, а не потому что он ноль.
+    assert [word for word in line.replace(":", " ").split() if word.isdigit()] == ["40"]

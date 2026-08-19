@@ -24,11 +24,13 @@
 """
 
 import math
+import time
 from collections.abc import Callable
 from typing import Any
 
 import httpx
 
+from brain.core.llm.accounting import record
 from brain.core.retrieval.errors import EmbeddingError, ProviderUnavailableError
 from brain.storage.models.chunk import DIMENSIONS
 
@@ -40,6 +42,16 @@ DOCUMENT = "RETRIEVAL_DOCUMENT"
 QUERY = "RETRIEVAL_QUERY"
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+
+# Тир для `llm_calls`. Эмбеддинги — не дешёвый и не дорогой тир текстовой
+# модели, у них своя квота и свой прайс, и смешивать их в отчёте нельзя.
+EMBEDDING = "embedding"
+
+# Назначения. Их три, потому что расход надо уметь разобрать: индексация
+# архива, поиск и проверка при старте тратят одну квоту, но по разным поводам.
+DOCUMENT_PURPOSE = "embed-document"
+QUERY_PURPOSE = "embed-query"
+CHECK_PURPOSE = "embed-check"
 
 
 class GeminiEmbedder:
@@ -81,24 +93,27 @@ class GeminiEmbedder:
         с обслуживания модель как рабочую, а 404 приходил только на вызов.
         """
         try:
-            await self._embed(["ok"], DOCUMENT)
+            await self._embed(["ok"], DOCUMENT, purpose=CHECK_PURPOSE)
         except EmbeddingError as error:
+            # Код переносится, а не теряется при заворачивании: решение
+            # «останавливаться или работать дальше» принимается по нему.
             raise ProviderUnavailableError(
-                f"модель эмбеддингов {self._model} недоступна: {error}"
+                f"модель эмбеддингов {self._model} недоступна: {error}",
+                status=error.status,
             ) from error
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Посчитать вектора кусков записи. Пустой список — без вызова."""
         if not texts:
             return []
-        return await self._embed(texts, DOCUMENT)
+        return await self._embed(texts, DOCUMENT, purpose=DOCUMENT_PURPOSE)
 
     async def embed_query(self, text: str) -> list[float]:
         """Посчитать вектор поискового запроса."""
-        [vector] = await self._embed([text], QUERY)
+        [vector] = await self._embed([text], QUERY, purpose=QUERY_PURPOSE)
         return vector
 
-    async def _embed(self, texts: list[str], task_type: str) -> list[list[float]]:
+    async def _embed(self, texts: list[str], task_type: str, *, purpose: str) -> list[list[float]]:
         body: dict[str, Any] = {
             "requests": [
                 {
@@ -113,6 +128,7 @@ class GeminiEmbedder:
             ]
         }
 
+        started = time.monotonic()
         async with self._client_factory() as client:
             try:
                 response = await client.post(
@@ -124,16 +140,53 @@ class GeminiEmbedder:
                 response.raise_for_status()
                 payload = response.json()
             except httpx.HTTPStatusError as error:
-                raise EmbeddingError(
+                # Код ответа едет **объектом**, а не только в тексте: по тексту
+                # старт воркера не мог отличить кончившуюся квоту от снятой
+                # модели и останавливался из-за временного отказа.
+                refused = EmbeddingError(
                     f"{self.provider}/{self._model}: HTTP {error.response.status_code}. "
-                    f"{_error_message(error.response)}"
-                ) from error
+                    f"{_error_message(error.response)}",
+                    status=error.response.status_code,
+                )
+                await self._count(purpose, len(texts), started, refused)
+                raise refused from error
             except (httpx.HTTPError, ValueError) as error:
-                raise EmbeddingError(
-                    f"{self.provider}/{self._model} не ответил: {error}"
-                ) from error
+                silent = EmbeddingError(f"{self.provider}/{self._model} не ответил: {error}")
+                await self._count(purpose, len(texts), started, silent)
+                raise silent from error
 
+        await self._count(purpose, len(texts), started, None)
         return [_unit(values, self._model) for values in self._extract(payload, len(texts))]
+
+    async def _count(
+        self, purpose: str, texts: int, started: float, refusal: EmbeddingError | None
+    ) -> None:
+        """Записать запрос в `llm_calls`. Одна строка — один HTTP-запрос.
+
+        Учёт стоит **в провайдере**, а не в двери `core/retrieval/embeddings`,
+        и это отличается от текстовой модели намеренно. Там дверь — единственный
+        путь наружу, и учёт в ней забыть невозможно. Здесь мимо двери ходит
+        `check_available`, а для квоты нужен каждый запрос без исключений:
+        20 августа 2026 воркер упёрся в суточный лимит вслепую именно потому,
+        что вызовов эмбеддингов в `llm_calls` не было вовсе.
+
+        Токены не пишутся: `batchEmbedContents` их не возвращает. Ноль здесь
+        честнее выдумки, а стоимость поэтому остаётся неизвестной — см.
+        `llm/pricing.py`. Квота считается **в запросах**, не в токенах.
+        """
+        await record(
+            provider=self.provider,
+            model=self._model,
+            tier=EMBEDDING,
+            purpose=purpose,
+            # Сколько текстов уехало одним запросом. Для квоты это не важно,
+            # для понимания расхода — да: батч из сорока и батч из одного
+            # стоят одинаково, и это стоит видеть.
+            entries_count=texts,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            succeeded=refusal is None,
+            error=None if refusal is None else str(refusal)[:500],
+        )
 
     def _extract(self, payload: dict[str, Any], expected: int) -> list[list[float]]:
         """Достать вектора, не принимая неполный ответ за успех.

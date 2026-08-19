@@ -17,7 +17,7 @@ from decimal import Decimal
 
 from sqlalchemy import insert
 
-from brain.core.llm.pricing import cost_usd
+from brain.core.llm.pricing import UNPRICED, cost_usd
 from brain.storage.db import session_scope
 from brain.storage.models.llm_call import LlmCall
 
@@ -39,9 +39,13 @@ async def record(
 ) -> Decimal | None:
     """Записать вызов. Вернуть его стоимость, если она известна."""
     cost = cost_usd(model, input_tokens=input_tokens, output_tokens=output_tokens)
-    if cost is None:
+    if cost is None and model not in UNPRICED:
         # Не крах, но и не мелочь: незнакомая модель означает, что расход
         # перестал считаться, а заметить это можно только по логу.
+        #
+        # Модели из `UNPRICED` сюда не попадают: про них известно, что цену
+        # вызова считать не из чего (провайдер не отдаёт токенов), и ежедневное
+        # предупреждение на каждый запрос индексации только заглушило бы лог.
         logger.warning("цена модели %s неизвестна — вызов учтён без стоимости", model)
 
     try:

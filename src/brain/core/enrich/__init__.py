@@ -19,11 +19,12 @@ from brain.core.enrich.repository import (
     drop_annotations,
     latest_annotation,
     rows_for_reply,
+    stale_entry_ids,
     topics_of,
     unannotated_count,
     unit_types_of,
 )
-from brain.core.enrich.service import PURPOSE, Outcome, annotate_pending
+from brain.core.enrich.service import PURPOSE, Outcome, annotate_pending, requests_for
 
 __all__ = [
     "NAMES",
@@ -37,7 +38,9 @@ __all__ = [
     "drop_annotations",
     "latest_annotation",
     "render",
+    "requests_for",
     "rows_for_reply",
+    "stale_entry_ids",
     "topics_of",
     "unannotated_count",
     "unit_types_of",

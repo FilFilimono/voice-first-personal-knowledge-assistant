@@ -5,6 +5,8 @@
 способы, которыми расшифровка может не получиться.
 """
 
+from brain.core.provider_errors import ProviderError
+
 
 class PrivateContentError(RuntimeError):
     """Попытка отправить приватную запись во внешний сервис.
@@ -19,11 +21,11 @@ class AudioTooLongError(RuntimeError):
     """Голосовое длиннее потолка из ADR-0007. Повтор не поможет."""
 
 
-class TranscriptionError(RuntimeError):
+class TranscriptionError(ProviderError):
     """Провайдер не ответил или ответил непонятным. Задание будет повторено."""
 
 
-class ProviderUnavailableError(RuntimeError):
+class ProviderUnavailableError(ProviderError):
     """Модели нет, она снята с обслуживания или ключу недоступна.
 
     Повторять бессмысленно: ответ не изменится, пока не поправят настройку.

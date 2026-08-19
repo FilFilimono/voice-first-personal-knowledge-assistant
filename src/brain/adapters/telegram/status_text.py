@@ -60,6 +60,10 @@ def render(status: SystemStatus, *, timezone: str) -> str:
         # вместе с командой, которая их возвращает.
         lines.append(f"❌ Упало: {status.jobs_failed} — вернуть: just failed, just requeue <id>")
 
+    quota_line = _quota(status, timezone=timezone)
+    if quota_line:
+        lines.append(quota_line)
+
     lines.append("")
     lines.extend(_touches(status, timezone=timezone))
 
@@ -136,6 +140,33 @@ SILENCE = {
     SilenceReason.QUIET: "вы просили молчать",
     SilenceReason.OVER_BUDGET: "бюджет касаний исчерпан",
 }
+
+
+def _quota(status: SystemStatus, *, timezone: str) -> str:
+    """Сколько запросов к провайдеру осталось на сегодня.
+
+    Показывается **только когда есть о чём сказать**: пока израсходована
+    небольшая часть, строка молчит, как и остальные разделы `/status`.
+
+    Появилась после 20 августа 2026, когда воркер упёрся в суточную квоту
+    эмбеддингов вслепую и не поднялся вовсе. Отвечает на единственный вопрос,
+    которого тогда не хватило: сколько ещё можно.
+    """
+    used = status.quota.embedding
+    if used.limit is None:
+        return f"📊 Запросов к эмбеддингам сегодня: {used.spent} (лимит неизвестен)"
+
+    # Порог показа. Ниже — не новость: строка каждый день сообщала бы, что
+    # всё в порядке, и её перестали бы читать до того дня, когда она нужна.
+    if used.spent < used.limit // 2 and not used.refused:
+        return ""
+
+    resets = status.quota.resets_at.astimezone(ZoneInfo(timezone))
+    mark = "🔴" if used.exhausted else "📊"
+    line = f"{mark} Запросов к эмбеддингам: {used.spent} из {used.limit}, сброс в {resets:%H:%M}"
+    if used.refused:
+        line += f"\n   Отказов сегодня: {used.refused}"
+    return line
 
 
 def _touches(status: SystemStatus, *, timezone: str) -> list[str]:

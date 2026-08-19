@@ -30,6 +30,7 @@ from brain.adapters.telegram.audio import TelegramAudioSource
 from brain.adapters.telegram.notifier import TelegramNotifier
 from brain.config import get_runtime_settings
 from brain.core import llm, stt
+from brain.core.provider_errors import ProviderError, advice
 from brain.core.scheduler import jobs
 from brain.core.scheduler.queue import (
     AUDIO_RETENTION,
@@ -71,6 +72,65 @@ def retry_executor(
     )
 
 
+async def check_models(
+    checks: list[tuple[str, str, Callable[[], Awaitable[None]]]],
+) -> list[str]:
+    """Проверить модели вызовом. Вернуть предупреждения о временных отказах.
+
+    Проверка обязана быть **настоящим вызовом**, а не сверкой со списком
+    моделей: 16 августа 2026 список показывал снятую с обслуживания модель
+    как рабочую, и правду сказал только вызов. Это в силе.
+
+    Изменилось другое, и изменилось 20 августа 2026. Кончилась бесплатная
+    суточная квота эмбеддингов, провайдер ответил `429` — и воркер не поднялся
+    вовсе. Вместе с эмбеддингами встали расшифровка, напоминания и утренняя
+    сводка, то есть в том числе «заказанное», о чём система не имеет права
+    молчать (`vision.md` §7). Квота при этом проходит сама к полуночи
+    по тихоокеанскому времени.
+
+    Поэтому теперь: **временный отказ — предупреждение, настроечный —
+    остановка.** Задания, которым нужна отказавшая модель, уйдут в ретраи
+    очереди и не потеряются (инвариант 7); сколько запросов потрачено сегодня,
+    видно в `/status`.
+
+    Проверяются все модели, даже после первого предупреждения: иначе неверное
+    имя второй выяснилось бы только назавтра, когда пройдёт квота у первой.
+    """
+    warnings: list[str] = []
+    failure: tuple[str, str, ProviderError] | None = None
+
+    for what, setting, check in checks:
+        try:
+            await check()
+        except ProviderError as raised:
+            # Python стирает переменную исключения на выходе из `except`,
+            # поэтому отказ сохраняется в отдельное имя.
+            refusal = raised
+            if refusal.fatal:
+                # Не выходим сразу: остальные модели тоже надо проверить,
+                # чтобы владелец узнал обо всём за один запуск.
+                failure = failure or (what, setting, refusal)
+                continue
+            warning = f"модель {what} временно недоступна: {refusal}\n{_advice(setting, refusal)}"
+            logger.warning("%s", warning)
+            warnings.append(warning)
+            continue
+        logger.info("модель %s доступна", what)
+
+    if failure is not None:
+        broken, setting, refusal = failure
+        raise SystemExit(
+            f"\nВоркер не запущен.\nМодель {broken}: {refusal}\n\n{_advice(setting, refusal)}\n"
+        )
+
+    return warnings
+
+
+def _advice(setting: str, error: ProviderError) -> str:
+    """Совет по коду ответа, а не один и тот же на все отказы."""
+    return advice(error.status, setting, message=str(error))
+
+
 def payload_of(job: Job) -> dict[str, Any]:
     """Разобрать полезную нагрузку задания. В ней только идентификаторы."""
     if job.payload is None:
@@ -96,43 +156,39 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
-    # и уже после того, как владелец что-то наговорил. Обе проверки —
-    # настоящие вызовы: список моделей 16 августа 2026 показывал снятую
-    # с обслуживания модель как рабочую, и правду сказал только вызов.
-    async def _check(what: str, setting: str, check: Callable[[], Awaitable[None]]) -> None:
-        try:
-            await check()
-        except (
-            stt.ProviderUnavailableError,
-            embeddings.ProviderUnavailableError,
-            llm.ProviderUnavailableError,
-        ) as error:
-            await bot.session.close()
-            await connection.close()
-            raise SystemExit(
-                f"\nВоркер не запущен.\n{error}\n\nПоправьте {setting} в .env.\n"
-            ) from None
-        logger.info("модель %s доступна", what)
-
-    await _check(
-        f"расшифровки {transcriber.provider}/{transcriber.model}",
-        "STT_MODEL",
-        transcriber.check_available,
-    )
-    await _check(
-        f"эмбеддингов {embedder.provider}/{embedder.model}",
-        "EMBEDDING_MODEL",
-        embedder.check_available,
-    )
-    # Третья проверка — по той же причине, что первые две, плюс одна своя:
-    # она заодно проверяет структурированный ответ. Модель может отвечать
-    # на generateContent и не уметь responseSchema, и выяснять это на первой
-    # пачке было бы поздно — записи к тому моменту уже накопились.
-    await _check(
-        f"разметки {model.provider}/{model.model}",
-        "ENRICH_MODEL",
-        model.check_available,
-    )
+    # и уже после того, как владелец что-то наговорил. Все три — настоящие
+    # вызовы: список моделей 16 августа 2026 показывал снятую с обслуживания
+    # модель как рабочую, и правду сказал только вызов.
+    #
+    # Третья проверка вдобавок проверяет структурированный ответ: модель может
+    # отвечать на generateContent и не уметь responseSchema, и выяснять это
+    # на первой пачке было бы поздно.
+    #
+    # Что из этого останавливает воркер, а что нет — в `check_models`.
+    try:
+        await check_models(
+            [
+                (
+                    f"расшифровки {transcriber.provider}/{transcriber.model}",
+                    "STT_MODEL",
+                    transcriber.check_available,
+                ),
+                (
+                    f"эмбеддингов {embedder.provider}/{embedder.model}",
+                    "EMBEDDING_MODEL",
+                    embedder.check_available,
+                ),
+                (
+                    f"разметки {model.provider}/{model.model}",
+                    "ENRICH_MODEL",
+                    model.check_available,
+                ),
+            ]
+        )
+    except SystemExit:
+        await bot.session.close()
+        await connection.close()
+        raise
 
     pgq = PgQueuer(AsyncpgDriver(connection))
 
@@ -163,7 +219,10 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     async def enrich(job: Job) -> None:
         payload = payload_of(job)
         await jobs.enrich(
-            entry_id=payload["entry_id"],
+            # Перепрогон приходит со списком, обычная разметка — с одной
+            # записью и разбирает всё неразмеченное разом.
+            entry_id=payload.get("entry_id", 0),
+            entry_ids=payload.get("entry_ids"),
             model=model,
             embedder=embedder,
             notifier=notifier,

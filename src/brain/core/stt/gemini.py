@@ -100,7 +100,8 @@ class GeminiTranscriber:
 
         raise ProviderUnavailableError(
             f"модель {self._model} не отвечает на generateContent: "
-            f"HTTP {response.status_code}. {_error_message(response)}"
+            f"HTTP {response.status_code}. {_error_message(response)}",
+            status=response.status_code,
         )
 
     async def transcribe(self, audio: bytes, mime_type: str) -> Transcription:
@@ -137,9 +138,12 @@ class GeminiTranscriber:
                 # Имя модели — в тексте ошибки. Без него «HTTP 404» в логе
                 # не говорит ничего: настройка живёт в `.env`, а не в коде,
                 # и первый вопрос всегда «а какая модель-то была».
+                # Код едет объектом, а не только в тексте: по тексту старт
+                # не отличал кончившуюся квоту от снятой модели.
                 raise TranscriptionError(
                     f"{self.provider}/{self._model}: HTTP {error.response.status_code}. "
-                    f"{_error_message(error.response)}"
+                    f"{_error_message(error.response)}",
+                    status=error.response.status_code,
                 ) from error
             except (httpx.HTTPError, ValueError) as error:
                 raise TranscriptionError(

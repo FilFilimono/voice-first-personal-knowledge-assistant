@@ -100,7 +100,10 @@ def build_router(settings: Settings) -> Router:
     @router.message(Command("status"))
     async def status(message: Message) -> None:
         """Что сейчас происходит — чтобы не лезть в терминал с телефона."""
-        collected = await core_status.collect(settings.brain_timezone)
+        collected = await core_status.collect(
+            settings.brain_timezone,
+            quota_limits=(settings.embedding_daily_quota, settings.enrich_daily_quota),
+        )
         await message.answer(status_text.render(collected, timezone=settings.brain_timezone))
 
     @router.message(Command("private"))

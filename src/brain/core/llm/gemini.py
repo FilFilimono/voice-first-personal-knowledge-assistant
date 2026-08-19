@@ -92,7 +92,9 @@ class GeminiChat:
                 temperature=0.0,
             )
         except LlmError as error:
-            raise ProviderUnavailableError(f"модель {self._model} недоступна: {error}") from error
+            raise ProviderUnavailableError(
+                f"модель {self._model} недоступна: {error}", status=error.status
+            ) from error
 
     async def complete(
         self,
@@ -126,9 +128,12 @@ class GeminiChat:
             except httpx.HTTPStatusError as error:
                 # Имя модели — в тексте любой ошибки: настройка живёт в `.env`,
                 # и первый вопрос по логу всегда «а какая модель-то была».
+                # Код едет объектом, а не только в тексте: по тексту старт
+                # не отличал кончившуюся квоту от снятой модели.
                 raise LlmError(
                     f"{self.provider}/{self._model}: HTTP {error.response.status_code}. "
-                    f"{_error_message(error.response)}"
+                    f"{_error_message(error.response)}",
+                    status=error.response.status_code,
                 ) from error
             except (httpx.HTTPError, ValueError) as error:
                 raise LlmError(f"{self.provider}/{self._model} не ответил: {error}") from error

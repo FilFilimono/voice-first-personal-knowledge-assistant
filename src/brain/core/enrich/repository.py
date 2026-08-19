@@ -78,6 +78,55 @@ async def entries_needing_annotation(limit: int) -> list[EntryText]:
     return [EntryText(entry_id=int(row[0]), text=str(row[1]), is_private=False) for row in rows]
 
 
+async def entries_for_reannotation(entry_ids: list[int]) -> list[EntryText]:
+    """Записи по явному списку — для перепрогона уже размеченного.
+
+    Отдельно от `entries_needing_annotation` намеренно: та отбирает
+    **неразмеченное**, и это правильно для обычной работы. Перепрогон —
+    другая операция, и 19 августа 2026 попытка сделать её через ту же выборку
+    поставила 37 заданий, которые не нашли бы себе работы.
+
+    **Приватность проверяется и здесь.** Список идентификаторов приходит
+    снаружи и мог бы протащить приватную запись мимо фильтра, который стоит
+    в обычной выборке. Инвариант 5 не должен зависеть от того, каким путём
+    запись попала в пачку.
+    """
+    if not entry_ids:
+        return []
+
+    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Entry.id, text_of)
+                .where(Entry.id.in_(entry_ids), text_of.is_not(None), ~is_private_now())
+                .order_by(Entry.id)
+            )
+        ).all()
+
+    return [EntryText(entry_id=int(row[0]), text=str(row[1]), is_private=False) for row in rows]
+
+
+async def stale_entry_ids() -> list[int]:
+    """Записи, чья текущая разметка сделана до ADR-0012 — без смысловых единиц.
+
+    Из единиц выводятся дела Фазы 4 и предложение завести петлю, поэтому такая
+    разметка выглядит рабочей и молча не даёт половине системы работать.
+    """
+    latest = (
+        select(Annotation.source_entry_id, func.max(Annotation.id).label("id"))
+        .group_by(Annotation.source_entry_id)
+        .subquery()
+    )
+    async with session_scope() as session:
+        rows = await session.scalars(
+            select(latest.c.source_entry_id)
+            .where(~select(EntryUnit.id).where(EntryUnit.annotation_id == latest.c.id).exists())
+            .order_by(latest.c.source_entry_id)
+        )
+    return [int(entry_id) for entry_id in rows]
+
+
 async def transcript_ids(entry_ids: list[int]) -> dict[int, int | None]:
     """Какой расшифровкой сейчас представлена каждая запись.
 

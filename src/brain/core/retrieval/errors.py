@@ -3,7 +3,13 @@
 Отдельным модулем — по той же причине, что и в `core/stt`: провайдер поднимает
 их, не импортируя пакет, который сам же его собирает. Побочная польза та же —
 по одному файлу видно все способы, которыми поиск может не получиться.
+
+Две из них наследуют `ProviderError` и несут **код ответа**. Без него старт
+воркера не отличал кончившуюся квоту от снятой модели — и 20 августа 2026
+из-за `429` на эмбеддингах встали расшифровка и напоминания.
 """
+
+from brain.core.provider_errors import ProviderError
 
 
 class PrivateContentError(RuntimeError):
@@ -15,11 +21,11 @@ class PrivateContentError(RuntimeError):
     """
 
 
-class EmbeddingError(RuntimeError):
+class EmbeddingError(ProviderError):
     """Провайдер не ответил или ответил непонятным. Задание будет повторено."""
 
 
-class ProviderUnavailableError(RuntimeError):
+class ProviderUnavailableError(ProviderError):
     """Модели эмбеддингов нет или она недоступна ключу.
 
     Поднимается при старте воркера настоящим вызовом, а не сверкой со списком

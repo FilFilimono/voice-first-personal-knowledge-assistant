@@ -286,14 +286,20 @@ async def enrich(
     embedder: Embedder,
     notifier: Notifier,
     limit: int,
+    entry_ids: list[int] | None = None,
 ) -> int:
     """Разметить всё, что ждёт разметки. Вернуть число размеченных записей.
 
     Задание приходит на конкретную запись, а размечается пачка: обработчик
     забирает всё неразмеченное разом (ADR-0011). Поэтому второе задание,
     пришедшее следом, чаще всего не найдёт работы — и это нормально, а не сбой.
+
+    `entry_ids` в нагрузке переключает задание на **перепрогон** явного списка.
+    Без этой ветки `just reenrich --stale` ставил задания, которым нечего было
+    делать: обычная выборка берёт неразмеченное, а перепрогон нужен как раз
+    для размеченного (найдено разбором очереди 20 августа 2026).
     """
-    outcome = await enrichment.annotate_pending(model, embedder, limit=limit)
+    outcome = await enrichment.annotate_pending(model, embedder, limit=limit, entry_ids=entry_ids)
     if outcome.annotated == 0:
         logger.info("разметка: пачку уже разобрало соседнее задание (запись %s)", entry_id)
         return 0

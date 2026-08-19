@@ -19,9 +19,12 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
 
+import brain.core.quota as quota_counter
 from brain.core import digest, enrich
+from brain.core.llm.gemini import CHEAP
 from brain.core.memory import repository
 from brain.core.retrieval import repository as retrieval
+from brain.core.retrieval.gemini import EMBEDDING
 from brain.core.scheduler.queue import HEARTBEAT, HEARTBEAT_STALE_MINUTES
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry, EntryKind
@@ -82,6 +85,20 @@ class Touches:
 
 
 @dataclass(frozen=True, slots=True)
+class Quota:
+    """Расход запросов к провайдеру за текущие сутки — его сутки, не наши.
+
+    Существует затем, чтобы в лимит не упирались вслепую. 20 августа 2026
+    воркер встал из-за исчерпанной квоты эмбеддингов, и узнать заранее,
+    сколько израсходовано, было неоткуда.
+    """
+
+    embedding: quota_counter.Usage
+    enrich: quota_counter.Usage
+    resets_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class SystemStatus:
     """Срез состояния на момент запроса."""
 
@@ -105,6 +122,7 @@ class SystemStatus:
     topics: int
     archive_age_days: int
     touches: Touches
+    quota: Quota
 
 
 async def _touches(now: datetime, timezone: str) -> Touches:
@@ -130,7 +148,23 @@ async def _touches(now: datetime, timezone: str) -> Touches:
     )
 
 
-async def collect(timezone: str) -> SystemStatus:
+async def _quota(now: datetime, limits: tuple[int | None, int | None]) -> Quota:
+    """Расход запросов за текущие сутки провайдера.
+
+    Тиры считаются раздельно: квоты у них разные, и «осталось 40» про один
+    ничего не говорит про другой.
+    """
+    embedding_limit, enrich_limit = limits
+    return Quota(
+        embedding=await quota_counter.used(now, tier=EMBEDDING, limit=embedding_limit),
+        enrich=await quota_counter.used(now, tier=CHEAP, limit=enrich_limit),
+        resets_at=quota_counter.resets_at(now),
+    )
+
+
+async def collect(
+    timezone: str, *, quota_limits: tuple[int | None, int | None] = (None, None)
+) -> SystemStatus:
     """Собрать состояние. Один проход по базе, никаких внешних вызовов."""
     async with session_scope() as session:
         entries = await session.scalar(select(func.count()).select_from(Entry)) or 0
@@ -213,4 +247,5 @@ async def collect(timezone: str) -> SystemStatus:
         topics=int(topics),
         archive_age_days=0 if oldest is None else (datetime.now(UTC) - oldest).days,
         touches=await _touches(datetime.now(UTC), timezone),
+        quota=await _quota(datetime.now(UTC), quota_limits),
     )

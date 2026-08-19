@@ -190,13 +190,23 @@ async def test_word_channels_carry_the_proper_noun(indexed: RecordedEmbedder) ->
 async def test_private_entry_is_found_by_words(
     indexed: RecordedEmbedder, migrated_database: str
 ) -> None:
-    """Инвариант 5 не делает запись невидимой — только беззвучной для модели."""
+    """Инвариант 5 не делает запись невидимой — только беззвучной для модели.
+
+    Проверяется **попадание в словесные каналы**, а не место в общей выдаче.
+    Прежняя редакция требовала, чтобы запись была в топ-5 по запросу «CV чек»,
+    и покраснела 20 августа 2026 — не от поломки, а от того, что архив дорос
+    с 39 записей до 50 и запись 47 оттеснила первую. Утверждение про место
+    в выдаче на растущем архиве нестабильно по построению, а инвариант,
+    ради которого тест написан, к месту в выдаче отношения не имеет.
+    """
     await _make_private(migrated_database, DISCIPLINE)
     await index_entry(indexed, entry_id=DISCIPLINE)
 
-    found = await search.search(indexed, "CV чек", limit=5)
+    rankings = await search.channel_rankings(indexed, "CV чек")
 
-    assert DISCIPLINE in _ids(found)
+    assert DISCIPLINE in rankings[search.FULLTEXT] or DISCIPLINE in rankings[search.TRIGRAM], (
+        "приватная запись потерялась и в словесных каналах — искать её нечем"
+    )
 
 
 async def test_private_entry_has_no_embedding(
