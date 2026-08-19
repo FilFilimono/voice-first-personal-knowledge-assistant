@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select, text
 
 from brain.core.memory import repository
+from brain.core.retrieval import repository as retrieval
 from brain.core.scheduler.queue import HEARTBEAT, HEARTBEAT_STALE_MINUTES
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry, EntryKind
@@ -62,6 +63,8 @@ class SystemStatus:
     worker: WorkerStatus
     entries: int
     voice_without_transcript: int
+    entries_without_index: int
+    trigrams_work: bool
     jobs_queued: int
     jobs_failed: int
     next_reminder: NextReminder | None
@@ -98,6 +101,16 @@ async def collect() -> SystemStatus:
             )
         ).one()
 
+        # Работают ли триграммы на кириллице. Не «настроено ли что-то»,
+        # а настоящая проверка вызовом — по тому же правилу, по которому
+        # доступность модели проверяется вызовом, а не списком моделей.
+        #
+        # Под локалью базы `C` pg_trgm не считает кириллицу буквами вовсе
+        # и возвращает пустой массив триграмм. Третий канал поиска при этом
+        # молчит, а всё остальное работает: система выглядит здоровой.
+        # Именно так и было до 18 августа 2026.
+        trigrams = await session.scalar(text("SELECT array_length(show_trgm('кошка'), 1)"))
+
         last_beat = await session.scalar(
             text("SELECT last_run FROM pgqueuer_schedules WHERE entrypoint = :name"),
             {"name": HEARTBEAT},
@@ -119,6 +132,8 @@ async def collect() -> SystemStatus:
         ),
         entries=int(entries),
         voice_without_transcript=int(voice_without_transcript),
+        entries_without_index=len(await retrieval.entries_needing_index()),
+        trigrams_work=bool(trigrams),
         jobs_queued=int(queue.active),
         jobs_failed=int(queue.failed),
         next_reminder=(

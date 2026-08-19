@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # задание, и воркер: разъехавшиеся строковые литералы ловятся только в проде.
 TRANSCRIBE = "transcribe"
 REMINDER = "reminder"
+INDEX = "index-entry"
 AUDIO_RETENTION = "audio-retention"
 HEARTBEAT = "heartbeat"
 

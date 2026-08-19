@@ -22,13 +22,15 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
-from brain.adapters.telegram import status_text
+import brain.core.retrieval.embeddings as embeddings
+from brain.adapters.telegram import search_text, status_text
 from brain.adapters.telegram.notifier import CALLBACK_PREFIX, NO, yes_no_keyboard
 from brain.config import Settings
 from brain.core import ingest
 from brain.core import status as core_status
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
+from brain.core.retrieval import search
 from brain.core.scheduler import reminders
 
 logger = logging.getLogger(__name__)
@@ -43,9 +45,16 @@ PRIVATE_VOICE_REFUSED = (
     "Расшифровка идёт через внешний сервис, поэтому голосовое пришлось бы "
     "отправить наружу. Наберите текстом."
 )
+SEARCH_FAILED = "Поиск не отработал — посмотрите логи. Записи целы."
+
+# Сколько результатов показывать. Пять — потому что recall меряется на пяти
+# (ADR-0006), и показывать больше, чем меряешь, значит не знать цену выдачи.
+RESULTS = 5
+
 HELP = (
     "Пишите или наговаривайте — сохраню.\n"
     "Скажите «напомни завтра в 10 …» — напомню.\n\n"
+    "/find <что искать> — поиск по архиву\n"
     "/status — всё ли работает\n"
     "/private on — приватный режим: записи не уходят наружу, голосовые "
     "не принимаются\n"
@@ -85,6 +94,32 @@ def build_router(settings: Settings) -> Router:
             if enabled
             else "Приватный режим выключен."
         )
+
+    @router.message(Command("find"))
+    async def find(message: Message, command: CommandObject) -> None:
+        """Поиск по архиву.
+
+        Командой, а не просто словом «найди» в начале сообщения. Обычное
+        сообщение обязано всегда записываться: перехват сделал бы захват
+        капризным — а захват это единственное, что в этой системе не имеет
+        права работать через раз.
+        """
+        query = (command.args or "").strip()
+        if not query:
+            await message.answer(search_text.EMPTY_QUERY)
+            return
+
+        embedder = embeddings.build_embedder(settings)
+        try:
+            found = await search.search(embedder, query, limit=RESULTS)
+        except Exception:
+            # Поиск ходит наружу за вектором запроса, и провайдер падает.
+            # Молчать нельзя: владелец решит, что в архиве ничего нет.
+            logger.exception("поиск не отработал: %r", query)
+            await message.answer(SEARCH_FAILED)
+            return
+
+        await message.answer(search_text.render(query, found, today=datetime.now(UTC)))
 
     @router.message(F.voice)
     async def voice(message: Message) -> None:

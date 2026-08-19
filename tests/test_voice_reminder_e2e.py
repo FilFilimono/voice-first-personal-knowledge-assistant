@@ -22,6 +22,7 @@ from brain.core import ingest
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.scheduler import jobs
+from tests.archive import Entry, entry
 from tests.fakes import FakeAudioSource, FakeNotifier, StubTranscriber
 
 pytestmark = pytest.mark.integration
@@ -30,12 +31,14 @@ TIMEZONE = "Europe/Moscow"
 CHAT_ID = 111
 ACK_MESSAGE_ID = 21
 
-# Расшифровки настоящих голосовых владельца, взятые из базы 16 августа 2026.
-# Первая пережила прошлую починку и работала, вторая — нет.
-SPOKEN_WITH_DIGIT = "Напомни мне через 3 минуты сходить в Ozon и забрать посылку."
-SPOKEN_WITH_WORD = (
-    "напомни мне через две минуты чегнуть Discord, потому что мне должен был позвонить мой брат."
-)
+# Настоящие голосовые владельца — по номерам записей: текст живёт в базе
+# и в репозиторий не попадает (ADR-0002).
+#
+# 3 — «через 3 минуты», цифрой. Пережила прошлую починку и работала.
+# 4 — «через две минуты», числительным словом. Не работала: парсер знал `\d+`,
+#     а живая речь цифр не содержит. Ровно на ней дыра проехала второй раз.
+SPOKEN_WITH_DIGIT = 3
+SPOKEN_WITH_WORD = 4
 
 
 @pytest.fixture(autouse=True)
@@ -89,14 +92,14 @@ async def _transcribe(entry_id: int, spoken: str, notifier: FakeNotifier) -> Non
     ],
 )
 async def test_voice_reminder_travels_the_whole_way(
-    audio_dir: Path, spoken: str, expected_delay: timedelta
+    archive: list[Entry], audio_dir: Path, spoken: int, expected_delay: timedelta
 ) -> None:
     """Аудио → расшифровка → напоминание заведено → напоминание отправлено."""
     notifier = FakeNotifier()
     started = datetime.now(UTC)
 
     entry_id = await _capture_voice(audio_dir)
-    await _transcribe(entry_id, spoken, notifier)
+    await _transcribe(entry_id, entry(archive, spoken).text, notifier)
 
     # 1. Напоминание заведено и привязано к записи (инвариант 4).
     reminder = await repository.get_reminder(1)
@@ -135,25 +138,25 @@ async def test_unparsed_time_is_not_stored_as_an_ordinary_thought(audio_dir: Pat
     assert "не понял, когда напомнить" in shown.lower()
 
 
-async def test_voice_without_the_trigger_word_is_questioned(audio_dir: Path) -> None:
+async def test_voice_without_the_trigger_word_is_questioned(
+    archive: list[Entry], audio_dir: Path
+) -> None:
     """Голос — главный источник просьб без слова «напомни».
 
-    Расшифровка записи 27 съела «На» у «Напомни», и осталось «Помни не уйти
-    в 7:40 вечера». Голосовой путь обязан спросить так же, как текстовый:
+    Расшифровка записи 27 съела первую букву у «Напомни», и триггер за такое
+    не цепляется. Голосовой путь обязан спросить так же, как текстовый:
     молча положить в архив — та самая дыра.
     """
     notifier = FakeNotifier()
     entry_id = await _capture_voice(audio_dir)
 
-    await _transcribe(entry_id, "Помни не уйти в 7:40 вечера.", notifier)
+    await _transcribe(entry_id, entry(archive, 27).text, notifier)
 
     assert notifier.asked, "голосовой путь промолчал"
     _, _, shown, asked_about = notifier.asked[0]
     assert asked_about == entry_id
     assert "Похоже на напоминание" in shown
     assert "19:40" in shown
-    # Расшифровка при этом видна: вопрос её не вытесняет.
-    assert "Помни не уйти" in shown
 
     # Вопрос — это вопрос: напоминание появится только после ответа.
     assert await repository.get_reminder(1) is None

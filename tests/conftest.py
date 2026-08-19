@@ -27,6 +27,7 @@ from brain.api.app import create_app
 from brain.api.dependencies import database_is_reachable
 from brain.config import get_settings
 from brain.storage.db import dispose_engine
+from tests import archive as archive_module
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
@@ -107,7 +108,15 @@ async def migrated_database(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[s
     url = database_url(INTEGRATION_DB)
 
     await _admin(server, f'DROP DATABASE IF EXISTS "{INTEGRATION_DB}" WITH (FORCE)')
-    await _admin(server, f'CREATE DATABASE "{INTEGRATION_DB}"')
+    # Локаль задаётся явно, а не наследуется от `template1`. Под `C` (а именно
+    # такой была рабочая база до 18.08.2026) pg_trgm не видит в кириллице букв
+    # вовсе, и третий канал поиска молчит — при полностью зелёных тестах,
+    # потому что «PGVector» латиницей находится прекрасно. `template0` нужен
+    # потому, что база с другой локалью копируется только с него.
+    await _admin(
+        server,
+        f"CREATE DATABASE \"{INTEGRATION_DB}\" LOCALE 'C.utf8' TEMPLATE template0",
+    )
 
     monkeypatch.setenv("DATABASE_URL", url)
     get_settings.cache_clear()
@@ -120,6 +129,22 @@ async def migrated_database(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[s
         await dispose_engine()
         get_settings.cache_clear()
         await _admin(server, f'DROP DATABASE IF EXISTS "{INTEGRATION_DB}" WITH (FORCE)')
+
+
+@pytest.fixture(scope="session")
+def archive() -> list[archive_module.Entry]:
+    """Живой архив: тексты берутся из базы, в репозитории их нет.
+
+    Сессионная и синхронная намеренно. Синхронная — потому что читает базу
+    через `asyncio.run`, а внутри тестового event loop это невозможно;
+    сессионная — потому что читать архив на каждый тест незачем.
+
+    Нет базы и нет кэша — скип с объяснением, а не выдуманные данные.
+    """
+    entries = archive_module.load()
+    if entries is None:
+        pytest.skip(archive_module.NO_ARCHIVE)
+    return entries
 
 
 @pytest.fixture(autouse=True)

@@ -54,7 +54,7 @@ async def _reminder_due_at(fire_at: datetime) -> int:
             EntryDraft(
                 source=EntrySource.TELEGRAM,
                 kind=EntryKind.TEXT,
-                raw_text="напомни мне уйти в 19:40 вечера домой",
+                raw_text="напомни в 19:40 закрыть ноутбук",
                 audio_path=None,
                 duration_sec=None,
                 is_private=False,

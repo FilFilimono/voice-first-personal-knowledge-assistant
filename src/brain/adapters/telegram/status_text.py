@@ -18,6 +18,13 @@ DEAD = "🔴 Воркер молчит"
 NEVER = "🔴 Воркер ни разу не отмечался"
 START_WORKER = "Запустите: just worker"
 
+# Локаль базы `C` — и pg_trgm не видит в кириллице букв. Поиск при этом
+# работает двумя каналами из трёх и выглядит исправным.
+TRIGRAMS_DEAD = (
+    "⚠️ Триграммы не работают на кириллице — база создана с локалью C. "
+    "Поиск идёт двумя каналами из трёх (см. docs/status.md)"
+)
+
 
 def render(status: SystemStatus, *, timezone: str) -> str:
     """Собрать сообщение для `/status`."""
@@ -26,6 +33,14 @@ def render(status: SystemStatus, *, timezone: str) -> str:
     lines.append(f"📥 Записей: {status.entries}")
     if status.voice_without_transcript:
         lines.append(f"⏳ Голосовых без расшифровки: {status.voice_without_transcript}")
+
+    if status.entries_without_index:
+        lines.append(f"🔍 Не в поиске: {status.entries_without_index} — поставить: just reindex")
+
+    if not status.trigrams_work:
+        # Третий канал поиска молчит, а первые два работают: выдача становится
+        # хуже, но не пустой, и заметить это без строки здесь невозможно.
+        lines.append(TRIGRAMS_DEAD)
 
     lines.append(f"⚙️ Заданий в очереди: {status.jobs_queued}")
     if status.jobs_failed:

@@ -85,7 +85,7 @@ def test_relative_time(text: str, hours: float) -> None:
     ("text", "hours"),
     [
         # Так говорят вслух — и так это приходит из расшифровки.
-        ("напомни мне через две минуты чегнуть Discord", 2 / 60),
+        ("напомни мне через две минуты открыть Discord", 2 / 60),
         ("напомни через одну минуту посмотреть календарь", 1 / 60),
         ("напомни через три часа про созвон", 3),
         ("напомни через пару минут глянуть почту", 2 / 60),
@@ -118,7 +118,7 @@ def test_word_numeral_does_not_eat_a_longer_one() -> None:
 
 
 def test_reminder_text_survives_the_word_numeral() -> None:
-    parsed = _parse("напомни мне через две минуты чегнуть Discord")
+    parsed = _parse("напомни мне через две минуты открыть Discord")
 
     assert parsed is not None
     assert "Discord" in parsed.text
@@ -255,7 +255,7 @@ def test_end_of_day() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "напомни за 10 минут до 15:00 пойти домой",
+        "напомни за 10 минут до 15:00 выйти",
         "напомни за десять минут до 15:00 пойти домой",
         "напомни за минут 10 до 15:00 пойти домой",
     ],

@@ -27,7 +27,8 @@ from sqlalchemy import select
 
 from brain.config import get_runtime_settings
 from brain.core.memory.unit_of_work import capture_transaction
-from brain.core.scheduler.queue import TRANSCRIBE
+from brain.core.retrieval import repository as retrieval_repository
+from brain.core.scheduler.queue import INDEX, TRANSCRIBE
 from brain.storage.db import dispose_engine, session_scope
 from brain.storage.models.entry import Entry, EntryKind
 from brain.storage.models.transcript import Transcript
@@ -94,6 +95,40 @@ async def requeue_transcripts(*, dry_run: bool) -> int:
     return queued
 
 
+async def reindex(*, dry_run: bool) -> int:
+    """Поставить задания на индексацию всему, чему её не хватает.
+
+    Список считается **по данным**, а не по журналу очереди — так же и по той
+    же причине, что у `requeue-transcripts`. Три случая перечислены
+    в `retrieval.repository.entries_needing_index`; общего у них одно:
+    запись есть, а найти её нельзя.
+
+    Ставится задание, а не считается вектор прямо здесь. Разница существенная:
+    задание попадает под ретраи очереди и переживает падение провайдера,
+    а цикл в этой команде на первой же сетевой ошибке остановился бы посередине
+    архива — и понять, где именно, было бы нечем.
+    """
+    entry_ids = await retrieval_repository.entries_needing_index()
+
+    if not entry_ids:
+        print("Всё проиндексировано.")
+        return 0
+
+    print(f"Записей без индекса: {len(entry_ids)}")
+    print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
+
+    if dry_run:
+        print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
+        return 0
+
+    for entry_id in entry_ids:
+        async with capture_transaction() as uow:
+            await uow.enqueue(INDEX, {"entry_id": entry_id})
+
+    print(f"\nПоставлено заданий: {len(entry_ids)}. Запустите воркер: just worker")
+    return len(entry_ids)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Эксплуатационные команды Brain")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -108,6 +143,16 @@ async def main() -> None:
         help="показать, что было бы сделано, и ничего не менять",
     )
 
+    index = commands.add_parser(
+        "reindex",
+        help="поставить индексацию записям, которых нет в поиске",
+    )
+    index.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что было бы сделано, и ничего не менять",
+    )
+
     arguments = parser.parse_args()
     get_runtime_settings()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -115,6 +160,8 @@ async def main() -> None:
     try:
         if arguments.command == "requeue-transcripts":
             await requeue_transcripts(dry_run=arguments.dry_run)
+        elif arguments.command == "reindex":
+            await reindex(dry_run=arguments.dry_run)
     finally:
         await dispose_engine()
 

@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # намеренно — команд ровно столько, сколько их есть, и каждая описана так,
 # чтобы не приходилось вспоминать синтаксис.
 COMMANDS = [
+    BotCommand(command="find", description="поиск по архиву: /find экзамен"),
     BotCommand(command="status", description="всё ли работает"),
     BotCommand(command="private", description="приватный режим: on / off / без аргумента"),
     BotCommand(command="start", description="что я умею"),

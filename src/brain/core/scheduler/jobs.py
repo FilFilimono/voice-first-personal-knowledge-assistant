@@ -27,8 +27,10 @@ from brain.core import stt
 from brain.core.memory import audio as audio_store
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
-from brain.core.ports import AudioSource, Notifier, Transcriber
+from brain.core.ports import AudioSource, Embedder, Notifier, Transcriber, Transcription
+from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
+from brain.core.scheduler.queue import INDEX
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
 from brain.storage.models.entry import Entry
 from brain.storage.models.reminder import Reminder
@@ -95,12 +97,7 @@ async def transcribe(
         await notifier.edit(chat_id, ack_message_id, TOO_LONG)
         return
 
-    await repository.save_transcript(entry_id, transcription)
-
-    # Напоминание разбирается здесь, а не при приёме: при приёме текста ещё нет.
-    # Голосом «напомни через 3 минуты» говорят чаще, чем текстом, — на ходу
-    # только так и получается.
-    reminder = await _schedule_reminder(entry, chat_id, transcription.text)
+    reminder = await _store_transcript(entry, chat_id, transcription)
     await _show(notifier, chat_id, ack_message_id, entry.id, transcription.text, reminder)
 
 
@@ -139,6 +136,40 @@ async def _show(
         return
 
     await notifier.edit(chat_id, ack_message_id, text)
+
+
+async def _store_transcript(
+    entry: Entry, chat_id: int, transcription: Transcription
+) -> reminders.ScheduleOutcome | None:
+    """Сохранить расшифровку и всё, что из неё следует, — одной транзакцией.
+
+    Вместе с расшифровкой в базу уходят два следствия: задание на индексацию
+    и напоминание, если запись им является. Раздельными транзакциями это
+    писать нельзя — упав между ними, мы получили бы расшифровку, которую
+    невозможно найти, и никакого следа о том, что так вышло. Это та же дыра,
+    что с пропавшими заданиями расшифровки 16 августа, только тише: там было
+    видно отсутствие ответа, здесь не видно ничего.
+    """
+    already_reminded = await repository.has_reminder(entry.id)
+
+    async with capture_transaction() as uow:
+        await uow.add_transcript(entry.id, transcription)
+        await uow.enqueue(INDEX, {"entry_id": entry.id})
+
+        if already_reminded:
+            return None
+
+        # Напоминание разбирается здесь, а не при приёме: при приёме текста
+        # ещё нет. Голосом «напомни через 3 минуты» говорят чаще, чем текстом,
+        # — на ходу только так и получается.
+        return await reminders.schedule(
+            uow,
+            entry_id=entry.id,
+            chat_id=chat_id,
+            text=transcription.text,
+            timezone=entry.timezone,
+            now=datetime.now(UTC),
+        )
 
 
 async def _schedule_reminder(
@@ -218,6 +249,17 @@ async def _reminder_text(reminder: Reminder) -> str:
     timezone = ZoneInfo(entry.timezone) if entry is not None else UTC
     due = reminder.fire_at.astimezone(timezone)
     return f"⏰ {reminder.text}\n\n⚠️ Просрочено: должно было прийти {due:%d.%m в %H:%M}."
+
+
+async def index(*, entry_id: int, embedder: Embedder) -> None:
+    """Разрезать запись на чанки и посчитать вектора.
+
+    Молчаливое задание: владельцу об индексации знать незачем, он о ней
+    не просил. Наружу оно проявляется только тем, что запись начинает
+    находиться, — и `/status` показывает, сколько записей ещё ждут индекса.
+    """
+    chunks = await index_entry(embedder, entry_id=entry_id)
+    logger.info("запись %s проиндексирована: чанков %s", entry_id, chunks)
 
 
 async def clean_audio(*, retention_days: int) -> int:

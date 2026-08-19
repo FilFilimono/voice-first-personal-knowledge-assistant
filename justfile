@@ -49,6 +49,16 @@ requeue *ids:
 requeue-transcripts *args:
     uv run python -m brain.maintenance requeue-transcripts {{args}}
 
+# Записи, которых нет в поиске: нет чанков, нет вектора, либо вектор есть
+# у приватной. Список считается по данным, а не по журналу очереди.
+reindex *args:
+    uv run python -m brain.maintenance reindex {{args}}
+
+# Прогон eval-набора ретривала: recall@5, MRR и recall по каналам.
+# Без числа отсюда Фаза 2 не закрыта.
+eval-retrieval *args:
+    uv run python -m evals.retrieval.run {{args}}
+
 # Быстрые тесты: без БД, без сети. Это же гоняет Stop-хук.
 test:
     uv run pytest

@@ -73,6 +73,31 @@ async def get_transcript(entry_id: int) -> str | None:
     return text
 
 
+async def entry_text(entry_id: int) -> tuple[str, bool] | None:
+    """Текущий текст записи и её приватность. `None`, если текста ещё нет.
+
+    Текст берётся так же, как везде: расшифровка, если она есть, иначе
+    `raw_text`. У голосовой записи до расшифровки текста нет вовсе — и это
+    законное состояние, а не ошибка: индексировать её просто нечем, задание
+    придёт заново, когда расшифровка появится.
+
+    Приватность возвращается рядом с текстом намеренно. Тот, кто собирается
+    считать эмбеддинг, обязан узнать про неё из того же запроса, а не сходить
+    за ней отдельно и забыть.
+    """
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(func.coalesce(latest_transcript(), Entry.raw_text), Entry.is_private).where(
+                    Entry.id == entry_id
+                )
+            )
+        ).first()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0]), bool(row[1])
+
+
 async def get_reminder(reminder_id: int) -> Reminder | None:
     async with session_scope() as session:
         return await session.get(Reminder, reminder_id)
@@ -92,7 +117,7 @@ async def entry_by_ack_message(chat_id: int, ack_message_id: int) -> tuple[int, 
     async with session_scope() as session:
         row = (
             await session.execute(
-                select(Entry.id, func.coalesce(_latest_transcript(), Entry.raw_text))
+                select(Entry.id, func.coalesce(latest_transcript(), Entry.raw_text))
                 .where(
                     Entry.meta["chat_id"].astext == str(chat_id),
                     Entry.meta["ack_message_id"].astext == str(ack_message_id),
@@ -106,8 +131,11 @@ async def entry_by_ack_message(chat_id: int, ack_message_id: int) -> tuple[int, 
     return int(row[0]), str(row[1])
 
 
-def _latest_transcript() -> Any:
+def latest_transcript() -> Any:
     """Последняя расшифровка записи — подзапрос, а не join.
+
+    Публичный, потому что нужен и ретривалу: «текущий текст записи» считается
+    везде одинаково, и второй такой подзапрос рядом однажды разъедется с этим.
 
     Перепрогон другой моделью добавляет строку, поэтому «текущая» это всегда
     «последняя», и join дал бы столько строк, сколько было прогонов.

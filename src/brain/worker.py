@@ -13,7 +13,7 @@
 
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
@@ -25,6 +25,7 @@ from pgqueuer.db import AsyncpgDriver
 from pgqueuer.executors import DatabaseRetryEntrypointExecutor, EntrypointExecutorParameters
 from pgqueuer.models import Job, Schedule
 
+import brain.core.retrieval.embeddings as embeddings
 from brain.adapters.telegram.audio import TelegramAudioSource
 from brain.adapters.telegram.notifier import TelegramNotifier
 from brain.config import get_runtime_settings
@@ -35,6 +36,7 @@ from brain.core.scheduler.queue import (
     AUDIO_RETENTION_SCHEDULE,
     HEARTBEAT,
     HEARTBEAT_SCHEDULE,
+    INDEX,
     REMINDER,
     TRANSCRIBE,
 )
@@ -84,20 +86,34 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     notifier = TelegramNotifier(bot)
     audio_source = TelegramAudioSource(bot)
     transcriber = stt.build_transcriber(settings)
+    embedder = embeddings.build_embedder(settings)
 
-    # Проверка модели — до того, как воркер возьмёт первое задание. Иначе
+    # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
-    # и уже после того, как владелец что-то наговорил.
-    try:
-        await transcriber.check_available()
-    except stt.ProviderUnavailableError as error:
-        await bot.session.close()
-        await connection.close()
-        raise SystemExit(
-            f"\nВоркер не запущен.\n{error}\n\nПоправьте STT_MODEL в .env.\n"
-        ) from None
+    # и уже после того, как владелец что-то наговорил. Обе проверки —
+    # настоящие вызовы: список моделей 16 августа 2026 показывал снятую
+    # с обслуживания модель как рабочую, и правду сказал только вызов.
+    async def _check(what: str, setting: str, check: Callable[[], Awaitable[None]]) -> None:
+        try:
+            await check()
+        except (stt.ProviderUnavailableError, embeddings.ProviderUnavailableError) as error:
+            await bot.session.close()
+            await connection.close()
+            raise SystemExit(
+                f"\nВоркер не запущен.\n{error}\n\nПоправьте {setting} в .env.\n"
+            ) from None
+        logger.info("модель %s доступна", what)
 
-    logger.info("модель расшифровки доступна: %s/%s", transcriber.provider, transcriber.model)
+    await _check(
+        f"расшифровки {transcriber.provider}/{transcriber.model}",
+        "STT_MODEL",
+        transcriber.check_available,
+    )
+    await _check(
+        f"эмбеддингов {embedder.provider}/{embedder.model}",
+        "EMBEDDING_MODEL",
+        embedder.check_available,
+    )
 
     pgq = PgQueuer(AsyncpgDriver(connection))
 
@@ -118,6 +134,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
             notifier=notifier,
             max_duration_sec=settings.stt_max_duration_sec,
         )
+
+    @pgq.qm.entrypoint(INDEX, executor_factory=retry_executor, on_failure="hold")
+    async def index(job: Job) -> None:
+        payload = payload_of(job)
+        await jobs.index(entry_id=payload["entry_id"], embedder=embedder)
 
     @pgq.qm.entrypoint(REMINDER, executor_factory=retry_executor, on_failure="hold")
     async def remind(job: Job) -> None:

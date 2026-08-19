@@ -16,11 +16,12 @@ from sqlalchemy import insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from brain.core.ports import EntryDraft, ReminderDraft
+from brain.core.ports import EntryDraft, ReminderDraft, Transcription
 from brain.core.scheduler.queue import queue_on
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry
 from brain.storage.models.reminder import Reminder, ReminderTrigger
+from brain.storage.models.transcript import Transcript
 
 
 class SqlCaptureUnitOfWork:
@@ -70,6 +71,18 @@ class SqlCaptureUnitOfWork:
         if reminder_id is None:  # pragma: no cover — INSERT ... RETURNING без строки
             raise RuntimeError("напоминание не вставилось")
         return reminder_id
+
+    async def add_transcript(self, entry_id: int, transcription: Transcription) -> None:
+        """Вставить расшифровку — производную запись (инвариант 4)."""
+        await self._session.execute(
+            insert(Transcript).values(
+                source_entry_id=entry_id,
+                text=transcription.text,
+                provider=transcription.provider,
+                model=transcription.model,
+                latency_ms=transcription.latency_ms,
+            )
+        )
 
     async def enqueue(
         self,

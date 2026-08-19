@@ -188,6 +188,8 @@ async def test_status_reports_the_worker_first(
         worker=WorkerStatus(last_beat=None, stale_after=timedelta(minutes=3)),
         entries=7,
         voice_without_transcript=2,
+        entries_without_index=0,
+        trigrams_work=True,
         jobs_queued=2,
         jobs_failed=0,
         next_reminder=None,
@@ -211,7 +213,7 @@ async def test_command_menu_lists_every_command_the_bot_answers() -> None:
     """Меню не должно обещать того, чего бот не понимает, и наоборот."""
     promised = {command.command for command in COMMANDS}
 
-    assert promised == {"start", "status", "private"}
+    assert promised == {"start", "status", "private", "find"}
 
 
 async def test_command_menu_is_registered_on_start(bot: Bot, session: FakeSession) -> None:

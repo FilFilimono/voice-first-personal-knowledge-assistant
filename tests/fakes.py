@@ -5,12 +5,15 @@ Stop-хук после каждой сессии. Каждая заглушка 
 о чём её спросили — иначе проверять было бы нечего.
 """
 
+import hashlib
+import math
 from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
 from brain.core.ports import EntryDraft, ReminderDraft, Transcription
 from brain.core.stt.errors import TranscriptionError
+from brain.storage.models.chunk import DIMENSIONS
 
 
 class FakeUnitOfWork:
@@ -19,6 +22,7 @@ class FakeUnitOfWork:
     def __init__(self) -> None:
         self.entries: list[EntryDraft] = []
         self.reminders: list[ReminderDraft] = []
+        self.transcripts: list[tuple[int, Transcription]] = []
         self.jobs: list[tuple[str, Mapping[str, Any], timedelta | None]] = []
         self._keys: set[str] = set()
 
@@ -32,6 +36,9 @@ class FakeUnitOfWork:
     async def add_reminder(self, draft: ReminderDraft) -> int:
         self.reminders.append(draft)
         return len(self.reminders)
+
+    async def add_transcript(self, entry_id: int, transcription: Transcription) -> None:
+        self.transcripts.append((entry_id, transcription))
 
     async def enqueue(
         self,
@@ -112,6 +119,110 @@ class FailingTranscriber:
     async def transcribe(self, audio: bytes, mime_type: str) -> Transcription:
         self.calls += 1
         raise TranscriptionError("провайдер не ответил")
+
+
+class StubEmbedder:
+    """Модель эмбеддингов, которая никуда не ходит и считает обращения.
+
+    Вектор детерминированный и зависит от текста: два разных куска обязаны
+    получить разные вектора, иначе тесты поиска ничего не проверяют.
+    Длина единичная — как требует порт `Embedder` от любой реализации.
+    """
+
+    def __init__(self, dimensions: int = DIMENSIONS) -> None:
+        self._dimensions = dimensions
+        self.documents: list[list[str]] = []
+        self.queries: list[str] = []
+        self.checked = 0
+
+    @property
+    def provider(self) -> str:
+        return "stub"
+
+    @property
+    def model(self) -> str:
+        return "stub-embedding-1"
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    @property
+    def calls(self) -> int:
+        """Сколько раз ходили наружу. Для приватных записей обязан быть ноль."""
+        return len(self.documents) + len(self.queries)
+
+    async def check_available(self) -> None:
+        self.checked += 1
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        self.documents.append(list(texts))
+        return [self.vector(text) for text in texts]
+
+    async def embed_query(self, text: str) -> list[float]:
+        self.queries.append(text)
+        return self.vector(text)
+
+    def vector(self, text: str) -> list[float]:
+        """Единичный вектор, однозначно определённый текстом."""
+        digest = hashlib.sha256(text.encode()).digest()
+        raw = [digest[index % len(digest)] - 127.5 for index in range(self._dimensions)]
+        norm = math.sqrt(sum(x * x for x in raw))
+        return [x / norm for x in raw]
+
+
+class RecordedEmbedder:
+    """Настоящие вектора, посчитанные один раз настоящей моделью.
+
+    `StubEmbedder` проверяет SQL, но не поиск: у хэша от текста нет смысла,
+    и «находится по смыслу, когда общих слов нет» на нём проверить нельзя
+    в принципе.
+
+    Данные приходят снаружи — из `tests/archive.py`, который берёт тексты
+    из живой базы, а вектора из кэша рядом. В репозитории ни того, ни другого
+    нет: архив в git не уходит (ADR-0002).
+
+    Неизвестный текст — ошибка, а не тихий нулевой вектор: молча вернув
+    что-нибудь, заглушка превратила бы отсутствие данных в зелёный тест.
+    """
+
+    def __init__(self, vectors: dict[str, dict[str, list[float]]], model: str) -> None:
+        self._documents = vectors["документы"]
+        self._queries = vectors["запросы"]
+        self._model = model
+
+    @property
+    def provider(self) -> str:
+        return "gemini"
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def dimensions(self) -> int:
+        return DIMENSIONS
+
+    async def check_available(self) -> None:
+        return None
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._lookup(self._documents, text, "документ") for text in texts]
+
+    async def embed_query(self, text: str) -> list[float]:
+        return self._lookup(self._queries, text, "запрос")
+
+    @staticmethod
+    def _lookup(source: dict[str, list[float]], text: str, kind: str) -> list[float]:
+        try:
+            return source[text]
+        except KeyError:
+            raise AssertionError(
+                f"вектор не посчитан ({kind}): {text[:60]!r}. "
+                "Добавьте текст в список запросов теста — он досчитается сам."
+            ) from None
 
 
 class FakeAudioSource:

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from brain.core.ports import CaptureUnitOfWork, EntryDraft
 from brain.core.scheduler import reminders
-from brain.core.scheduler.queue import TRANSCRIBE
+from brain.core.scheduler.queue import INDEX, TRANSCRIBE
 from brain.storage.models.entry import EntryKind, EntrySource
 
 # Расширение сохраняется как есть: Telegram отдаёт OGG/Opus, провайдер
@@ -108,6 +108,12 @@ async def capture_text(
     )
     if entry_id is None:
         return CaptureResult(reply="", duplicate=True)
+
+    # Индексация — в той же транзакции (инвариант 7). Текст записи есть уже
+    # сейчас, в отличие от голосовой, поэтому искать её можно будет сразу.
+    # Приватная запись индексируется тоже: у неё будут чанки и полнотекст,
+    # не будет только вектора (инвариант 5).
+    await uow.enqueue(INDEX, {"entry_id": entry_id})
 
     reminder = await reminders.schedule(
         uow,

@@ -1,0 +1,4 @@
+# Живой архив в git не попадает (ADR-0002). Кэш собирается из базы при прогоне,
+# скрипт сборки — `tests/archive.py`, объяснение — в README.md рядом.
+archive_cache.json
+archive_vectors.json
