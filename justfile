@@ -75,6 +75,13 @@ eval-classification *args:
 eval-retrieval *args:
     uv run python -m evals.retrieval.run {{args}}
 
+# Замер чистки расшифровки — **по одной записи**, как чистит воркер. Пачками
+# мерить нельзя: на пачке модель видит соседние записи. Печатает медиану и p95
+# латентности: из них выбирается CLEANUP_WAIT_SEC. Пока не прогнан, CLEANUP_MODEL
+# — дефолт, а не выбор (ADR-0015).
+eval-cleanup *args:
+    uv run python -m evals.cleanup.run {{args}}
+
 # Повтор касаний по прошедшим дням живого архива: что ушло бы и что промолчало.
 # Ничего не пишет и не отправляет. Оценку 1–5 ставит владелец.
 eval-digest *args:

@@ -556,6 +556,48 @@ def _question(text: str, *, now: datetime, timezone: str) -> ScheduleOutcome | N
     )
 
 
+def promise(fire_at: datetime) -> str:
+    """Обещание, которое видит владелец. Одна формулировка на два места.
+
+    Второе место — перерисовка подтверждения приёма после чистки: сообщение
+    собирается заново, и строка обязана получиться той же самой, иначе
+    вычищенный текст пришёл бы вместе с чуть другим обещанием.
+    """
+    return f"Напомню {fire_at:%d.%m в %H:%M}."
+
+
+def shown(
+    text: str, *, fire_at: datetime | None, now: datetime, timezone: str
+) -> ScheduleOutcome | None:
+    """Что владельцу уже сказали про напоминание — собранное заново.
+
+    Нужна перерисовке подтверждения приёма. Подтверждение живёт в Telegram,
+    прочитать его нельзя — только заменить целиком; значит, всё, что там было,
+    надо уметь восстановить. Тот же приём, что в `enrich/reply.py`.
+
+    Восстанавливать приходится **три разных сообщения**, а не одно: обещание
+    («⏰ Напомню в 19:40»), вопрос с кнопками («❓ Похоже на напоминание…»)
+    и признание, что время не разобрано. Потерять любое из них при перерисовке
+    значит соврать: первое читается как «напоминание не завелось», второе
+    уносит с собой единственный способ ответить.
+
+    `fire_at` приходит из базы, а не пересчитывается из текста, и это главное
+    здесь. «Через 3 минуты», разобранное заново через полминуты, дало бы время
+    на полминуты позже настоящего — обещание, которого система не давала.
+    """
+    if fire_at is not None:
+        return ScheduleOutcome(
+            message=promise(fire_at.astimezone(ZoneInfo(timezone))), created=True
+        )
+
+    if not TRIGGER.search(text):
+        return _question(text, now=now, timezone=timezone)
+
+    # Слово «напомни» прозвучало, напоминания нет. Значит, время не разобрали,
+    # и об этом было сказано вслух — молчаливое сохранение здесь хуже отказа.
+    return ScheduleOutcome(message=NOT_UNDERSTOOD, created=False)
+
+
 async def _create(
     uow: CaptureUnitOfWork,
     *,
@@ -573,7 +615,7 @@ async def _create(
         {"reminder_id": reminder_id, "chat_id": chat_id},
         execute_after=parsed.fire_at - now,
     )
-    return ScheduleOutcome(message=f"Напомню {parsed.fire_at:%d.%m в %H:%M}.", created=True)
+    return ScheduleOutcome(message=promise(parsed.fire_at), created=True)
 
 
 async def schedule_confirmed(

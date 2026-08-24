@@ -15,6 +15,7 @@ import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -35,6 +36,7 @@ from brain.core.scheduler import jobs
 from brain.core.scheduler.queue import (
     AUDIO_RETENTION,
     AUDIO_RETENTION_SCHEDULE,
+    CLEANUP,
     ENRICH,
     HEARTBEAT,
     HEARTBEAT_SCHEDULE,
@@ -42,6 +44,7 @@ from brain.core.scheduler.queue import (
     REGENERALIZE,
     REGENERALIZE_SCHEDULE,
     REMINDER,
+    SHOW_TRANSCRIPT,
     TOUCH,
     TOUCH_SCHEDULE,
     TRANSCRIBE,
@@ -72,10 +75,35 @@ def retry_executor(
     )
 
 
-async def check_models(
-    checks: list[tuple[str, str, Callable[[], Awaitable[None]]]],
-) -> list[str]:
-    """Проверить модели вызовом. Вернуть предупреждения о временных отказах.
+@dataclass(frozen=True, slots=True)
+class ModelCheck:
+    """Модель, которую при старте проверяют настоящим вызовом."""
+
+    # Как назвать её владельцу: «расшифровки gemini/...».
+    what: str
+    # Настройка, которую он пойдёт править, если дело в ней.
+    setting: str
+    check: Callable[[], Awaitable[None]]
+    # Имеет ли отказ этой модели право остановить воркер.
+    #
+    # `False` стоит у **косметических** моделей, и правило у них другое
+    # не по недосмотру. Работа без чистки — рабочая система: расшифровка
+    # приходит, напоминания приходят, владелец просто читает свои «э».
+    # Работа без расшифровки — не система вовсе. Поэтому неверное имя
+    # в `ENRICH_MODEL` обязано валить старт громко, а такое же неверное имя
+    # в `CLEANUP_MODEL` — нет: иначе опечатка в косметике кладёт «заказанное»,
+    # о чём система не имеет права молчать (`vision.md` §7). Это тот же вывод,
+    # что у ADR-0014 про квоту, и пункт 6 ADR-0015 распространяет его
+    # на настроечные отказы: под нехваткой чего угодно косметика отключается
+    # первой, а расшифровка и напоминания не трогаются никогда.
+    #
+    # Проверять косметическую модель при старте всё равно стоит: неверное имя
+    # видно сразу, в логе и одной строкой, а не через сутки по молчанию чистки.
+    vital: bool = True
+
+
+async def check_models(checks: list[ModelCheck]) -> list[str]:
+    """Проверить модели вызовом. Вернуть предупреждения о том, что не отвечает.
 
     Проверка обязана быть **настоящим вызовом**, а не сверкой со списком
     моделей: 16 августа 2026 список показывал снятую с обслуживания модель
@@ -93,29 +121,37 @@ async def check_models(
     очереди и не потеряются (инвариант 7); сколько запросов потрачено сегодня,
     видно в `/status`.
 
+    У косметических моделей (`vital=False`) остановки нет вовсе — ни на каком
+    отказе. Причина в `ModelCheck.vital`: работа без чистки — рабочая система,
+    работа без расшифровки — нет.
+
     Проверяются все модели, даже после первого предупреждения: иначе неверное
     имя второй выяснилось бы только назавтра, когда пройдёт квота у первой.
     """
     warnings: list[str] = []
     failure: tuple[str, str, ProviderError] | None = None
 
-    for what, setting, check in checks:
+    for item in checks:
         try:
-            await check()
+            await item.check()
         except ProviderError as raised:
             # Python стирает переменную исключения на выходе из `except`,
             # поэтому отказ сохраняется в отдельное имя.
             refusal = raised
-            if refusal.fatal:
+            if refusal.fatal and item.vital:
                 # Не выходим сразу: остальные модели тоже надо проверить,
                 # чтобы владелец узнал обо всём за один запуск.
-                failure = failure or (what, setting, refusal)
+                failure = failure or (item.what, item.setting, refusal)
                 continue
-            warning = f"модель {what} временно недоступна: {refusal}\n{_advice(setting, refusal)}"
+            # «Временно» говорится только там, где это правда. Настроечный
+            # отказ косметической модели сам не пройдёт, и обещать обратное
+            # значило бы научить владельца не читать это предупреждение.
+            passing = "временно недоступна" if not refusal.fatal else "недоступна"
+            warning = f"модель {item.what} {passing}: {refusal}\n{_advice(item.setting, refusal)}"
             logger.warning("%s", warning)
             warnings.append(warning)
             continue
-        logger.info("модель %s доступна", what)
+        logger.info("модель %s доступна", item.what)
 
     if failure is not None:
         broken, setting, refusal = failure
@@ -153,6 +189,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     transcriber = stt.build_transcriber(settings)
     embedder = embeddings.build_embedder(settings)
     model = llm.build_model(settings)
+    # Модель чистки — своя, а не та же, что у разметки: задачи разные, цена
+    # ошибки разная, и выбираются они порознь (ADR-0015). Строится всегда,
+    # даже с выключенной чисткой: `build_model` в сеть не ходит, а ветвление
+    # здесь стоило бы `None` в трёх местах ниже.
+    cleaner = llm.build_model(settings, model=settings.cleanup_model)
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
@@ -168,20 +209,39 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     try:
         await check_models(
             [
-                (
+                ModelCheck(
                     f"расшифровки {transcriber.provider}/{transcriber.model}",
                     "STT_MODEL",
                     transcriber.check_available,
                 ),
-                (
+                ModelCheck(
                     f"эмбеддингов {embedder.provider}/{embedder.model}",
                     "EMBEDDING_MODEL",
                     embedder.check_available,
                 ),
-                (
+                ModelCheck(
                     f"разметки {model.provider}/{model.model}",
                     "ENRICH_MODEL",
                     model.check_available,
+                ),
+                # Четвёртая проверка — чистка, и она **никогда не валит старт**,
+                # даже на неверном имени модели: `vital=False`. Косметика
+                # отключается первой, расшифровка и напоминания не трогаются
+                # никогда (ADR-0015, пункт 6) — а `SystemExit` из-за опечатки
+                # в `CLEANUP_MODEL` останавливал бы как раз их. Проверка при
+                # этом остаётся: неверное имя видно сразу и одной строкой,
+                # а не через сутки по молчанию чистки.
+                *(
+                    [
+                        ModelCheck(
+                            f"чистки {cleaner.provider}/{cleaner.model}",
+                            "CLEANUP_MODEL",
+                            cleaner.check_available,
+                            vital=False,
+                        )
+                    ]
+                    if settings.cleanup_enabled
+                    else []
                 ),
             ]
         )
@@ -208,6 +268,34 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
             audio_source=audio_source,
             notifier=notifier,
             max_duration_sec=settings.stt_max_duration_sec,
+        )
+
+    @pgq.qm.entrypoint(CLEANUP, executor_factory=retry_executor, on_failure="hold")
+    async def cleanup(job: Job) -> None:
+        """Чистка расшифровки. Задание ставит сама расшифровка, в своей транзакции."""
+        payload = payload_of(job)
+        await jobs.cleanup(
+            entry_id=payload["entry_id"],
+            chat_id=payload["chat_id"],
+            ack_message_id=payload["ack_message_id"],
+            model=cleaner,
+            notifier=notifier,
+        )
+
+    @pgq.qm.entrypoint(SHOW_TRANSCRIPT, executor_factory=retry_executor, on_failure="hold")
+    async def show_transcript(job: Job) -> None:
+        """Срок ожидания чистки истёк — показать то, что есть.
+
+        Это и есть ожидание из ADR-0015: отложенное задание, а не сон
+        в обработчике расшифровки. Спящий обработчик держал бы слот воркера
+        и не пережил бы перезапуск.
+        """
+        payload = payload_of(job)
+        await jobs.show_transcript(
+            entry_id=payload["entry_id"],
+            chat_id=payload["chat_id"],
+            ack_message_id=payload["ack_message_id"],
+            notifier=notifier,
         )
 
     @pgq.qm.entrypoint(INDEX, executor_factory=retry_executor, on_failure="hold")

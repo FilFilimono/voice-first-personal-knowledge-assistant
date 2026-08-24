@@ -35,6 +35,13 @@ def render(status: SystemStatus, *, timezone: str) -> str:
     if status.voice_without_transcript:
         lines.append(f"⏳ Голосовых без расшифровки: {status.voice_without_transcript}")
 
+    if status.transcripts_without_cleanup:
+        # Отставание чистки. Показывается всегда, когда оно есть: одна-две
+        # записи — это нормальный ход очереди, десятки означают, что чистка
+        # придержана квотой или лежит, и в обоих случаях владелец видит
+        # в сообщениях свои «э» и должен знать, почему.
+        lines.append(f"🧹 Расшифровок без чистки: {status.transcripts_without_cleanup}")
+
     if status.entries_without_index:
         lines.append(f"🔍 Не в поиске: {status.entries_without_index} — поставить: just reindex")
 

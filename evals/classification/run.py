@@ -27,12 +27,12 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from brain.config import get_runtime_settings
 from brain.core import llm
 from brain.core.enrich import prompt, repository, service
-from brain.core.memory.repository import latest_transcript
+from brain.core.memory.repository import working_text
 from brain.core.ports import EntryText
 from brain.storage.db import dispose_engine, session_scope
 from brain.storage.models.annotation import AnnotationType
@@ -82,14 +82,16 @@ def load_dataset(path: Path) -> list[Labelled]:
 
 
 async def texts_of(entry_ids: list[int]) -> dict[int, str]:
-    """Тексты записей из живой базы. Их нет в репозитории и не должно быть."""
+    """Тексты записей из живой базы. Их нет в репозитории и не должно быть.
+
+    Текст **рабочий**, тот же самый, что уходит в разметку: замер обязан
+    воспроизводить рабочий режим, а показываемый владельцу текст с Фазы 5
+    может быть вычищенным (ADR-0015, ось 3). Взяв здесь `display_text()`,
+    мы измерили бы точность на текстах, которых разметка не видела.
+    """
     async with session_scope() as session:
         rows = (
-            await session.execute(
-                select(Entry.id, func.coalesce(latest_transcript(), Entry.raw_text)).where(
-                    Entry.id.in_(entry_ids)
-                )
-            )
+            await session.execute(select(Entry.id, working_text()).where(Entry.id.in_(entry_ids)))
         ).all()
     return {int(row[0]): str(row[1]) for row in rows if row[1]}
 

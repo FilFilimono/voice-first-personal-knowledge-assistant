@@ -186,6 +186,12 @@ class GeminiEmbedder:
             latency_ms=int((time.monotonic() - started) * 1000),
             succeeded=refusal is None,
             error=None if refusal is None else str(refusal)[:500],
+            # Код ответа кладётся и здесь, а не только в двери текстовой
+            # модели. Колонка обещает «код ответа провайдера»; заполняемая
+            # через раз, она обещала бы «код, если вызывающий не забыл»,
+            # и первый же разбор по ней дал бы неверный ответ про то,
+            # чем именно упёрлись.
+            status_code=None if refusal is None else refusal.status,
         )
 
     def _extract(self, payload: dict[str, Any], expected: int) -> list[list[float]]:

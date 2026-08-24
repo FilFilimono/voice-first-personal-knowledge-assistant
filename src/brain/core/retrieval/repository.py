@@ -7,7 +7,7 @@
 
 from sqlalchemy import delete, func, insert, select
 
-from brain.core.memory.repository import is_private_now, latest_transcript
+from brain.core.memory.repository import is_private_now, working_text
 from brain.storage.db import session_scope
 from brain.storage.models.chunk import Chunk
 from brain.storage.models.entry import Entry
@@ -83,7 +83,7 @@ async def entries_needing_index() -> list[int]:
     сразу, но по колонке она осталась обычной — и первый же пересчёт вернул бы
     ей вектор, то есть отправил бы текст наружу второй раз.
     """
-    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    text_of = working_text()
     is_private = is_private_now()
     has_chunks = select(Chunk.id).where(Chunk.source_entry_id == Entry.id).exists()
     missing_vector = (

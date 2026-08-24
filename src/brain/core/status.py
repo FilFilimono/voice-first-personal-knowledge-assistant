@@ -17,7 +17,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 
 import brain.core.quota as quota_counter
 from brain.core import digest, enrich
@@ -105,6 +105,11 @@ class SystemStatus:
     worker: WorkerStatus
     entries: int
     voice_without_transcript: int
+    # Расшифровок, до которых чистка не дошла. Отставание обязано быть видно
+    # с телефона: без этой строки владелец узнаёт о вставшей чистке только
+    # по тому, что в сообщениях снова появились «э» и «мм», — то есть заметит
+    # не сразу и спутает с плохой работой модели, а не с отсутствием вызова.
+    transcripts_without_cleanup: int
     entries_without_index: int
     # Не размечено и ждёт вечернего разбора. Две разные беды: первая означает,
     # что разметка отстаёт или лежит, вторая — что модель сомневается, и это
@@ -181,6 +186,54 @@ async def collect(
             or 0
         )
 
+        # Расшифровки, до которых чистка не дошла.
+        #
+        # Считаются **не все** пустые `clean_text`, и это не хитрость,
+        # а следствие решений. Два отсева:
+        #
+        # 1. Отсчёт от первой вычищенной расшифровки. Старые записи задним
+        #    числом не чистятся — квота и отрезки уже заведённых дел дороже
+        #    единообразия (ADR-0015, пункт 3), — и, считая всё подряд, строка
+        #    показывала бы вечные семьдесят с лишним. Ни разу не чистили —
+        #    счётчик показывает весь архив, и это правда: чистка не работала
+        #    никогда.
+        # 2. Приватные записи. Их чистить нельзя вовсе (инвариант 5), поэтому
+        #    их `clean_text` пуст навсегда — и это не отставание, а норма.
+        #    Приватность спрашивается **сейчас** (`is_private_now`), а не
+        #    по колонке: её включают задним числом уже после расшифровки.
+        #
+        # **Чем счётчик всё-таки врёт, вслух.** Расшифровка, на которой модель
+        # вернула негодный ответ, остаётся с пустым `clean_text` навсегда
+        # и считается отставанием вечно. Отличить «не дошли» от «дошли
+        # и не получилось» сейчас нечем: следа о неудачной попытке в базе
+        # не остаётся. Признак понадобится — заводить его надо строкой
+        # о попытке, а не догадкой по времени.
+        # Когда вычистили первую расшифровку. NULL — не чистили ни разу.
+        cleaning_started = (
+            select(func.min(Transcript.created_at))
+            .where(Transcript.clean_text.is_not(None))
+            .scalar_subquery()
+        )
+        without_cleanup = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Transcript)
+                .join(Entry, Entry.id == Transcript.source_entry_id)
+                .where(
+                    Transcript.clean_text.is_(None),
+                    # Приватность спрашивается тем же единственным выражением,
+                    # что и везде: своё условие рядом однажды разъехалось бы
+                    # с ним молча.
+                    ~repository.is_private_now(),
+                    or_(
+                        cleaning_started.is_(None),
+                        Transcript.created_at >= cleaning_started,
+                    ),
+                )
+            )
+            or 0
+        )
+
         # `failed` — это задания, исчерпавшие попытки и оставленные в очереди
         # (`on_failure="hold"`). Они ждут `pgq requeue`, а не исчезают.
         queue = (
@@ -230,6 +283,7 @@ async def collect(
         ),
         entries=int(entries),
         voice_without_transcript=int(voice_without_transcript),
+        transcripts_without_cleanup=int(without_cleanup),
         entries_without_index=len(await retrieval.entries_needing_index()),
         entries_without_annotation=await enrich.unannotated_count(),
         # Считается через вечерний разбор, а не по состоянию разметки: с Фазы 4

@@ -32,7 +32,7 @@ from brain.core import enrich as enrichment
 from brain.core.digest import commitments
 from brain.core.enrich import repository as enrich_repository
 from brain.core.llm.gemini import CHEAP
-from brain.core.memory.repository import latest_transcript
+from brain.core.memory.repository import working_text
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import repository as retrieval_repository
 from brain.core.retrieval.gemini import EMBEDDING
@@ -216,11 +216,9 @@ async def backfill_commitments(*, dry_run: bool) -> int:
                 without_units.append(int(entry_id))
                 continue
 
-            body = await session.scalar(
-                select(func.coalesce(latest_transcript(), Entry.raw_text)).where(
-                    Entry.id == entry_id
-                )
-            )
+            # Работа, а не показ: ниже из этой строки режутся дела по отрезкам
+            # единиц, а отрезки посчитаны над рабочим текстом (ADR-0015, ось 3).
+            body = await session.scalar(select(working_text()).where(Entry.id == entry_id))
             if dry_run:
                 pending = await session.scalars(
                     select(EntryUnit.id).where(

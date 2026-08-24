@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from brain.core.memory.repository import latest_transcript
+from brain.core.memory.repository import working_text
 from brain.storage.db import session_scope
 from brain.storage.models.annotation import Annotation, AnnotationType
 from brain.storage.models.entry import Entry
@@ -115,9 +115,10 @@ async def create_from_entry(entry_id: int) -> int | None:
             return None
 
         unit_id, start, end = found
-        body = await session.scalar(
-            select(func.coalesce(latest_transcript(), Entry.raw_text)).where(Entry.id == entry_id)
-        )
+        # Работа, а не показ: строка сейчас режется по отрезку единицы, а он
+        # посчитан над рабочим текстом (ADR-0015, ось 3). Взяв здесь
+        # вычищенный, мы отрезали бы по чужим границам.
+        body = await session.scalar(select(working_text()).where(Entry.id == entry_id))
 
     question = str(body or "")[start:end].strip()
     if not question:

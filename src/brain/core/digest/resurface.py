@@ -33,9 +33,9 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 
 from brain.core.digest import touches
+from brain.core.memory.repository import display_text
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry
-from brain.storage.models.transcript import Transcript
 
 # Нижняя граница возраста. Она же — причина, по которой механизм молчит
 # на молодом архиве.
@@ -75,18 +75,13 @@ async def eligible(now: datetime) -> list[Old]:
 
     seen = await touches.resurfaced_since((now - COOLDOWN).date())
 
-    # Текст берётся так же, как везде: расшифровка, если она есть, иначе
-    # сырой текст. У приватной записи расшифровки не бывает — в приватном
-    # режиме голосовые не принимаются (ADR-0002).
-    latest = (
-        select(Transcript.text)
-        .where(Transcript.source_entry_id == Entry.id)
-        .order_by(Transcript.id.desc())
-        .limit(1)
-        .correlate(Entry)
-        .scalar_subquery()
-    )
-    body = func.coalesce(latest, Entry.raw_text)
+    # Показ, а не работа: всплывшая запись уходит владельцу целиком и
+    # по отрезкам не режется (ADR-0015, ось 3). До 24 августа 2026 здесь стоял
+    # свой подзапрос последней расшифровки — второе такое выражение рядом
+    # ровно так и разъезжается с общим: чистку оно бы не заметило.
+    # У приватной записи расшифровки не бывает — в приватном режиме голосовые
+    # не принимаются (ADR-0002).
+    body = display_text()
 
     async with session_scope() as session:
         rows = (

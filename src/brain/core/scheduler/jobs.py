@@ -19,11 +19,13 @@
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from brain.core import digest, stt
+from brain.config import get_settings
+from brain.core import digest, present, quota, stt
 from brain.core import enrich as enrichment
 from brain.core.enrich import regeneralize as regeneralization
 from brain.core.memory import audio as audio_store
@@ -39,7 +41,7 @@ from brain.core.ports import (
 )
 from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
-from brain.core.scheduler.queue import ENRICH, INDEX
+from brain.core.scheduler.queue import CLEANUP, ENRICH, INDEX, SHOW_TRANSCRIPT
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.entry import Entry
@@ -54,6 +56,22 @@ VOICE_MIME = "audio/ogg"
 # в базе сработавшие вовремя отстают на десятые доли секунды, а то, что
 # ждало поднятия воркера, — на десятки минут.
 OVERDUE_AFTER = timedelta(minutes=2)
+
+# Насколько свежим должно быть подтверждение приёма, чтобы его ещё правили.
+#
+# Правило одно на всех, кто дописывает что-то в это сообщение: и на разметку,
+# и на чистку. Править сообщение недельной давности значит переписывать
+# переписку задним числом — о такой правке никто не просил, и владелец увидит
+# её как сообщение, изменившееся само.
+#
+# У чистки к этому добавляется своя беда, и она хуже косметической. Под квотой
+# чистка переставляет себя на сутки вперёд (`_postpone_cleanup`), а перерисовка
+# собирает сообщение заново — вместе со строкой «⏰ Напомню в 19:40». Для
+# напоминания, которое за эти сутки давно сработало, это обещание прошлого
+# в будущем времени. Поэтому по истечении окна вычищенный текст **сохраняется**
+# (он нужен показу везде: поиску, сводке, вечернему разбору), а сообщение
+# не трогается вовсе.
+ACK_WINDOW = timedelta(hours=1)
 
 ENTRY_GONE = "Запись потерялась — такого быть не должно, посмотрите логи."
 TOO_LONG = "Голосовое слишком длинное, я такое не расшифровываю. Разбейте на части."
@@ -83,8 +101,19 @@ async def transcribe(
         # второй раз незачем. Но напоминание могло не завестись — первый проход
         # мог упасть между сохранением расшифровки и постановкой напоминания,
         # и тогда повтор это единственный шанс его завести.
+        #
+        # Разбирается напоминание по **дословному** тексту (отрезки и время
+        # считаются над ним), а показывается вычищенный, если он уже есть:
+        # повтор задания не повод показать владельцу «э» второй раз.
         reminder = await _schedule_reminder(entry, chat_id, existing)
-        await _show(notifier, chat_id, ack_message_id, entry.id, existing, reminder)
+        await _show(
+            notifier,
+            chat_id,
+            ack_message_id,
+            entry.id,
+            await repository.display_of(entry_id) or existing,
+            reminder,
+        )
         return
 
     audio = await _audio_bytes(entry.audio_path, entry.meta.get("file_id"), audio_source)
@@ -109,8 +138,14 @@ async def transcribe(
         await notifier.edit(chat_id, ack_message_id, TOO_LONG)
         return
 
-    reminder = await _store_transcript(entry, chat_id, transcription)
-    await _show(notifier, chat_id, ack_message_id, entry.id, transcription.text, reminder)
+    stored = await _store_transcript(entry, chat_id, ack_message_id, transcription)
+    if stored.deferred:
+        # Показ отложен намеренно: ждём чистку. Мгновенно показанный мусор
+        # хуже небольшой задержки — весь смысл ADR-0015 в этом. Показывать
+        # будет задание `show-transcript`, если чистка не успеет первой.
+        return
+
+    await _show(notifier, chat_id, ack_message_id, entry.id, transcription.text, stored.reminder)
 
 
 # Значок перед судьбой напоминания. Разные намеренно: ⏰ значит «сделано»,
@@ -150,36 +185,68 @@ async def _show(
     await notifier.edit(chat_id, ack_message_id, text)
 
 
+@dataclass(frozen=True, slots=True)
+class _Stored:
+    """Что получилось из расшифровки и надо ли показывать её прямо сейчас."""
+
+    reminder: reminders.ScheduleOutcome | None
+    # Показ отложен: чистка в пути, и владелец не должен увидеть дословный
+    # вариант, если она успеет. Не отложен — чистки не будет (выключена или
+    # запись приватна), и показывать надо сразу, как до Фазы 5.
+    deferred: bool
+
+
 async def _store_transcript(
-    entry: Entry, chat_id: int, transcription: Transcription
-) -> reminders.ScheduleOutcome | None:
+    entry: Entry, chat_id: int, ack_message_id: int, transcription: Transcription
+) -> _Stored:
     """Сохранить расшифровку и всё, что из неё следует, — одной транзакцией.
 
-    Вместе с расшифровкой в базу уходят два следствия: задание на индексацию
-    и напоминание, если запись им является. Раздельными транзакциями это
-    писать нельзя — упав между ними, мы получили бы расшифровку, которую
-    невозможно найти, и никакого следа о том, что так вышло. Это та же дыра,
-    что с пропавшими заданиями расшифровки 16 августа, только тише: там было
-    видно отсутствие ответа, здесь не видно ничего.
+    Вместе с расшифровкой в базу уходят её следствия: задания на индексацию,
+    разметку, чистку и на показ по истечении ожидания, плюс напоминание, если
+    запись им является. Раздельными транзакциями это писать нельзя — упав
+    между ними, мы получили бы расшифровку, которую невозможно найти,
+    и никакого следа о том, что так вышло. Это та же дыра, что с пропавшими
+    заданиями расшифровки 16 августа, только тише: там было видно отсутствие
+    ответа, здесь не видно ничего.
+
+    **Разметка ставится с той же задержкой, что и показ.** Она рисует то же
+    самое сообщение (`_show_annotations`) и берёт текст выражением
+    `display_text()`. Опередив чистку, она показала бы дословный вариант —
+    и вся задача оказалась бы напрасной, причём незаметно: и разметка,
+    и чистка при этом работают правильно, просто пришли не в том порядке.
+    Задержка не бесплатна — разбор записи появляется на полминуты позже,
+    — но это ровно тот обмен, который ADR-0015 называет ценой.
     """
     already_reminded = await repository.has_reminder(entry.id)
     is_private = await repository.is_entry_private(entry.id)
 
+    settings = get_settings()
+    # Приватность спрашивается заново, а не берётся из колонки: её включают
+    # задним числом, и тогда расшифровка уже есть, а чистка ещё нет.
+    cleaning = settings.cleanup_enabled and not is_private
+    wait = timedelta(seconds=settings.cleanup_wait_sec) if cleaning else None
+    payload = {"entry_id": entry.id, "chat_id": chat_id, "ack_message_id": ack_message_id}
+
     async with capture_transaction() as uow:
         await uow.add_transcript(entry.id, transcription)
         await uow.enqueue(INDEX, {"entry_id": entry.id})
+
+        if cleaning:
+            await uow.enqueue(CLEANUP, payload)
+            await uow.enqueue(SHOW_TRANSCRIPT, payload, execute_after=wait)
+
         # Разметка ставится здесь, а не при приёме: при приёме у голосовой
         # записи текста ещё нет, а размечать нечем.
         if not is_private:
-            await uow.enqueue(ENRICH, {"entry_id": entry.id})
+            await uow.enqueue(ENRICH, {"entry_id": entry.id}, execute_after=wait)
 
         if already_reminded:
-            return None
+            return _Stored(reminder=None, deferred=cleaning)
 
         # Напоминание разбирается здесь, а не при приёме: при приёме текста
         # ещё нет. Голосом «напомни через 3 минуты» говорят чаще, чем текстом,
         # — на ходу только так и получается.
-        return await reminders.schedule(
+        reminder = await reminders.schedule(
             uow,
             entry_id=entry.id,
             chat_id=chat_id,
@@ -187,6 +254,8 @@ async def _store_transcript(
             timezone=entry.timezone,
             now=datetime.now(UTC),
         )
+
+    return _Stored(reminder=reminder, deferred=cleaning)
 
 
 async def _schedule_reminder(
@@ -209,6 +278,188 @@ async def _schedule_reminder(
             timezone=entry.timezone,
             now=datetime.now(UTC),
         )
+
+
+async def cleanup(
+    *,
+    entry_id: int,
+    chat_id: int,
+    ack_message_id: int,
+    model: LanguageModel,
+    notifier: Notifier,
+) -> None:
+    """Вычистить расшифровку и показать владельцу то, что получилось.
+
+    Отдельным заданием от расшифровки — ADR-0015, ось 2: промпт расшифровки
+    не трогается, а отказ чистки не стоит записи. Ретраи здесь тоже свои:
+    упавшая чистка повторяется, не задевая ни текста, ни напоминания.
+    """
+    target = await repository.transcript_to_clean(entry_id)
+    if target is None:
+        # Законное состояние: задание опередило расшифровку после ручного
+        # перезапуска очереди. Задание закрывается — новое поставит расшифровка.
+        logger.info("чистить нечего: у записи %s ещё нет расшифровки", entry_id)
+        return
+
+    if target.clean_text is not None:
+        # Задание выполняется второй раз: текст уже вычищен, платить за него
+        # снова незачем. А вот перерисовать надо — прошлый проход мог упасть
+        # **между** записью в базу и правкой сообщения, и тогда владелец
+        # остался бы с «Принял» навсегда: задание показа по сроку тоже молчит,
+        # увидев готовый `clean_text`. Повторная одинаковая правка Telegram'у
+        # безразлична, её глотает `TelegramNotifier._edit`.
+        logger.info("запись %s уже вычищена — только перерисовываю", entry_id)
+        await _redraw(notifier, entry_id=entry_id, chat_id=chat_id, ack_message_id=ack_message_id)
+        return
+
+    if target.is_private:
+        # Приватность включили задним числом, а расшифровка уже была.
+        # Наружу текст не уходит (инвариант 5), и это не сбой задания:
+        # повторять бессмысленно, результат будет тот же.
+        logger.warning("запись %s стала приватной — чистка отменена", entry_id)
+        return
+
+    now = datetime.now(UTC)
+    if not await present.cosmetic_allowed(now):
+        await _postpone_cleanup(entry_id, chat_id, ack_message_id, now)
+        return
+
+    clean = await present.clean_one(
+        model, entry_id=entry_id, text=target.text, is_private=target.is_private
+    )
+    if clean is None:
+        # Модель ответила не тем. Ретрай стоил бы ещё одного запроса под квотой
+        # ради того же ответа, а деградация уже написана: показ уйдёт дословным.
+        return
+
+    await repository.save_clean_text(target.transcript_id, clean, model=model.model)
+    await _redraw(notifier, entry_id=entry_id, chat_id=chat_id, ack_message_id=ack_message_id)
+
+
+async def _postpone_cleanup(
+    entry_id: int, chat_id: int, ack_message_id: int, now: datetime
+) -> None:
+    """Переставить чистку на время сброса квоты вместо того, чтобы умереть.
+
+    Ретраи очереди — пять попыток с ростом задержки, то есть около получаса,
+    а суточная квота сбрасывается через часы (ADR-0014, «Цена решения»).
+    Без переноса косметическое задание исчерпало бы попытки и ушло в `failed`,
+    где ждало бы `just requeue` руками — при том, что чинить нечего и всё
+    пройдёт само к полуночи по тихоокеанскому времени.
+    """
+    resets_at = quota.resets_at(now)
+    async with capture_transaction() as uow:
+        await uow.enqueue(
+            CLEANUP,
+            {"entry_id": entry_id, "chat_id": chat_id, "ack_message_id": ack_message_id},
+            execute_after=resets_at - now,
+        )
+    logger.info(
+        "чистка записи %s отложена до %s: квота", entry_id, resets_at.isoformat(timespec="minutes")
+    )
+
+
+async def show_transcript(
+    *, entry_id: int, chat_id: int, ack_message_id: int, notifier: Notifier
+) -> None:
+    """Показать расшифровку, когда ждать чистку больше нельзя.
+
+    Это и есть «ожидание» из ADR-0015 — отложенное задание, а не сон
+    в обработчике: спящий обработчик держит слот воркера и не переживает
+    перезапуск. Здесь ожидание не стоит ничего, пока идёт.
+
+    Дождались чистки — задание молчит: сообщение уже перерисовано, и второй
+    раз показывать то же самое незачем. Не дождались — показывается дословный
+    вариант, а чистка заменит его, когда пройдёт. Молчать над готовой
+    расшифровкой полчаса было бы хуже.
+    """
+    target = await repository.transcript_to_clean(entry_id)
+    if target is None:
+        logger.info("показывать нечего: у записи %s нет расшифровки", entry_id)
+        return
+
+    if target.clean_text is not None:
+        return
+
+    logger.info("чистка записи %s не успела — показываю дословный вариант", entry_id)
+    await _redraw(notifier, entry_id=entry_id, chat_id=chat_id, ack_message_id=ack_message_id)
+
+
+async def _redraw(notifier: Notifier, *, entry_id: int, chat_id: int, ack_message_id: int) -> None:
+    """Перерисовать подтверждение приёма — **тем же путём, каким его рисовали**.
+
+    Голый `notifier.edit(chat_id, ack_message_id, clean_text)` здесь был бы
+    ошибкой, и ошибкой тихой. Расшифровка показывается не одна: `_show` клеит
+    к ней судьбу напоминания («⏰ Напомню 24.08 в 19:40», «⚠️ не понял, когда»)
+    и в одной ветке вешает кнопки «да/нет». Заменив сообщение одним текстом,
+    чистка стёрла бы и строку, и кнопки: владелец прочитал бы это как
+    «напоминание не завелось», а на пропавший вопрос ответить было бы нечем.
+
+    Разметка приходит своим заданием и рисует то же самое сообщение по-своему
+    — с типом, темами и своими кнопками (`_show_annotations`). Если она уже
+    успела, перерисовка идёт её путём: иначе чистка стёрла бы разбор ровно
+    так же, как стёрла бы напоминание.
+
+    Старое сообщение не трогается ни одной из двух веток — `ACK_WINDOW`, и там
+    же объяснено, почему у чистки на это причина серьёзнее, чем у разметки.
+    Пропуск пишется в лог: молчание, которого не видно в журнале, в этом
+    проекте считается дырой.
+    """
+    entry = await repository.get_entry(entry_id)
+    if entry is None:  # pragma: no cover — запись только что читали
+        logger.error("перерисовывать нечего: запись %s исчезла", entry_id)
+        return
+
+    age = datetime.now(UTC) - entry.created_at
+    if age > ACK_WINDOW:
+        logger.info(
+            "перерисовка записи %s пропущена: подтверждению приёма уже %s, "
+            "вычищенный текст сохранён и виден везде, кроме этого сообщения",
+            entry_id,
+            age,
+        )
+        return
+
+    if await enrichment.latest_annotation(entry_id) is not None:
+        await _show_annotations(notifier, [entry_id])
+        return
+
+    shown = await repository.display_of(entry_id)
+    if shown is None:  # pragma: no cover — расшифровка только что читалась
+        logger.error("перерисовывать нечего: у записи %s нет текста", entry_id)
+        return
+
+    await _show(notifier, chat_id, ack_message_id, entry_id, shown, await _reminder_shown(entry))
+
+
+async def _reminder_shown(entry: Entry) -> reminders.ScheduleOutcome | None:
+    """Что владельцу уже сказали про напоминание этой записи.
+
+    Время **заведённого** напоминания берётся из базы, а не разбирается заново:
+    «через 3 минуты», пересчитанное через полминуты, дало бы обещание
+    на полминуты позже настоящего.
+
+    А вот **вопрос** «Похоже на напоминание: …? Поставить на 25.08 в 19:40?»
+    нигде не хранится — ни текстом, ни временем, — и собрать его можно только
+    разбором от текущего `now`. Значит, при перерисовке он может показать
+    другое время, чем показал в первый раз: «в 19:40», спрошенное в 19:45,
+    во второй раз уедет на завтра. На тридцати секундах ожидания разницы нет
+    никогда; заметной она стала бы на перерисовке через часы — и именно её
+    закрывает `ACK_WINDOW` в `_redraw`, а не эта функция. Здесь — знание
+    о том, что такая точность у вопроса недостижима без хранения самого вопроса.
+    """
+    reminder = await repository.reminder_of(entry.id)
+    # Разбирается **рабочий** текст: над ним считались и время, и отрезки.
+    working = await repository.entry_text(entry.id)
+    if working is None:  # pragma: no cover — расшифровка только что читалась
+        return None
+
+    return reminders.shown(
+        working[0],
+        fire_at=None if reminder is None else reminder.fire_at,
+        now=datetime.now(UTC),
+        timezone=entry.timezone,
+    )
 
 
 async def _audio_bytes(path: str, file_id: object, audio_source: AudioSource) -> bytes:
@@ -306,14 +557,6 @@ async def enrich(
 
     await _show_annotations(notifier, outcome.entry_ids)
     return int(outcome.annotated)
-
-
-# Насколько свежей должна быть запись, чтобы бот дописал к подтверждению приёма
-# разметку. Старая размечается молча, и это не экономия: править сообщение
-# недельной давности значит переписывать переписку задним числом. Первый же
-# проход разбирает весь накопленный архив — и всё это были бы правки старых
-# сообщений, о которых никто не просил.
-ACK_WINDOW = timedelta(hours=1)
 
 
 async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:

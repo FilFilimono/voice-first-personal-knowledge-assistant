@@ -219,6 +219,13 @@ async def test_entries_cannot_be_changed(engine: AsyncEngine) -> None:
 
 
 async def test_voice_is_transcribed_and_the_acknowledgement_is_edited(tmp_path: Path) -> None:
+    """Расшифровка доходит до владельца — пусть и не мгновенно.
+
+    Показ с Фазы 5 отложен: расшифровка ждёт чистку, а если та не успела,
+    сообщение правит задание `show-transcript`. Здесь чистки нет вовсе,
+    поэтому проходится именно эта ветка — и она обязана показать дословный
+    текст, а не промолчать над готовой расшифровкой.
+    """
     entry_id = await _capture_voice(tmp_path)
     assert entry_id is not None
     notifier = FakeNotifier()
@@ -231,6 +238,9 @@ async def test_voice_is_transcribed_and_the_acknowledgement_is_edited(tmp_path: 
         audio_source=FakeAudioSource(),
         notifier=notifier,
         max_duration_sec=900,
+    )
+    await jobs.show_transcript(
+        entry_id=entry_id, chat_id=CHAT_ID, ack_message_id=21, notifier=notifier
     )
 
     assert await repository.get_transcript(entry_id) == "надо переписать ретривал"
@@ -296,6 +306,10 @@ async def test_reminder_spoken_by_voice_is_scheduled(tmp_path: Path) -> None:
         audio_source=FakeAudioSource(),
         notifier=notifier,
         max_duration_sec=900,
+    )
+    # Показ отложен на срок ожидания чистки — здесь она не приходит вовсе.
+    await jobs.show_transcript(
+        entry_id=entry_id, chat_id=CHAT_ID, ack_message_id=21, notifier=notifier
     )
 
     reminder = await repository.get_reminder(1)

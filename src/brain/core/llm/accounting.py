@@ -36,6 +36,7 @@ async def record(
     latency_ms: int = 0,
     succeeded: bool = True,
     error: str | None = None,
+    status_code: int | None = None,
 ) -> Decimal | None:
     """Записать вызов. Вернуть его стоимость, если она известна."""
     cost = cost_usd(model, input_tokens=input_tokens, output_tokens=output_tokens)
@@ -63,6 +64,7 @@ async def record(
                     latency_ms=latency_ms,
                     succeeded=succeeded,
                     error=error,
+                    status_code=status_code,
                 )
             )
     except Exception:

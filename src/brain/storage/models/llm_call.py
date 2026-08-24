@@ -55,3 +55,13 @@ class LlmCall(Base):
 
     succeeded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Код ответа провайдера — отдельной колонкой, а не внутри `error`.
+    # По нему решается, придерживать ли косметику: `429` в текущих сутках
+    # провайдера означает, что чистка и лид сводки замолкают до сброса квоты
+    # (ADR-0015, пункт 6). Разбирать этот код подстрокой из текста ошибки
+    # значило бы привязать работающий механизм к формату сообщения —
+    # и потерять его молча при первой же правке текста.
+    #
+    # `None` — ответа не было вовсе: сеть отвалилась, таймаут. Это не ноль.
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)

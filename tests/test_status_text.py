@@ -48,6 +48,7 @@ def _status(
     silent_for: timedelta | None = timedelta(seconds=10),
     entries: int = 12,
     voice_without_transcript: int = 0,
+    transcripts_without_cleanup: int = 0,
     entries_without_index: int = 0,
     entries_without_annotation: int = 0,
     waiting_for_review: int = 0,
@@ -68,6 +69,7 @@ def _status(
         worker=WorkerStatus(last_beat=last_beat, stale_after=STALE_AFTER),
         entries=entries,
         voice_without_transcript=voice_without_transcript,
+        transcripts_without_cleanup=transcripts_without_cleanup,
         entries_without_index=entries_without_index,
         entries_without_annotation=entries_without_annotation,
         waiting_for_review=waiting_for_review,
@@ -119,7 +121,20 @@ def test_quiet_sections_are_omitted() -> None:
 
     assert "без расшифровки" not in report
     assert "Упало" not in report
+    assert "без чистки" not in report
     assert "Напоминаний нет" in report
+
+
+def test_cleanup_backlog_is_visible() -> None:
+    """Отставание чистки владелец должен читать с телефона.
+
+    Без этой строки вставшая чистка проявляется только тем, что в сообщениях
+    снова появились «э» и «мм», — а это читается как «модель стала хуже»,
+    а не как «вызова не было».
+    """
+    report = render(_status(transcripts_without_cleanup=12), timezone=TIMEZONE)
+
+    assert "🧹 Расшифровок без чистки: 12" in report
 
 
 def test_backlog_and_failures_are_shown_with_the_way_out() -> None:

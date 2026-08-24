@@ -72,7 +72,14 @@ async def _capture_voice(audio_dir: Path) -> int:
 
 
 async def _transcribe(entry_id: int, spoken: str, notifier: FakeNotifier) -> None:
-    """Отработать задание расшифровки так же, как это делает воркер."""
+    """Отработать задание расшифровки так же, как это делает воркер.
+
+    Двумя заданиями, а не одним, потому что путь именно такой с Фазы 5:
+    расшифровка сохраняет текст и ставит чистку, а показывает — либо чистка,
+    либо срок ожидания (`show-transcript`), если она не успела. Здесь
+    проверяются напоминания, а не чистка, поэтому проходится вторая ветка:
+    модели в тестах нет, чистка не случится, и владелец видит дословный текст.
+    """
     await jobs.transcribe(
         entry_id=entry_id,
         chat_id=CHAT_ID,
@@ -81,6 +88,12 @@ async def _transcribe(entry_id: int, spoken: str, notifier: FakeNotifier) -> Non
         audio_source=FakeAudioSource(),
         notifier=notifier,
         max_duration_sec=900,
+    )
+    await jobs.show_transcript(
+        entry_id=entry_id,
+        chat_id=CHAT_ID,
+        ack_message_id=ACK_MESSAGE_ID,
+        notifier=notifier,
     )
 
 

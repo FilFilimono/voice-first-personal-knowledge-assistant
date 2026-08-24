@@ -35,6 +35,25 @@ def database(migrated_database: str) -> str:
     return migrated_database
 
 
+def _days_after_capture(days: int) -> datetime:
+    """Момент через N дней после того, как запись реально создана.
+
+    **Отсчёт от настоящих часов, а не от `NOW`, и это не мелочь.** Отсечка
+    долга сравнивается с `entries.created_at`, а он приходит
+    из `server_default=func.now()` — то есть с часов сервера. Переданный
+    приёму `now=NOW` на него не влияет никак: `entries` не правится
+    (инвариант 3), значение ставит база в момент вставки.
+
+    Так эти три теста и сломались. С `NOW = 20 августа` отсечка
+    `settle_debt(NOW + 8 дней) - 7 дней` приходилась на 21 августа, и пока
+    настоящая дата была раньше, запись оказывалась старше отсечки — случайно.
+    21 августа 2026 тесты покраснели молча и оставались красными, пока их
+    не разобрали руками 24-го. Подгонять константу под сегодняшний день
+    нельзя: это вернёт ту же поломку через неделю.
+    """
+    return datetime.now(UTC) + timedelta(days=days)
+
+
 async def _annotated(body: str, state: AnnotationState, message_id: int) -> int:
     async with capture_transaction() as uow:
         result = await ingest.capture_text(
@@ -118,8 +137,8 @@ async def test_debt_settles_itself_after_seven_days() -> None:
     """Долг не копится (`vision.md` §7)."""
     entry_id = await _annotated("спорная", AnnotationState.TWO_HYPOTHESES, message_id=10)
 
-    assert await evening.settle_debt(NOW + timedelta(days=6)) == 0
-    assert await evening.settle_debt(NOW + timedelta(days=8)) == 1
+    assert await evening.settle_debt(_days_after_capture(6)) == 0
+    assert await evening.settle_debt(_days_after_capture(8)) == 1
 
     assert await evening.disputed() == []
     assert await evening.auto_resolved_count() == 1
@@ -134,8 +153,8 @@ async def test_debt_is_settled_once_not_every_tick() -> None:
     """
     await _annotated("спорная", AnnotationState.TWO_HYPOTHESES, message_id=10)
 
-    assert await evening.settle_debt(NOW + timedelta(days=8)) == 1
-    assert await evening.settle_debt(NOW + timedelta(days=8)) == 0
+    assert await evening.settle_debt(_days_after_capture(8)) == 1
+    assert await evening.settle_debt(_days_after_capture(8)) == 0
 
 
 async def test_confirmed_and_auto_resolved_are_told_apart() -> None:
@@ -148,6 +167,6 @@ async def test_confirmed_and_auto_resolved_are_told_apart() -> None:
     await _annotated("другая спорная", AnnotationState.TWO_HYPOTHESES, message_id=20)
 
     await evening.settle(mine, action=OverrideAction.CONFIRM)
-    await evening.settle_debt(NOW + timedelta(days=8))
+    await evening.settle_debt(_days_after_capture(8))
 
     assert await evening.auto_resolved_count() == 1

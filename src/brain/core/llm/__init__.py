@@ -110,6 +110,10 @@ async def complete_over_entries(
     except LlmError as error:
         # Провайдер берёт деньги за попытку, поэтому упавший вызов учитывается
         # тоже. Иначе месяц ретраев не виден в расходах вовсе.
+        #
+        # Отсюда `status_code` попадает в базу для текстовой модели: признаком
+        # придерживания косметики служит **наблюдённый** отказ, а наблюдается
+        # он здесь (`core/present/pacing.py`).
         await record(
             provider=model.provider,
             model=model.model,
@@ -118,6 +122,7 @@ async def complete_over_entries(
             entries_count=len(entries),
             succeeded=False,
             error=str(error)[:500],
+            status_code=error.status,
         )
         raise
 

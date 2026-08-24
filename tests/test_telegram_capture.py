@@ -189,6 +189,7 @@ async def test_status_reports_the_worker_first(
         worker=WorkerStatus(last_beat=None, stale_after=timedelta(minutes=3)),
         entries=7,
         voice_without_transcript=2,
+        transcripts_without_cleanup=0,
         entries_without_index=0,
         entries_without_annotation=0,
         waiting_for_review=0,

@@ -41,10 +41,10 @@ from datetime import datetime
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from brain.core.memory.repository import is_private_now
+from brain.core.memory.repository import display_text, is_private_now
 from brain.core.ports import Embedder
 from brain.storage.db import session_scope
-from brain.storage.models.chunk import FTS_CONFIG, Chunk
+from brain.storage.models.chunk import FTS_CONFIG
 from brain.storage.models.entry import Entry
 from brain.storage.types import to_literal
 
@@ -81,10 +81,19 @@ class Found:
     created_at: datetime
     timezone: str
     is_private: bool
-    # Начало записи. Показываем именно его, а не тот кусок, которым запись
-    # попала в выдачу: 30 записей архива из 31 короче порога резки и состоят
-    # из одного чанка, так что разницы почти нет, а начало мысли владелец
-    # узнаёт быстрее, чем её середину.
+    # Начало записи, **вычищенное** (`display_text()`), а не текст чанка.
+    #
+    # Чанки строятся над рабочим текстом, то есть пока над дословным. Оставь
+    # выдача текст чанка — поиск остался бы единственным экраном, где владелец
+    # продолжает видеть «э-э-э», а сказано было «везде без исключений»
+    # (ADR-0015, ось 3; найдено ревизией Задачи 1).
+    #
+    # **Цена названа вслух.** У записи длиннее 1500 символов чанков несколько,
+    # и показанный кусок перестаёт быть тем куском, который совпал с запросом,
+    # — показывается начало записи. Сегодня это задевает единицы записей
+    # (медиана 409 символов, максимум 1958), но с ростом архива будет задевать
+    # чаще. Настоящее решение — вычищенные чанки, и оно приходит вместе
+    # с переключением рабочего текста, а не раньше.
     text: str
     score: float
     # Какие каналы её нашли. Нужно и eval'у, и объяснимости: «нашлось только
@@ -236,10 +245,11 @@ async def _load(entry_ids: Sequence[int], rankings: dict[str, list[int]]) -> lis
                     # запись, сделанную приватной задним числом, колонка
                     # по-прежнему считает обычной (инвариант 3).
                     is_private_now(),
-                    Chunk.text,
-                )
-                .join(Chunk, Chunk.source_entry_id == Entry.id)
-                .where(Entry.id.in_(list(entry_ids)), Chunk.ordinal == 0)
+                    # То, что видит владелец, — вычищенный текст, если он есть.
+                    # Джойна с чанками здесь больше нет: он был нужен только
+                    # ради текста нулевого чанка.
+                    display_text(),
+                ).where(Entry.id.in_(list(entry_ids)))
             )
         ).all()
 

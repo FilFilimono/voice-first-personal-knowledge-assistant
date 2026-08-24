@@ -28,7 +28,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import Exists, Subquery, func, insert, select
 
-from brain.core.memory.repository import is_private_now, latest_transcript
+from brain.core.memory.repository import display_text, is_private_now
 from brain.storage.db import session_scope
 from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
 from brain.storage.models.entry import Entry
@@ -99,7 +99,10 @@ async def disputed(limit: int = 10, *, exclude: set[int] | None = None) -> list[
     а это разные вещи.
     """
     latest = _latest_annotations()
-    body = func.coalesce(latest_transcript(), Entry.raw_text)
+    # Показ, а не работа: спорная запись уходит в вечерний разбор целиком,
+    # по отрезкам она не режется. Значит, вычищенный вариант, если он есть
+    # (ADR-0015, ось 3).
+    body = display_text()
     seen = exclude or set()
 
     statement = (

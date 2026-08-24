@@ -17,7 +17,12 @@ from sqlalchemy import delete, func, insert, select
 
 from brain.core.digest import commitments
 from brain.core.enrich.units import MergedUnit
-from brain.core.memory.repository import is_private_now, latest_transcript, latest_transcript_id
+from brain.core.memory.repository import (
+    display_text,
+    is_private_now,
+    latest_transcript_id,
+    working_text,
+)
 from brain.core.ports import EntryText
 from brain.storage.db import session_scope
 from brain.storage.models.annotation import Annotation, AnnotationState, AnnotationType
@@ -61,8 +66,13 @@ async def entries_needing_annotation(limit: int) -> list[EntryText]:
     Приватные не попадают сюда вовсе: их разметки не бывает (инвариант 5,
     ADR-0002). Дверь в `core/llm` проверит это ещё раз, но приватная запись
     не должна доходить до двери — она должна не попадать в пачку.
+
+    Текст **рабочий**: над ним модель считает границы смысловых единиц
+    (ADR-0012), и отрезки потом режутся из него же. Показать владельцу
+    вычищенный вариант можно где угодно, кроме этого места, — иначе отрезки
+    и текст разъедутся на длину вычищенного (ADR-0015, ось 3).
     """
-    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    text_of = working_text()
     annotated = select(Annotation.id).where(Annotation.source_entry_id == Entry.id).exists()
 
     async with session_scope() as session:
@@ -94,7 +104,7 @@ async def entries_for_reannotation(entry_ids: list[int]) -> list[EntryText]:
     if not entry_ids:
         return []
 
-    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    text_of = working_text()
     async with session_scope() as session:
         rows = (
             await session.execute(
@@ -316,7 +326,10 @@ async def rows_for_reply(entry_ids: list[int]) -> list[ReplyRow]:
                     Entry.created_at,
                     Entry.timezone,
                     Entry.kind,
-                    func.coalesce(latest_transcript(), Entry.raw_text),
+                    # Показ, а не работа: эта строка целиком уходит в сообщение
+                    # владельцу и по отрезкам не режется. Значит, вычищенный
+                    # вариант, если он есть (ADR-0015, ось 3).
+                    display_text(),
                     Reminder.fire_at,
                     Reminder.text,
                 )
@@ -392,7 +405,7 @@ async def recent_entries(limit: int) -> list[EntryText]:
     Приватные не попадают сюда вовсе, как и в разметку: их текст наружу
     не уходит (инвариант 5), и тем у них не бывает.
     """
-    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    text_of = working_text()
     async with session_scope() as session:
         rows = (
             await session.execute(
@@ -573,7 +586,7 @@ async def counts_by_state() -> dict[AnnotationState, int]:
 
 async def unannotated_count() -> int:
     """Сколько записей ещё ждут разметки."""
-    text_of = func.coalesce(latest_transcript(), Entry.raw_text)
+    text_of = working_text()
     annotated = select(Annotation.id).where(Annotation.source_entry_id == Entry.id).exists()
 
     async with session_scope() as session:
