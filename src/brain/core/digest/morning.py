@@ -58,6 +58,18 @@ class Morning:
         """
         return not self.commitments and self.loop is None
 
+    @property
+    def loop_stuck(self) -> bool:
+        """Петлю уже трижды откладывали — `vision.md` §5.2 велит сменить вопрос.
+
+        Признак живёт здесь, а не у каждого читателя, потому что читателей два
+        и они обязаны сказать одно и то же: текст сводки (`render.morning`)
+        и кнопки под ней (через нагрузку касания в `service._prepare`).
+        Посчитай его каждый сам — и разъехаться они смогут молча, а это ровно
+        тот почерк, которым в проекте уже потерялась `loops.is_stuck`.
+        """
+        return self.loop is not None and loops.is_stuck(self.loop.times_asked)
+
 
 async def collect(now: datetime, timezone: str) -> Morning:
     """Собрать сводку на сегодня. Ничего не отправляет и ничего не помечает."""

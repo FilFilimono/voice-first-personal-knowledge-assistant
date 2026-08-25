@@ -193,7 +193,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     # ошибки разная, и выбираются они порознь (ADR-0015). Строится всегда,
     # даже с выключенной чисткой: `build_model` в сеть не ходит, а ветвление
     # здесь стоило бы `None` в трёх местах ниже.
-    cleaner = llm.build_model(settings, model=settings.cleanup_model)
+    cleaner = llm.build_model(
+        settings,
+        model=settings.cleanup_model,
+        thinking_level=settings.cleanup_thinking_level,
+    )
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
@@ -201,9 +205,12 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     # вызовы: список моделей 16 августа 2026 показывал снятую с обслуживания
     # модель как рабочую, и правду сказал только вызов.
     #
-    # Третья проверка вдобавок проверяет структурированный ответ: модель может
-    # отвечать на generateContent и не уметь responseSchema, и выяснять это
-    # на первой пачке было бы поздно.
+    # Текстовые модели проверяются **настоящей схемой** — объектом со строковым
+    # полем, как у чистки. Прежняя проба слала одно булево поле и ловила ровно
+    # «модели нет»: 25 августа 2026 воркер написал «модель чистки доступна»
+    # про модель, которая на рабочем запросе не отвечает и за 900 секунд.
+    # Текст пробы при этом минимальный: проверяется, что модель умеет ответить
+    # по схеме, а не то, как быстро она это делает.
     #
     # Что из этого останавливает воркер, а что нет — в `check_models`.
     try:
@@ -222,7 +229,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
                 ModelCheck(
                     f"разметки {model.provider}/{model.model}",
                     "ENRICH_MODEL",
-                    model.check_available,
+                    # Проверка текстовой модели идёт **дверью** `core/llm`,
+                    # а не методом провайдера: там ведётся учёт, а проба —
+                    # такой же запрос против квоты, как рабочий. Пока она была
+                    # методом, её вызовов в `llm_calls` не было вовсе.
+                    lambda: llm.check_available(model),
                 ),
                 # Четвёртая проверка — чистка, и она **никогда не валит старт**,
                 # даже на неверном имени модели: `vital=False`. Косметика
@@ -236,7 +247,7 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
                         ModelCheck(
                             f"чистки {cleaner.provider}/{cleaner.model}",
                             "CLEANUP_MODEL",
-                            cleaner.check_available,
+                            lambda: llm.check_available(cleaner),
                             vital=False,
                         )
                     ]

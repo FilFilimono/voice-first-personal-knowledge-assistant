@@ -11,12 +11,20 @@
    от полного и в заголовке, и в файле результата: файлы потом сравниваются.
 3. **Чего стоит p95.** На десятке точек перцентиль без интерполяции — это
    ровно максимум, и печатать его так же уверенно, как на семидесяти, нельзя.
+4. **Как замер переживает поминутный лимит.** 25 августа 2026 прогон трижды
+   объявил «квота кончилась» на 15, 6 и 7 записи из 70 — а через минуту все три
+   модели отвечали `200`. Лимит был на темп запросов, и замер не доводил
+   измерение, объясняя остановку неверной причиной.
 """
 
+import time
 from collections.abc import Mapping
 from typing import Any
 
+import pytest
+
 from brain.config import Settings
+from brain.core import llm
 from brain.core.ports import Completion
 from evals.cleanup import run
 from evals.cleanup.checks import compare
@@ -199,3 +207,127 @@ def test_percentile_is_nearest_rank() -> None:
     assert run.percentile([1, 2, 3, 4], 0.95) == 4
     assert run.percentile(list(range(1, 21)), 0.95) == 19
     assert run.percentile([], 0.95) == 0
+
+
+# --- Поминутный лимит: прогон его пережидает, а не сдаётся ---
+
+VERBATIM = "ну надо надо посмотреть"
+CLEAN = "Надо посмотреть."
+
+
+class FlakyCleaner:
+    """Модель, которая отвечает `429` заданное число раз, а потом — как надо.
+
+    Это и есть наблюдённое 25 августа поведение: лимит поминутный, и та же
+    запись после паузы проходит. Сеть не нужна — отказ поднимается прямо
+    из `complete`, то есть тест идёт через настоящую дверь `core/llm`
+    и настоящий `present.clean_one`, а не мимо них.
+    """
+
+    def __init__(self, *, refusals: int, entry_id: int = 1) -> None:
+        self._left = refusals
+        self._entry_id = entry_id
+        self.calls = 0
+
+    @property
+    def provider(self) -> str:
+        return "stub"
+
+    @property
+    def model(self) -> str:
+        return "stub-flash"
+
+    @property
+    def tier(self) -> str:
+        return "cheap"
+
+    async def check_available(self) -> None:
+        raise AssertionError("замер модель при старте не проверяет")
+
+    async def complete(
+        self, *, system: str, prompt: str, schema: Mapping[str, Any], temperature: float
+    ) -> Completion:
+        self.calls += 1
+        if self._left > 0:
+            self._left -= 1
+            raise llm.LlmError("429 RESOURCE_EXHAUSTED: too many requests", status=429)
+        return Completion(
+            data={"items": [{"id": self._entry_id, "clean": CLEAN}]},
+            input_tokens=10,
+            output_tokens=10,
+            latency_ms=1,
+        )
+
+
+def target(entry_id: int = 1) -> run.Target:
+    return run.Target(entry_id=entry_id, verbatim=VERBATIM)
+
+
+async def test_minute_limit_is_waited_out_instead_of_ending_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`429` на записи — это темп, а не стена: та же запись повторяется после паузы."""
+    monkeypatch.setattr(run, "RETRY_PAUSES_SEC", (0.0, 0.0, 0.0))
+    model = FlakyCleaner(refusals=1)
+
+    finished = await run.clean_all([target()], model=model)
+
+    assert model.calls == 2
+    assert finished.interrupted is None
+    assert [item.clean for item in finished.outcomes] == [CLEAN]
+    assert finished.waiting.times == 1
+
+
+async def test_the_pause_stays_out_of_the_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Колонка меряет ожидание владельца, а не ожидание провайдера.
+
+    Пауза здесь настоящая, но крошечная (`PAUSE`): будь она сложена
+    в латентность, число вышло бы не меньше её. Записывается время удавшейся
+    попытки — по нему ставится `CLEANUP_WAIT_SEC`.
+    """
+    pause = 0.15
+    monkeypatch.setattr(run, "RETRY_PAUSES_SEC", (pause,))
+    model = FlakyCleaner(refusals=1)
+
+    started = time.perf_counter()
+    finished = await run.clean_all([target()], model=model)
+    whole = time.perf_counter() - started
+
+    assert whole >= pause
+    assert finished.outcomes[0].latency_ms < int(pause * 1000)
+    assert finished.waiting.seconds >= pause
+
+
+def test_report_says_how_long_it_sat_in_pauses(capsys: pytest.CaptureFixture[str]) -> None:
+    """Молчаливая пауза превратила бы «шесть минут» в «двадцать» без объяснения."""
+    summary = run.report(
+        [outcome(1)],
+        model=FakeCleaner("модель"),
+        wait_sec=30,
+        planned=1,
+        interrupted=None,
+        waiting=run.Waiting(times=2, seconds=60.0),
+    )
+
+    printed = capsys.readouterr().out
+    assert "Пауз из-за 429: 2" in printed
+    assert "60 с" in printed
+    assert summary["пауз из-за 429"] == 2
+    assert summary["просидели в паузах с"] == 60.0
+    # «Повторили и получилось» отличимо от «сдались»: прогон не оборван.
+    assert summary["оборван"] is None
+
+
+async def test_a_real_wall_still_stops_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если `429` держится и после всех пауз — это правда стена, и прогон встаёт."""
+    monkeypatch.setattr(run, "RETRY_PAUSES_SEC", (0.0, 0.0))
+    model = FlakyCleaner(refusals=99)
+
+    finished = await run.clean_all([target(1), target(2)], model=model)
+
+    # Первая попытка и две после пауз — и ни одного вызова по второй записи.
+    assert model.calls == 3
+    assert finished.waiting.times == 2
+    assert finished.interrupted is not None
+    assert "429" in finished.interrupted
+    assert [item.entry_id for item in finished.outcomes] == [1]

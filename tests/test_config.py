@@ -112,3 +112,19 @@ def test_quota_setting_still_parses_a_number() -> None:
     settings = Settings(_env_file=None, embedding_daily_quota="1000")
 
     assert settings.embedding_daily_quota == 1000
+
+
+def test_empty_thinking_level_means_not_set_at_all() -> None:
+    """`CLEANUP_THINKING_LEVEL=` в `.env` — это «уровень не задан».
+
+    Мина злее квотной: пустая строка не уронила бы старт, а доехала бы до тела
+    запроса, и провайдер отверг бы её `400`. Именно в таком виде переменная
+    стоит в `.env.example`, то есть попала бы к владельцу с первого запуска.
+    """
+    settings = Settings(_env_file=None, cleanup_thinking_level="")
+
+    assert settings.cleanup_thinking_level is None
+
+
+def test_thinking_level_still_reaches_the_settings() -> None:
+    assert Settings(_env_file=None, cleanup_thinking_level="low").cleanup_thinking_level == "low"

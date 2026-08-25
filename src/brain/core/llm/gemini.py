@@ -18,6 +18,15 @@ enum'а, которые мы назвали; разбирать свободны
 и без разброса расхождения не бывает. Заодно замер показал, что 0.0 у этого
 провайдера всё равно ничего не фиксирует: три прогона при нулевой температуре
 разошлись на 17 записях из 29.
+
+**Про уровень рассуждения.** Он необязателен и по умолчанию не шлётся вовсе:
+не попросили — тело запроса ровно то же, что было до его появления. Иначе
+правка ради одной модели уехала бы в разметку, в которой этот файл участвует
+той же дверью, а её замеры сняты на другом теле запроса.
+
+**Проверки при старте здесь нет намеренно.** Она живёт в двери `core/llm`,
+потому что там ведётся учёт вызовов, а проба — такой же запрос против квоты,
+как остальные. Пока она стояла тут, её вызовов в `llm_calls` не было вовсе.
 """
 
 import json
@@ -27,7 +36,7 @@ from typing import Any
 
 import httpx
 
-from brain.core.llm.errors import LlmError, ProviderUnavailableError
+from brain.core.llm.errors import LlmError
 from brain.core.ports import Completion
 
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -47,10 +56,21 @@ class GeminiChat:
         *,
         api_key: str,
         model: str,
+        thinking_level: str | None = None,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
+        # Уровень рассуждения — свойство **модели**, а не вызова: у одной он
+        # не поддерживается вовсе, у другой стоит по умолчанию, и вызывающему
+        # про это знать нечего. Поэтому он приходит в конструктор один раз,
+        # а не тянется параметром через каждый `complete`.
+        #
+        # `None` означает «не просили» — и тогда тело запроса обязано остаться
+        # прежним целиком. Этим же классом ходит разметка, где ненулевая
+        # температура работает измерительным прибором (ADR-0011): лишний ключ
+        # в её запросе менял бы поведение, о котором сняты замеры.
+        self._thinking_level = thinking_level
         # Шов для тестов: разбор ответа провайдера — самая ошибкоопасная часть
         # файла, и проверять её надо на настоящем коде, но без сети.
         self._client_factory = client_factory or self._default_client
@@ -71,31 +91,6 @@ class GeminiChat:
     def tier(self) -> str:
         return CHEAP
 
-    async def check_available(self) -> None:
-        """Дёрнуть модель настоящим вызовом при старте воркера.
-
-        Списку моделей верить нельзя: 16 августа 2026 он показывал снятую
-        с обслуживания модель как рабочую, и правду сказал только вызов.
-        Проверяется заодно и структурированный ответ — модель может отвечать
-        на `generateContent` и не уметь `responseSchema`, и узнать об этом
-        на первой же пачке было бы поздно.
-        """
-        try:
-            await self.complete(
-                system="Отвечай строго по схеме.",
-                prompt="ok",
-                schema={
-                    "type": "object",
-                    "properties": {"ok": {"type": "boolean"}},
-                    "required": ["ok"],
-                },
-                temperature=0.0,
-            )
-        except LlmError as error:
-            raise ProviderUnavailableError(
-                f"модель {self._model} недоступна: {error}", status=error.status
-            ) from error
-
     async def complete(
         self,
         *,
@@ -113,6 +108,20 @@ class GeminiChat:
                 "responseSchema": dict(schema),
             },
         }
+
+        if self._thinking_level is not None:
+            # Ключ **вложенный**, и это не стиль, а протокол. Проверено живым
+            # вызовом 25 августа 2026: плоское `generationConfig.thinkingLevel`
+            # провайдер отвергает с `400 Unknown name "thinkingLevel"
+            # at 'generation_config': Cannot find field`.
+            #
+            # Значение не проверяется здесь: словарь уровней принадлежит
+            # провайдеру и у разных моделей разный (`gemini-3.7-flash`
+            # отвечает `400 Thinking level MINIMAL is not supported for this
+            # model`, а у `gemini-3.5-flash-lite` `minimal` стоит умолчанием).
+            # Список, замороженный в нашем коде, устарел бы молча — вместо него
+            # неверный уровень ловит проба при старте, одной строкой в логе.
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
 
         started = time.monotonic()
         async with self._client_factory() as client:

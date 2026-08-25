@@ -201,6 +201,61 @@ async def test_loop_is_marked_asked_only_after_the_summary_leaves() -> None:
     assert asked.last_asked_at is not None
 
 
+async def test_thrice_snoozed_loop_changes_the_question() -> None:
+    """Девятая дыра того же почерка, найдена 24 августа 2026.
+
+    `loops.is_stuck` была написана, покрыта тестом и не звалась из `src/`
+    ни разу: `_prepare` не клал признак в нагрузку, `_send` не передавал его
+    отправителю, и смена вопроса после третьего «ещё думаю» (`vision.md` §5.2)
+    не работала с написания Фазы 4. Поэтому тест идёт от тика, а не от чистой
+    функции: чистая функция всё это время отвечала правильно, а до владельца
+    ответ не доезжал.
+
+    Откладывания копятся так же, как в проде — спросили и отложили, три круга
+    по четырнадцать дней. Выставить `times_asked` руками значило бы проверить
+    нашу догадку о колонке вместо пути через петлю.
+    """
+    entry_id = await _entry_with_tasks()
+    loop_id = await loops.create(entry_id=entry_id, unit_id=None, question="куда дальше")
+
+    moment = MORNING - loops.INTERVAL * 4
+    for _ in range(loops.SNOOZES_BEFORE_DECISION):
+        await loops.mark_asked(loop_id, now=moment)
+        await loops.still_thinking(loop_id, now=moment)
+        moment += loops.INTERVAL
+
+    notifier = FakeNotifier()
+    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+
+    _, _, _, asked_loop = notifier.mornings[0]
+    assert asked_loop == loop_id
+    assert notifier.stuck_loops == [loop_id]
+
+
+async def test_thrice_snoozed_loop_changes_the_question_in_the_text_too() -> None:
+    """Кнопки уже спрашивали «Закрыть · Переформулирую», а текст — «Сдвинулось?».
+
+    Та же дыра, что и у признака в нагрузке, только с другой стороны: до текста
+    он не доезжал вовсе. Проверяется от тика, а не от рендера, потому что рендер
+    и раньше отвечал бы правильно — не доходило до него.
+    """
+    entry_id = await _entry_with_tasks()
+    loop_id = await loops.create(entry_id=entry_id, unit_id=None, question="куда дальше")
+
+    moment = MORNING - loops.INTERVAL * 4
+    for _ in range(loops.SNOOZES_BEFORE_DECISION):
+        await loops.mark_asked(loop_id, now=moment)
+        await loops.still_thinking(loop_id, now=moment)
+        moment += loops.INTERVAL
+
+    notifier = FakeNotifier()
+    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+
+    _, text, _, _ = notifier.mornings[0]
+    assert "Закрыть или переформулируешь?" in text
+    assert "Сдвинулось?" not in text
+
+
 async def test_closing_a_deed_from_the_summary_removes_it_tomorrow(
     dispatcher: Dispatcher, bot: Bot, session: FakeSession
 ) -> None:

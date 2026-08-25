@@ -11,8 +11,13 @@
 Обращение к `expensive` до Фазы 6 падает явно и не деградирует молча
 в дешёвую модель.
 
-**Учёт стоимости.** Строка в `llm_calls` пишется в той же функции, что делает
-вызов, поэтому забыть её невозможно.
+**Учёт стоимости и запросов.** Строка в `llm_calls` пишется в той же функции,
+что делает вызов (`_call`), поэтому забыть её невозможно. Через неё же идёт
+**проверка модели при старте**: раньше она жила в провайдере, звала `complete`
+напрямую и не оставляла в `llm_calls` ни строки — при том, что квота
+у провайдера считается в запросах (ADR-0014). Время вызова меряется тоже
+здесь: у упавшего вызова провайдер его не сообщает, а ноль в колонке ломает
+любой расчёт по ней.
 
 **Почему дверь принимает записи, а не готовый текст промпта.** Если сюда
 передавать собранную строку, проверить в ней нечего: приватный текст уже внутри
@@ -23,6 +28,7 @@
 """
 
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -41,9 +47,36 @@ logger = logging.getLogger(__name__)
 
 EXPENSIVE = "expensive"
 
+# Назначение пробы при старте. Отдельное, как `embed-check` у эмбеддингов:
+# расход надо уметь разобрать, а в разработке воркер перезапускается часто,
+# и проб за день набирается больше, чем разметок.
+CHECK_PURPOSE = "chat-check"
+
+# Чем проверяется модель при старте. Схема **настоящая** — объект со строковым
+# полем, ровно как у чистки. Прежняя проба слала одно булево поле, то есть
+# ловила «модели нет» и не ловила «модель есть и бесполезна»: 25 августа 2026
+# воркер написал «модель чистки доступна» про модель, которая на рабочем
+# запросе не отвечает.
+#
+# Текст при этом **минимальный**, а не сопоставимый с рабочим. Проверяется,
+# что модель умеет ответить по схеме, а не то, как быстро она это делает:
+# скорость меряется замером на архиве, а не одним вызовом при каждом старте,
+# за который платит квота.
+CHECK_SYSTEM = "Отвечай строго по схеме."
+CHECK_PROMPT = "Ответь словом «готово»."
+CHECK_SCHEMA: Mapping[str, Any] = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+}
+
 
 def build_model(
-    settings: Settings, *, tier: str = CHEAP, model: str | None = None
+    settings: Settings,
+    *,
+    tier: str = CHEAP,
+    model: str | None = None,
+    thinking_level: str | None = None,
 ) -> LanguageModel:
     """Модель по тиру и настройке.
 
@@ -54,6 +87,11 @@ def build_model(
     `model` перебивает имя из настроек. Нужен ровно одному месту — прогону
     eval'а, где две модели сравниваются на одном наборе. Настройки заморожены
     (`frozen=True`) намеренно, поэтому подмена делается здесь, а не в них.
+
+    `thinking_level` необязателен и по умолчанию не задан. «Не задан» означает
+    не «уровень по умолчанию», а «мы про уровень не говорим вовсе»: тело
+    запроса тогда байт в байт прежнее, и разметка со снятыми на ней замерами
+    не меняется от того, что чистке понадобилась настройка.
     """
     if tier == EXPENSIVE:
         raise TierNotAvailableError(
@@ -66,6 +104,7 @@ def build_model(
             return GeminiChat(
                 api_key=settings.google_api_key,
                 model=model or settings.enrich_model,
+                thinking_level=thinking_level,
             )
 
 
@@ -100,6 +139,79 @@ async def complete_over_entries(
 
     prompt = "\n\n".join(f"[{entry.entry_id}] {entry.text}" for entry in entries)
 
+    return await _call(
+        model,
+        system=system,
+        prompt=prompt,
+        schema=schema,
+        temperature=temperature,
+        purpose=purpose,
+        entries_count=len(entries),
+    )
+
+
+async def check_available(model: LanguageModel) -> None:
+    """Проверить модель настоящим вызовом при старте воркера.
+
+    **Почему проверка живёт в двери, а не в провайдере.** Учёт вызовов
+    текстовой модели ведётся здесь и только здесь — этим дверь и ценна: забыть
+    строку в `llm_calls` невозможно, потому что мимо неё не пройти. Пока проба
+    стояла в `GeminiChat.check_available` и звала `complete` напрямую, она шла
+    мимо учёта, и её запросов в `llm_calls` не было **вовсе** — при том, что
+    квота у провайдера считается в запросах (ADR-0014), а в разработке воркер
+    перезапускается по десятку раз в день.
+
+    Чинить это копией учёта внутри каждого провайдера значило бы завести второе
+    место, где о нём надо помнить, — и второй провайдер про него бы не знал.
+    У эмбеддингов выбор обратный и по обратной причине: там `check_available`
+    физически идёт мимо двери, и единственное общее место — сам провайдер.
+
+    Проба заодно проверяет структурированный ответ: модель может отвечать
+    на `generateContent` и не уметь `responseSchema`, и выяснять это на первой
+    же пачке было бы поздно.
+    """
+    try:
+        await _call(
+            model,
+            system=CHECK_SYSTEM,
+            prompt=CHECK_PROMPT,
+            schema=CHECK_SCHEMA,
+            temperature=0.0,
+            purpose=CHECK_PURPOSE,
+            entries_count=0,
+        )
+    except LlmError as error:
+        # Код ответа переносится, а не теряется при заворачивании: по нему
+        # старт решает, вставать громко или работать дальше (ADR-0014).
+        raise ProviderUnavailableError(
+            f"модель {model.model} недоступна: {error}", status=error.status
+        ) from error
+
+
+async def _call(
+    model: LanguageModel,
+    *,
+    system: str,
+    prompt: str,
+    schema: Mapping[str, Any],
+    temperature: float,
+    purpose: str,
+    entries_count: int,
+) -> Completion:
+    """Вызвать модель и записать вызов. Единственное место учёта текстовых моделей.
+
+    **Время меряется здесь, а не берётся из ответа провайдера.** У успешного
+    вызова ответ его несёт, у упавшего — нет, и в `llm_calls` уезжал ноль.
+    Это порча измерителя: `CLEANUP_WAIT_SEC` ставится по живым данным из этой
+    колонки, и вызов, простоявший до таймаута в 180 секунд и упавший, попадал
+    в выборку самым быстрым вызовом дня и тянул p95 вниз — прибор врал тем
+    сильнее, чем хуже была реальность.
+
+    Одна мерка на обе ветки и на всех провайдеров: колонка обещает «сколько
+    занял вызов», и заполняемая двумя разными способами она обещала бы
+    «сколько занял вызов, если он удался».
+    """
+    started = time.monotonic()
     try:
         completion = await model.complete(
             system=system,
@@ -119,13 +231,15 @@ async def complete_over_entries(
             model=model.model,
             tier=model.tier,
             purpose=purpose,
-            entries_count=len(entries),
+            entries_count=entries_count,
+            latency_ms=_elapsed_ms(started),
             succeeded=False,
             error=str(error)[:500],
             status_code=error.status,
         )
         raise
 
+    latency_ms = _elapsed_ms(started)
     cost = await record(
         provider=model.provider,
         model=model.model,
@@ -133,23 +247,29 @@ async def complete_over_entries(
         purpose=purpose,
         input_tokens=completion.input_tokens,
         output_tokens=completion.output_tokens,
-        entries_count=len(entries),
-        latency_ms=completion.latency_ms,
+        entries_count=entries_count,
+        latency_ms=latency_ms,
     )
     logger.info(
         "%s: записей %s, токенов %s+%s, %s мс, $%s",
         purpose,
-        len(entries),
+        entries_count,
         completion.input_tokens,
         completion.output_tokens,
-        completion.latency_ms,
+        latency_ms,
         "?" if cost is None else f"{cost:.6f}",
     )
     return completion
 
 
+def _elapsed_ms(started: float) -> int:
+    """Сколько прошло с начала вызова. `monotonic`, а не часы: их переводят."""
+    return int((time.monotonic() - started) * 1000)
+
+
 __all__ = [
     "CHEAP",
+    "CHECK_PURPOSE",
     "EXPENSIVE",
     "Completion",
     "EntryText",
@@ -159,5 +279,6 @@ __all__ = [
     "ProviderUnavailableError",
     "TierNotAvailableError",
     "build_model",
+    "check_available",
     "complete_over_entries",
 ]

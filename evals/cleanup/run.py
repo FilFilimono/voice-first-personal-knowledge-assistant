@@ -27,6 +27,15 @@
 вызовов, и под меткой рабочей чистки они испортили бы ответ на вопрос
 «сколько стоит чистка».
 
+**`429` — не приговор, а темп.** 25 августа 2026 прогон трижды подряд объявил
+«квота кончилась» — на 15-й, 6-й и 7-й записи из семидесяти, — а через минуту
+все три модели отвечали `200` на живой вызов. Лимит был **поминутный**:
+воркер чистит по одной записи, разнесённые во времени, а замер шлёт запросы
+очередью и упирается в частоту. Поэтому запись после `429` повторяется через
+паузу (`RETRY_PAUSES_SEC`), и только `429`, доживший до конца пауз, считается
+стеной. Прибор, не доводящий измерение и объясняющий остановку неверной
+причиной, хуже отсутствующего прибора: ему верят.
+
 **Печатает живые тексты записей.** Это терминал владельца, и так и задумано:
 замечания надо читать глазами. Перенаправлять вывод в файл внутри репозитория
 нельзя — архив в git не уходит (ADR-0002). В `results/` ложатся только числа
@@ -70,6 +79,21 @@ UNITS = HERE / "units.jsonl"
 # и то и другое обязано быть видно там же, где остальное.
 PURPOSE = "eval-cleanup"
 
+# Сколько ждать после `429`, прежде чем повторить **ту же** запись.
+#
+# Числа взяты из наблюдения 25 августа 2026, а не из головы: три прогона
+# упёрлись в `429`, и все три модели отвечали `200` меньше чем через минуту.
+# Значит, лимит поминутный, и первой паузы в 20 секунд хватает в типичном
+# случае; растущие 40 и 60 покрывают окно целиком с запасом — суммарно
+# две минуты. Дальше ждать бессмысленно: поминутное окно уже прошло, и `429`
+# после него означает суточную квоту или ключ, то есть настоящую стену.
+#
+# Кортеж модульный намеренно — тест подменяет его нулями. Иначе проверка
+# «пауза не уехала в латентность» стоила бы двух минут на прогон набора,
+# а быстрые тесты обязаны отрабатывать за секунды (Stop-хук гоняет их
+# после каждой сессии).
+RETRY_PAUSES_SEC: tuple[float, ...] = (20.0, 40.0, 60.0)
+
 # Сколько нужно точек, чтобы называть перцентиль перцентилем. При меньшем
 # числе ранг без интерполяции даёт ровно максимум: ceil(0.95 · n) = n при
 # n ≤ 19. Настройка, выбранная по одной неудачной записи, — это не «p95».
@@ -109,6 +133,26 @@ class Outcome:
 
 
 @dataclass(frozen=True, slots=True)
+class Waiting:
+    """Сколько раз прогон пережидал `429` и сколько на это ушло.
+
+    Едет отдельно от латентности и печатается отдельной строкой. Молчаливая
+    пауза превратила бы «замер шёл шесть минут» в «замер шёл двадцать» без
+    объяснения — а правило проекта ровно обратное: молчание записывается
+    строкой, иначе тишина неотличима от смерти.
+    """
+
+    times: int = 0
+    seconds: float = 0.0
+
+
+# Прогон, ни разу не упёршийся в лимит, — обычное состояние, и оно же значение
+# по умолчанию. Отдельным именем, а не вызовом в списке аргументов: значение
+# неизменяемое, и одного экземпляра на процесс хватает.
+NO_WAITING = Waiting()
+
+
+@dataclass(frozen=True, slots=True)
 class Run:
     """Итог прогона вместе с тем, полным ли он был.
 
@@ -116,11 +160,16 @@ class Run:
     квотой прогон обязан быть отличим от полного и в заголовке, и в файле.
     Файлы результатов потом сравниваются между собой, и «сорок из семидесяти»,
     прочитанное как «семьдесят», — это сравнение с самим собой не по делу.
+
+    По той же причине рядом лежит `waiting`: «повторили и получилось»
+    и «сдались» — разные прогоны, и разница обязана быть видна в отчёте,
+    а не только в том, сколько времени владелец просидел у терминала.
     """
 
     outcomes: list[Outcome]
     planned: int
     interrupted: str | None = None
+    waiting: Waiting = NO_WAITING
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,8 +267,17 @@ def build_cleaner(settings: Settings, model_name: str | None) -> LanguageModel:
 
     Поэтому имя модели в отчёте берётся **из построенной модели**, а не
     из настройки рядом: разойтись им тогда негде.
+
+    Уровень рассуждения передаётся по той же причине: воркер строит чистильщика
+    с `CLEANUP_THINKING_LEVEL`, и замер без него мерил бы другой режим той же
+    модели, подписывая результат её именем. Это ровно та ошибка, из-за которой
+    ось «темы» в ADR-0011 измерена пачками, а воркер работает по одной.
     """
-    return llm.build_model(settings, model=model_name or settings.cleanup_model)
+    return llm.build_model(
+        settings,
+        model=model_name or settings.cleanup_model,
+        thinking_level=settings.cleanup_thinking_level,
+    )
 
 
 async def clean_all(items: list[Target], *, model: LanguageModel) -> Run:
@@ -228,53 +286,91 @@ async def clean_all(items: list[Target], *, model: LanguageModel) -> Run:
     Время берётся вокруг вызова, а не из ответа провайдера: владелец ждёт
     целиком то, что здесь измеряется, — вместе с учётом в `llm_calls`
     и разбором ответа. Именно с этим числом сравнивается `CLEANUP_WAIT_SEC`.
+
+    **`429` сначала пережидается, и только потом считается стеной** (см. шапку).
+    Пауза при этом в латентность не попадает: секундомер запускается заново
+    на каждой попытке, и в исход уезжает время **удавшейся**. Сложить туда
+    ожидание значило бы испортить ровно то число, ради которого замер гоняется:
+    владелец ждёт один вызов, а не наши повторы.
     """
     outcomes: list[Outcome] = []
+    waited_times = 0
+    waited_seconds = 0.0
+
     for item in items:
-        started = time.perf_counter()
-        try:
-            clean = await present.clean_one(
-                model,
-                entry_id=item.entry_id,
-                text=item.verbatim,
-                is_private=False,
-                purpose=PURPOSE,
-            )
-        except llm.LlmError as error:
-            elapsed = int((time.perf_counter() - started) * 1000)
+        # Свой запас пауз на каждую запись: поминутное окно проходит, и одна
+        # переждавшая запись не должна лишать следующую права переждать.
+        pauses = list(RETRY_PAUSES_SEC)
+        while True:
+            started = time.perf_counter()
+            try:
+                clean = await present.clean_one(
+                    model,
+                    entry_id=item.entry_id,
+                    text=item.verbatim,
+                    is_private=False,
+                    purpose=PURPOSE,
+                )
+            except llm.LlmError as error:
+                if error.status == 429 and pauses:
+                    pause = pauses.pop(0)
+                    waited_times += 1
+                    waited_seconds += pause
+                    # Пауза не молчит: иначе прогон выглядит зависшим, а его
+                    # длительность потом не с чем сопоставить.
+                    print(
+                        f"⏳  429 на записи {item.entry_id} — лимит на темп запросов."
+                        f" Жду {pause:.0f} с и повторяю ту же запись."
+                    )
+                    await asyncio.sleep(pause)
+                    continue
+
+                outcomes.append(
+                    Outcome(
+                        entry_id=item.entry_id,
+                        verbatim=item.verbatim,
+                        clean=None,
+                        report=None,
+                        latency_ms=int((time.perf_counter() - started) * 1000),
+                        failure=f"{type(error).__name__}: {error}"[:200],
+                    )
+                )
+                if error.status == 429:
+                    # Паузы кончились, а `429` держится — это уже не темп,
+                    # а суточная квота или ключ. Продолжать значит потратить
+                    # ещё полсотни отказов и получить ту же строку.
+                    used = len(RETRY_PAUSES_SEC) - len(pauses)
+                    print(
+                        f"⚠️  429 на записи {item.entry_id} держится и после {used}"
+                        f" пауз ({waited_seconds:.0f} с) — дальше не иду.\n"
+                    )
+                    return Run(
+                        outcomes=outcomes,
+                        planned=len(items),
+                        interrupted=(
+                            f"квота (429) на записи {item.entry_id}:"
+                            f" не отпустило и после {used} пауз"
+                        ),
+                        waiting=Waiting(times=waited_times, seconds=waited_seconds),
+                    )
+                break
+
             outcomes.append(
                 Outcome(
                     entry_id=item.entry_id,
                     verbatim=item.verbatim,
-                    clean=None,
-                    report=None,
-                    latency_ms=elapsed,
-                    failure=f"{type(error).__name__}: {error}"[:200],
+                    clean=clean,
+                    report=checks.compare(item.verbatim, clean) if clean is not None else None,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
                 )
             )
-            if error.status == 429:
-                # Квота кончилась. Продолжать значит потратить ещё полсотни
-                # отказов и получить ту же строку — прогон останавливается
-                # и печатает то, что успел собрать.
-                print(f"⚠️  Квота кончилась на записи {item.entry_id} — дальше не иду.\n")
-                return Run(
-                    outcomes=outcomes,
-                    planned=len(items),
-                    interrupted=f"квота (429) на записи {item.entry_id}",
-                )
-            continue
+            break
 
-        elapsed = int((time.perf_counter() - started) * 1000)
-        outcomes.append(
-            Outcome(
-                entry_id=item.entry_id,
-                verbatim=item.verbatim,
-                clean=clean,
-                report=checks.compare(item.verbatim, clean) if clean is not None else None,
-                latency_ms=elapsed,
-            )
-        )
-    return Run(outcomes=outcomes, planned=len(items))
+    return Run(
+        outcomes=outcomes,
+        planned=len(items),
+        waiting=Waiting(times=waited_times, seconds=waited_seconds),
+    )
 
 
 async def spent(since: datetime) -> tuple[int, Decimal | None]:
@@ -316,6 +412,7 @@ def report(
     wait_sec: int,
     planned: int,
     interrupted: str | None,
+    waiting: Waiting = NO_WAITING,
 ) -> dict[str, object]:
     """Напечатать результат первого уровня и вернуть числа — для файла.
 
@@ -348,6 +445,19 @@ def report(
     # неудачную запись за верхнюю границу нормы. README предлагает `--limit`
     # ради экономии квоты, так что случай не гипотетический.
     trustworthy = len(latencies) >= MIN_POINTS_FOR_P95
+
+    if waiting.times:
+        # Печатается до латентности, чтобы «в латентность не входит» стояло
+        # рядом с самими числами: иначе паузы прочтутся как их часть.
+        print(f"\n⏳  Пауз из-за 429: {waiting.times}, просидели {waiting.seconds:.0f} с.")
+        # «Повторили и получилось» и «сдались» — разные прогоны, и разница
+        # обязана читаться словами, а не выводиться из соседних чисел.
+        print(
+            "    Записи после пауз прошли — прогон дошёл до конца."
+            if interrupted is None
+            else "    Последняя пауза не помогла — прогон оборван, см. строку выше."
+        )
+        print("    В латентность ниже это не входит: там время удавшейся попытки.")
 
     print("\nЛатентность одного вызова — столько ждёт владелец:")
     print(f"  медиана   {median / 1000:.1f} с")
@@ -418,6 +528,11 @@ def report(
         "p95 достоверен": trustworthy,
         "cleanup_wait_sec": wait_sec,
         "дольше cleanup_wait_sec": len(overdue),
+        # Паузы попадают и в файл: прогон, простоявший половину времени
+        # в ожидании лимита, и прогон, прошедший подряд, сравниваются по
+        # латентности одинаково, а по стоимости времени — нет.
+        "пауз из-за 429": waiting.times,
+        "просидели в паузах с": round(waiting.seconds, 1),
     }
 
 
@@ -618,6 +733,7 @@ async def main() -> None:
             wait_sec=settings.cleanup_wait_sec,
             planned=finished.planned,
             interrupted=finished.interrupted,
+            waiting=finished.waiting,
         )
 
         requests, cost = await spent(since)

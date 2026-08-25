@@ -17,19 +17,25 @@
 Что здесь лежит:
 
     cleanup.py     чистка расшифровки: промпт, схема ответа, разбор
+    guard.py       проверка написанного моделью перед показом
     pacing.py      что замолкает первым, когда квота на исходе
     repository.py  чтение из базы, которое для этого нужно
 
 Дальше сюда придут названия дел и петель и лид утренней сводки (задачи 4 и 7).
 """
 
+from brain.core.present import guard
 from brain.core.present.cleanup import PROMPT, PURPOSE, clean_one, parse
 from brain.core.present.pacing import cosmetic_allowed
 
+# `guard` берётся модулем целиком: его выражения зовутся `check` и `reproach`,
+# и в общем пространстве пакета такие имена ничего не сказали бы о том,
+# что именно проверяется.
 __all__ = [
     "PROMPT",
     "PURPOSE",
     "clean_one",
     "cosmetic_allowed",
+    "guard",
     "parse",
 ]

@@ -127,6 +127,13 @@ async def _prepare(
         return render.morning(content), {
             "commitment_ids": [item.id for item in content.commitments],
             "loop_id": content.loop.id if content.loop else None,
+            # Правило про три откладывания — часть замысла, а не оформления
+            # (`vision.md` §5.2), поэтому признак считается в ядре, а не
+            # в адаптере. Считает его сам `Morning`: тот же признак выбирает
+            # вопрос в тексте сводки, и посчитанный тут второй раз он мог бы
+            # разойтись с текстом молча. В журнал попадает вместе с остальной
+            # нагрузкой: по строке касания должно быть видно, какой вопрос ушёл.
+            "loop_stuck": content.loop_stuck,
         }
 
     if slot is TouchSlot.DAY:
@@ -168,6 +175,7 @@ async def _send(
             text,
             commitment_ids=[int(item) for item in _ids(payload, "commitment_ids")],
             loop_id=int(loop_id) if isinstance(loop_id, int) else None,
+            loop_stuck=payload.get("loop_stuck") is True,
         )
         return
 
