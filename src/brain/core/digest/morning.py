@@ -31,13 +31,19 @@ from datetime import datetime
 
 from brain.core.digest import commitments as commitment_store
 from brain.core.digest import loops
+from brain.core.present.digest import MAX_DEEDS
 from brain.storage.models.commitment import Commitment
 from brain.storage.models.loop import Loop
 
 # Сколько дел показывать. «Читается за 40 секунд» из `vision.md` §5.1 —
 # это обещание, и список на двадцать пунктов его нарушает молча. Показываются
 # старейшие: эскалация вверх по важности, а не по частоте (§7).
-COMMITMENTS_SHOWN = 5
+#
+# С Задачи 7 их три, а не пять, и число берётся из слоя представления: там оно
+# стоит рядом с бюджетом сообщения, потому что это правило показа, а не отбора.
+# Своё число здесь однажды разъехалось бы с бюджетом молча, и заметить это
+# можно было бы только по длине сводки. Остальные дела — по кнопке «все дела».
+COMMITMENTS_SHOWN = MAX_DEEDS
 
 
 @dataclass(frozen=True, slots=True)

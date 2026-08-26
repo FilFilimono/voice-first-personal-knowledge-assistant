@@ -14,7 +14,7 @@
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -23,7 +23,7 @@ from aiogram import Bot, Dispatcher
 
 from brain.adapters.telegram.bot import COMMANDS, build_dispatcher, register_commands
 from brain.config import Settings
-from brain.core.quota import Usage
+from brain.core.quota import ModelUsage
 from brain.core.status import Quota, SystemStatus, Touches, WorkerStatus
 from tests.fakes import FakeUnitOfWork
 from tests.telegram_harness import (
@@ -201,8 +201,7 @@ async def test_status_reports_the_worker_first(
         topics=9,
         archive_age_days=60,
         quota=Quota(
-            embedding=Usage(tier="embedding", spent=0, refused=0, limit=1000),
-            enrich=Usage(tier="cheap", spent=0, refused=0, limit=None),
+            models=(ModelUsage(model="gemini-embedding-001", spent=0, refused=0, limit=1000),),
             resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC),
         ),
         touches=Touches(
@@ -217,7 +216,7 @@ async def test_status_reports_the_worker_first(
     )
 
     async def fake_collect(
-        timezone: str, *, quota_limits: tuple[int | None, int | None] = (None, None)
+        timezone: str, *, quota_overrides: Mapping[str, int] | None = None
     ) -> SystemStatus:
         return collected
 

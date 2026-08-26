@@ -640,16 +640,26 @@ async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:
         )
 
 
-async def touch(*, notifier: Notifier, chat_id: int, timezone: str) -> list[str]:
+async def touch(
+    *, notifier: Notifier, chat_id: int, timezone: str, model: LanguageModel
+) -> list[str]:
     """Тик касаний. Возвращает слоты, по которым что-то ушло.
 
     Молчание — обычный исход, а не сбой: на молодом архиве сказать чаще всего
     нечего (ADR-0013). Почему это не молчание системы вообще — потому что
     каждый такой тик оставляет строку в журнале, и `/status` умеет объяснить,
     почему сводки сегодня не было.
+
+    `model` пишет лид утренней сводки (ADR-0015, п. 5). Её отказ ничего
+    не роняет: сводка уходит сухим рендером, и разбирается с этим сам слой
+    представления — здесь ловить нечего.
     """
     sent = await digest.tick(
-        now=datetime.now(UTC), timezone=timezone, chat_id=chat_id, notifier=notifier
+        now=datetime.now(UTC),
+        timezone=timezone,
+        chat_id=chat_id,
+        notifier=notifier,
+        model=model,
     )
     if sent:
         logger.info("касания отправлены: %s", ", ".join(slot.value for slot in sent))

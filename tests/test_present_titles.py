@@ -289,7 +289,9 @@ async def test_summary_shows_the_written_title_instead_of_the_span(
     await _annotate(entry_id, text, titler)
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, shown, _, _ = notifier.mornings[0]
     assert FILM_TITLE in shown
@@ -313,7 +315,9 @@ async def test_summary_keeps_the_span_when_the_guard_refuses_the_title(
     await _annotate(entry_id, text, Titler("Досмотреть фильм за 5 дней"))
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, shown, commitment_ids, _ = notifier.mornings[0]
     assert len(commitment_ids) == 2
@@ -332,7 +336,9 @@ async def test_summary_keeps_the_span_when_the_model_says_nothing(
     await _annotate(entry_id, text, Titler(answer={}))
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, shown, commitment_ids, _ = notifier.mornings[0]
     assert len(commitment_ids) == 2
@@ -371,7 +377,9 @@ async def test_the_loop_question_gets_a_title_too(
     await titles.name_open(titler, limit=None, recompute=False)
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, shown, _, _ = notifier.mornings[0]
     assert "Ты хотел разобраться: Разобраться с подпиской" in shown
@@ -575,9 +583,157 @@ async def test_loop_without_a_title_still_shows_its_question(
     await loops.create(entry_id=entry_id, unit_id=None, question=text[:120])
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, shown, _, _ = notifier.mornings[0]
     assert "Вот это по боту" in shown
     async with session_scope() as session:
         assert await session.scalar(select(Loop.title)) is None
+
+
+# --- Предпросмотр: `--preview N` ---
+#
+# `--dry-run` печатает цену прогона и ни одного названия — то есть смету,
+# а не предпросмотр. Ради результата ключ и был нужен: семьдесят названий
+# лягут в базу, и `--recompute` стоит ещё четырёх вызовов. Поэтому здесь
+# отдельный ключ, который **зовёт модель по-настоящему** и не пишет ничего.
+#
+# Модель по-прежнему заглушка: утверждения ниже про путь, про пачку и про то,
+# что видит владелец, — а не про качество названия.
+
+
+def test_preview_without_a_number_costs_one_call() -> None:
+    """`--preview` без числа — десять дел, то есть один вызов.
+
+    Проверяется на разборе аргументов, а не на константе: значение по умолчанию
+    живёт в argparse, и «десять» в другом месте ничего не доказывало бы.
+    """
+    parsed = maintenance.build_parser().parse_args(["backfill-titles", "--preview"])
+
+    assert parsed.preview == 10
+
+
+def test_preview_and_dry_run_do_not_go_together() -> None:
+    """Ключи отвечают на разные вопросы, и вместе они противоречат друг другу.
+
+    `--dry-run` обещает не звать модель, `--preview` зовёт её обязательно.
+    Молчаливое «один победил другого» здесь хуже отказа: владелец решил бы,
+    что смету он тоже увидел.
+    """
+    with pytest.raises(SystemExit):
+        maintenance.build_parser().parse_args(["backfill-titles", "--preview", "--dry-run"])
+
+
+@pytest.mark.integration
+async def test_preview_shows_the_title_next_to_the_span(
+    migrated_database: str,
+    archive: list[archive_module.Entry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Главное утверждение ключа: видно, **что изменилось**, а не только итог.
+
+    Отрезок и название стоят друг под другом — иначе это снова смета.
+    """
+    entry_id = await _live_entry(migrated_database, archive, LIVE_ENTRY)
+    await _deeds(migrated_database, entry_id, 3, archive)
+    titler = Titler(FILM_TITLE)
+
+    await maintenance.backfill_titles(
+        model=titler, dry_run=False, recompute=False, limit=None, preview=3
+    )
+
+    shown = capsys.readouterr().out
+    assert "было:  Вот это по боту" in shown
+    assert f"стало: {FILM_TITLE}" in shown
+    # Одна пачка — один вызов: предпросмотр не имеет права стоить дороже.
+    assert titler.calls == 1
+
+
+@pytest.mark.integration
+async def test_preview_writes_nothing_to_the_database(
+    migrated_database: str, archive: list[archive_module.Entry]
+) -> None:
+    """Предпросмотр показывает и уходит: в базе после него ровно то же, что было."""
+    entry_id = await _live_entry(migrated_database, archive, LIVE_ENTRY)
+    await _deeds(migrated_database, entry_id, 3, archive)
+
+    await maintenance.backfill_titles(
+        model=Titler(FILM_TITLE), dry_run=False, recompute=False, limit=None, preview=3
+    )
+
+    assert await _commitment_titles() == [None, None, None]
+
+
+@pytest.mark.integration
+async def test_preview_takes_one_batch_however_many_were_asked(
+    migrated_database: str,
+    archive: list[archive_module.Entry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Больше пачки не берётся: суточный лимит модели — двадцать запросов.
+
+    Ключ обещает «одна пачка», и число сверх потолка обязано упереться в него,
+    а не превратиться в четыре тихих вызова.
+    """
+    entry_id = await _live_entry(migrated_database, archive, LIVE_ENTRY)
+    await _deeds(migrated_database, entry_id, 30, archive)
+    titler = Titler(FILM_TITLE)
+
+    await maintenance.backfill_titles(
+        model=titler, dry_run=False, recompute=False, limit=None, preview=30
+    )
+
+    assert titler.calls == 1
+    assert capsys.readouterr().out.count("стало: ") == titles.BATCH_LIMIT
+
+
+@pytest.mark.integration
+async def test_preview_says_why_the_guard_refused(
+    migrated_database: str,
+    archive: list[archive_module.Entry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Отвергнутое название видно вместе с причиной, а не пропадает молча.
+
+    Иначе владелец гадает, почему у дела остался отрезок: в базу такое название
+    не попадёт и при настоящем прогоне, и знать об этом он должен здесь.
+    """
+    entry_id = await _live_entry(migrated_database, archive, LIVE_ENTRY)
+    await _deeds(migrated_database, entry_id, 2, archive)
+
+    await maintenance.backfill_titles(
+        model=Titler("Досмотреть фильм за 5 дней"),
+        dry_run=False,
+        recompute=False,
+        limit=None,
+        preview=2,
+    )
+
+    shown = capsys.readouterr().out
+    assert "Досмотреть фильм за 5 дней" in shown
+    assert "числа, которых не было во входе" in shown
+    assert await _commitment_titles() == [None, None]
+
+
+@pytest.mark.integration
+async def test_preview_shows_the_deed_the_model_skipped(
+    migrated_database: str,
+    archive: list[archive_module.Entry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Дело, про которое модель не сказала ничего, из предпросмотра не исчезает.
+
+    Пропавшая строка читалась бы как «названо», а это ровно наоборот.
+    """
+    entry_id = await _live_entry(migrated_database, archive, LIVE_ENTRY)
+    await _deeds(migrated_database, entry_id, 2, archive)
+
+    await maintenance.backfill_titles(
+        model=Titler(answer={}), dry_run=False, recompute=False, limit=None, preview=2
+    )
+
+    shown = capsys.readouterr().out
+    assert shown.count("было:  ") == 2
+    assert "модель не ответила" in shown

@@ -19,11 +19,13 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from brain.config import get_settings
 from brain.core.digest.evening import Disputed
 from brain.core.digest.morning import Morning
 from brain.core.digest.resurface import Old
 from brain.core.digest.weekly import Weekly
 from brain.core.enrich.reply import NAMES
+from brain.core.present.guard import Written
 from brain.storage.models.commitment import Commitment, CommitmentState
 
 # Сколько символов записи показывать в списке. Больше — и сводка перестаёт
@@ -50,8 +52,20 @@ def snippet(text: str, limit: int = SNIPPET) -> str:
     return flat[: limit - 1].rstrip() + "…"
 
 
-def morning(content: Morning) -> str:
+def morning(content: Morning, written: Written | None = None) -> str:
     """Утренняя сводка. Смотрит вперёд: «вот что сегодня висит».
+
+    `written` — то, что написала модель (ADR-0015, п. 5). `None` означает
+    **сухой рендер**: тот же текст слово в слово, каким сводка была до Задачи 7.
+    Он приходит, когда модель не ответила, когда её ответ отверг гвард, когда
+    косметика придержана квотой — и он не удаляется никогда, потому что он
+    и есть та защита, которой куплена недетерминированность в единственном
+    сообщении, приходящем каждый день.
+
+    Модель пишет **только лид**. Строки дел — это названия из базы, номера
+    ставит код, вопрос под петлёй выбирает код: кнопка это действие, текст это
+    речь, и вопрос, не совпадающий с кнопками, оставляет человека без
+    понимания, что нажимать.
 
     **Кончается вопросом петли или списком дел, и приписки после них нет.**
     Здесь стояла строка «🤔 Со вчера ждут разбора: N. Покажу вечером.», и убрал
@@ -66,28 +80,51 @@ def morning(content: Morning) -> str:
     """
     lines = ["☀️ Утро."]
 
-    if content.commitments:
-        lines += ["", "Висит:"]
-        # Дела нумеруются, потому что закрываются кнопками, а текст дела
-        # в подпись кнопки не помещается: на телефоне это два-три слова.
-        # Номер — единственный способ связать кнопку с делом, не обрезая
-        # его до неузнаваемости.
-        lines += [
-            f"{number}. {snippet(item.title or item.text)}{_started(item)}"
-            for number, item in enumerate(content.commitments, start=1)
-        ]
-        hidden = content.open_commitments - len(content.commitments)
-        if hidden > 0:
-            lines.append(f"…и ещё {hidden}")
+    if written is not None:
+        lines += ["", written.lead]
 
-    if content.loop is not None:
-        lines += [
-            "",
-            f"🔁 Ты хотел разобраться: {snippet(content.loop.title or content.loop.question)}",
-            _asking(content),
-        ]
+    # Порядок — настройка, а не решение автора: `vision.md` §5.2 называет петлю
+    # ядром системы, но внизу сообщения её увидят последней, а дела внизу — это
+    # список, до которого не дошли. Данных нет ни за одно (ADR-0015, цена),
+    # поэтому выбирает наблюдение.
+    blocks = [_deeds(content), _loop(content)]
+    if get_settings().digest_order == "loop_first":
+        blocks.reverse()
+
+    for block in blocks:
+        lines += block
 
     return "\n".join(lines)
+
+
+def _deeds(content: Morning) -> list[str]:
+    """Список дел. Пустой, если их нет: заголовка без списка не бывает."""
+    if not content.commitments:
+        return []
+
+    # Дела нумеруются, потому что закрываются кнопками, а текст дела в подпись
+    # кнопки не помещается: на телефоне это два-три слова. Номер — единственный
+    # способ связать кнопку с делом, не обрезая его до неузнаваемости.
+    lines = ["", "Висит:"]
+    lines += [
+        f"{number}. {snippet(item.title or item.text)}{_started(item)}"
+        for number, item in enumerate(content.commitments, start=1)
+    ]
+    hidden = content.open_commitments - len(content.commitments)
+    if hidden > 0:
+        lines.append(f"…и ещё {hidden}")
+    return lines
+
+
+def _loop(content: Morning) -> list[str]:
+    """Петля и вопрос под ней. Оба — код, и после Задачи 7 тоже: см. `morning`."""
+    if content.loop is None:
+        return []
+    return [
+        "",
+        f"🔁 Ты хотел разобраться: {snippet(content.loop.title or content.loop.question)}",
+        _asking(content),
+    ]
 
 
 def _started(item: Commitment) -> str:

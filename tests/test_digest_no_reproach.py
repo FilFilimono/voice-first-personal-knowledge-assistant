@@ -180,7 +180,9 @@ async def test_the_morning_summary_never_counts_the_unsorted(
     assert len(await _waiting_since_yesterday()) == len(DISPUTED_ENTRIES)
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     assert len(notifier.mornings) == 1
     _, text, _, _ = notifier.mornings[0]
@@ -202,7 +204,9 @@ async def test_the_morning_summary_still_gives_deeds_and_the_loop(
     await _disputed_yesterday(archive)
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, text, commitment_ids, loop_id = notifier.mornings[0]
     assert len(commitment_ids) == 2

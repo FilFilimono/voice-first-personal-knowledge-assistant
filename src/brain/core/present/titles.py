@@ -31,6 +31,7 @@ ADR-0015, п. 4. До этой задачи дело показывалось п
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from brain.core import llm
@@ -121,20 +122,39 @@ def requests_for(items: int, *, batch_limit: int) -> int:
     return -(-items // batch_limit)
 
 
-def parse(data: dict[str, Any], *, sources: Mapping[int, str]) -> dict[int, str]:
-    """Названия, которые годятся к записи в базу.
+@dataclass(frozen=True, slots=True)
+class Verdict:
+    """Что модель написала про одно дело и что с этим сделал гвард.
+
+    `refusal is None` — название годится к записи. Иначе это причина отказа
+    той самой строкой, которую вернул гвард: она и уходит в журнал, и —
+    с появлением `--preview` — на экран владельцу.
+    """
+
+    title: str
+    refusal: str | None
+
+
+def review(data: dict[str, Any], *, sources: Mapping[int, str]) -> dict[int, Verdict]:
+    """Разбор ответа модели вместе с вердиктом гварда на каждое название.
+
+    Отдельно от `parse` — потому что читателей у разбора стало двое, а правила
+    у них обязаны остаться одни. Рабочий путь берёт отсюда только прошедшее,
+    предпросмотр — всё вместе с причинами отказа. Две копии правил разъехались
+    бы молча, и предпросмотр показывал бы не то, что ляжет в базу.
 
     Три отсева, и каждый деградирует одинаково — в отсутствие названия,
     то есть в прежний обрезок:
 
     - **чужой идентификатор.** Та же защита, что в разметке и чистке: в пачке
       номера идут подряд, ошибиться на единицу легко. Здесь она дороже — чужое
-      название уедет в базу и будет показываться месяцами;
+      название уедет в базу и будет показываться месяцами. Вердикта у такого
+      названия нет вовсе: приписать его нашему делу не к чему;
     - **проверка гварда.** Выдуманное число или имя, упрёк, длина;
     - **ответ не по схеме.** Пусто, а не исключение: название не стоит разметки,
       в транзакции которой оно заводится.
     """
-    named: dict[int, str] = {}
+    reviewed: dict[int, Verdict] = {}
     for raw in data.get("items", []):
         try:
             item_id = int(raw["id"])
@@ -151,10 +171,18 @@ def parse(data: dict[str, Any], *, sources: Mapping[int, str]) -> dict[int, str]
         refusal = guard.check_title(title, source=source, max_length=MAX_LENGTH)
         if refusal is not None:
             logger.info("название %s отвергнуто (%s): %r", item_id, refusal, title[:80])
-            continue
 
-        named[item_id] = title
-    return named
+        reviewed[item_id] = Verdict(title=title, refusal=refusal)
+    return reviewed
+
+
+def parse(data: dict[str, Any], *, sources: Mapping[int, str]) -> dict[int, str]:
+    """Названия, которые годятся к записи в базу. Отсевы — в `review`."""
+    return {
+        item_id: verdict.title
+        for item_id, verdict in review(data, sources=sources).items()
+        if verdict.refusal is None
+    }
 
 
 async def name(model: LanguageModel, targets: Sequence[TitleTarget]) -> int:
@@ -183,6 +211,22 @@ async def _name_batch(model: LanguageModel, kind: str, batch: Sequence[TitleTarg
     if not batch:
         return 0
 
+    reviewed = await _review_batch(model, batch)
+    named = {
+        item_id: verdict.title for item_id, verdict in reviewed.items() if verdict.refusal is None
+    }
+    written = await repository.save_titles(kind, named)
+    logger.info("названий проставлено: %s из %s (%s)", written, len(batch), kind)
+    return written
+
+
+async def _review_batch(model: LanguageModel, batch: Sequence[TitleTarget]) -> dict[int, Verdict]:
+    """Спросить модель про одну пачку и проверить ответ. **В базу не пишет.**
+
+    Общий шаг рабочего пути и предпросмотра: вызов и проверка у них обязаны
+    быть одни и те же, иначе предпросмотр показывал бы не то, что ляжет
+    в базу, — а он ровно затем и нужен.
+    """
     completion = await llm.complete_over_entries(
         model,
         # `entry_id` двери — это идентификатор **дела**, а не записи: у одной
@@ -199,10 +243,7 @@ async def _name_batch(model: LanguageModel, kind: str, batch: Sequence[TitleTarg
         purpose=PURPOSE,
     )
 
-    named = parse(completion.data, sources={target.id: target.text for target in batch})
-    written = await repository.save_titles(kind, named)
-    logger.info("названий проставлено: %s из %s (%s)", written, len(batch), kind)
-    return written
+    return review(completion.data, sources={target.id: target.text for target in batch})
 
 
 async def name_open(
@@ -224,6 +265,62 @@ async def pending(*, recompute: bool, limit: int | None) -> list[TitleTarget]:
     return await repository.targets_to_name(recompute=recompute, limit=limit)
 
 
+@dataclass(frozen=True, slots=True)
+class Preview:
+    """Одно дело предпросмотра: отрезок, слова модели и вердикт гварда.
+
+    `title is None` — модель про это дело не сказала ничего (не ответила вовсе,
+    ответила не по схеме или назвала чужой номер). `refusal` — причина, по
+    которой название не ляжет в базу; `None` значит, что ляжет.
+
+    Тип живёт здесь, а не в команде обслуживания: собирает его тот, кто зовёт
+    модель и знает вердикт, а команда только печатает.
+    """
+
+    target: TitleTarget
+    title: str | None
+    refusal: str | None
+
+
+async def preview(model: LanguageModel, targets: Sequence[TitleTarget]) -> list[Preview]:
+    """Назвать **одну пачку** и не записать ничего.
+
+    Ключ `--dry-run` печатает цену и ни одного названия — то есть смету.
+    Ради результата предпросмотр и был нужен: семьдесят названий лягут в базу
+    надолго, и увидеть их до этого стоит один вызов.
+
+    Пачка одна на вид, и лишнее отбрасывается **здесь**: обещание «один вызов»
+    и есть весь смысл ключа, а число просит владелец руками — промахнуться
+    в нём легко, и четыре тихих вызова съели бы пятую часть суточного лимита.
+    Сколько взято на самом деле, видно по длине ответа.
+
+    Вида по-прежнему два и считаются порознь (см. модуль): дело № 5 и петля
+    № 5 — разные строки. Обычно в пачку попадают одни дела — они идут первыми,
+    а петля в архиве одна.
+    """
+    verdicts: dict[tuple[str, int], Verdict] = {}
+    taken: list[TitleTarget] = []
+    for kind in (COMMITMENT, LOOP):
+        batch = [target for target in targets if target.kind == kind][:BATCH_LIMIT]
+        if not batch:
+            continue
+        taken += batch
+        for item_id, verdict in (await _review_batch(model, batch)).items():
+            verdicts[(kind, item_id)] = verdict
+
+    shown: list[Preview] = []
+    for target in taken:
+        found = verdicts.get((target.kind, target.id))
+        shown.append(
+            Preview(
+                target=target,
+                title=found.title if found is not None else None,
+                refusal=found.refusal if found is not None else None,
+            )
+        )
+    return shown
+
+
 __all__ = [
     "BATCH_LIMIT",
     "COMMITMENT",
@@ -231,11 +328,15 @@ __all__ = [
     "MAX_LENGTH",
     "PROMPT",
     "PURPOSE",
+    "Preview",
     "TitleTarget",
+    "Verdict",
     "name",
     "name_open",
     "parse",
     "pending",
+    "preview",
     "requests_for",
     "response_schema",
+    "review",
 ]

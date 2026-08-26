@@ -14,13 +14,21 @@
    в Риме ошибался бы на девять часов и врал бы ровно в тот момент, когда
    квота нужна.
 
+С 26 августа 2026 к ним добавилось третье, и оно про то же самое:
+
+3. **лимит считается на модель, а не на проект.** Провайдер сказал это
+   дословно — в теле `429` приходит метрика
+   `GenerateRequestsPerDayPerProjectPerModel-FreeTier` со значением 20.
+   Одно число «сегодня потрачено 58» не отвечает на единственный вопрос,
+   ради которого его смотрят: можно ли сейчас запустить бэкфилл.
+
 Требует поднятого Postgres: `just up`.
 """
 
 import asyncio
 import json
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -28,6 +36,8 @@ import pytest
 from sqlalchemy import func, insert, select
 
 import brain.core.quota as quota
+from brain.adapters.telegram.bot import build_dispatcher
+from brain.config import Settings
 from brain.core import llm
 from brain.core.llm.gemini import GeminiChat
 from brain.core.ports import Completion, EntryText
@@ -36,6 +46,7 @@ from brain.core.retrieval.gemini import EMBEDDING, GeminiEmbedder
 from brain.storage.db import session_scope
 from brain.storage.models.chunk import DIMENSIONS
 from brain.storage.models.llm_call import LlmCall
+from tests.telegram_harness import OWNER_ID, FakeSession, make_bot, make_message, make_update
 
 pytestmark = pytest.mark.integration
 
@@ -290,3 +301,119 @@ async def test_unknown_limit_is_shown_as_unknown_not_as_zero() -> None:
     assert usage.limit is None
     assert usage.left is None
     assert not usage.exhausted
+
+
+# --- Разбивка по моделям: лимит у провайдера на модель, а не на проект ---
+
+
+async def _calls(model: str, *, tier: str, ok: int = 0, refused: int = 0, when: datetime) -> None:
+    """Столько-то запросов к модели, как их записал бы учёт."""
+    async with session_scope() as session:
+        for index in range(ok + refused):
+            await session.execute(
+                insert(LlmCall).values(
+                    created_at=when,
+                    provider="gemini",
+                    model=model,
+                    tier=tier,
+                    purpose="cleanup",
+                    input_tokens=0,
+                    output_tokens=0,
+                    entries_count=1,
+                    latency_ms=1,
+                    succeeded=index < ok,
+                    status_code=None if index < ok else 429,
+                )
+            )
+
+
+async def _today_as_it_really_was() -> None:
+    """День 26 августа 2026 в `llm_calls`, числами из живой базы.
+
+    Четыре модели, и разброс между ними — это и есть суть правки: у `3.6-flash`
+    двадцать запросов в сутки уже кончились, а `3.5-flash-lite` за тот же день
+    сделала больше двадцати и не отказала ни разу.
+    """
+    now = datetime.now(UTC)
+    await _calls("gemini-3.6-flash", tier=llm.CHEAP, ok=19, refused=1, when=now)
+    await _calls("gemini-3.5-flash", tier=llm.CHEAP, ok=17, refused=5, when=now)
+    await _calls("gemini-3.5-flash-lite", tier=llm.CHEAP, ok=22, when=now)
+    await _calls(MODEL, tier=EMBEDDING, ok=1, when=now)
+
+
+async def test_status_shows_the_spending_model_by_model() -> None:
+    """Путь целиком: `/status` в боте — расход разбивкой по моделям.
+
+    Тест идёт от входа системы, а не от функции: до этой правки обработчик
+    отдавал одну строку про эмбеддинги, и разбивка, посчитанная где угодно
+    внутри, всё равно не доехала бы до владельца.
+    """
+    await _today_as_it_really_was()
+
+    session = FakeSession()
+    dispatcher = build_dispatcher(
+        Settings(
+            _env_file=None,
+            telegram_bot_token="123:test-token",
+            google_api_key="AI-test",
+            telegram_allowed_user_ids=[OWNER_ID],
+            brain_timezone="Europe/Moscow",
+        )
+    )
+    await dispatcher.feed_update(make_bot(session), make_update(make_message(text="/status")))
+
+    answer = session.texts[-1]
+    # Лимит известен из тела `429` провайдера: 20 запросов в сутки на модель.
+    assert "gemini-3.6-flash: 19 из 20" in answer
+    assert "gemini-3.5-flash: 17 из 20" in answer
+    # А у этой он неизвестен, и выдумывать его нельзя: 22 запроса за день
+    # доказывают только то, что двадцатью он не ограничен.
+    assert "gemini-3.5-flash-lite: 22" in answer
+    assert "лимит неизвестен" in answer
+
+
+async def test_yesterdays_spending_does_not_land_in_todays_breakdown() -> None:
+    """Окно суток остаётся тихоокеанским и в разбивке тоже."""
+    now = datetime.now(UTC)
+    await _calls("gemini-3.6-flash", tier=llm.CHEAP, ok=3, when=now)
+    await _calls(
+        "gemini-3.6-flash", tier=llm.CHEAP, ok=17, when=quota.window_start(now) - timedelta(hours=1)
+    )
+
+    [usage] = await quota.by_model(now)
+
+    assert usage.model == "gemini-3.6-flash"
+    assert usage.spent == 3
+    assert usage.limit == 20
+    assert usage.left == 17
+
+
+async def test_the_model_that_hit_the_wall_comes_first() -> None:
+    """Сверху то, во что упёрлись, а не то, чего потрачено больше.
+
+    Живой день 26.08.2026: `3.5-flash-lite` сделала 22 запроса и чувствует себя
+    прекрасно, `3.6-flash` — 19 из двадцати и уже получила отказ. Порядок
+    по расходу поставил бы первой ту, про которую нечего решать.
+    """
+    now = datetime.now(UTC)
+    await _calls("gemini-3.5-flash-lite", tier=llm.CHEAP, ok=22, when=now)
+    await _calls("gemini-3.6-flash", tier=llm.CHEAP, ok=19, refused=1, when=now)
+
+    assert [usage.model for usage in await quota.by_model(now)] == [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+    ]
+
+
+async def test_a_number_from_env_beats_the_table_in_code() -> None:
+    """Наблюдение в коде — не приговор: провайдер меняет лимиты молча.
+
+    Поэтому число из `.env` сильнее таблицы: увидев настоящую границу, владелец
+    поправляет её правкой настройки, а не правкой кода.
+    """
+    now = datetime.now(UTC)
+    await _calls("gemini-3.6-flash", tier=llm.CHEAP, ok=2, when=now)
+
+    [usage] = await quota.by_model(now, overrides={"gemini-3.6-flash": 250})
+
+    assert usage.limit == 250

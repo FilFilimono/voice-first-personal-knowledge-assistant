@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from brain.adapters.telegram.status_text import render
-from brain.core.quota import Usage
+from brain.core.quota import ModelUsage
 from brain.core.status import NextReminder, Quota, SystemStatus, Touches, WorkerStatus
 from brain.storage.models.touch import SilenceReason, Touch, TouchCategory, TouchSlot
 
@@ -27,8 +27,7 @@ STALE_AFTER = timedelta(minutes=3)
 # Квота по умолчанию: израсходована малая часть, и строка про неё молчит.
 # Тесты, которые её проверяют, передают своё.
 QUIET_QUOTA = Quota(
-    embedding=Usage(tier="embedding", spent=3, refused=0, limit=1000),
-    enrich=Usage(tier="cheap", spent=2, refused=0, limit=None),
+    models=(ModelUsage(model="gemini-embedding-001", spent=3, refused=0, limit=1000),),
     resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC),
 )
 
@@ -294,12 +293,18 @@ def test_auto_resolved_debt_is_answerable_but_never_pushed() -> None:
 # --- Квота: чтобы в неё не упирались вслепую ---
 
 
-def _quota(spent: int, *, limit: int | None = 1000, refused: int = 0) -> Quota:
-    return Quota(
-        embedding=Usage(tier="embedding", spent=spent, refused=refused, limit=limit),
-        enrich=Usage(tier="cheap", spent=0, refused=0, limit=None),
-        resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC),
-    )
+def _quota(*models: ModelUsage) -> Quota:
+    return Quota(models=models, resets_at=datetime(2026, 8, 21, 7, 0, tzinfo=UTC))
+
+
+def _model(
+    model: str = "gemini-embedding-001",
+    *,
+    spent: int,
+    limit: int | None = 1000,
+    refused: int = 0,
+) -> ModelUsage:
+    return ModelUsage(model=model, spent=spent, refused=refused, limit=limit)
 
 
 def test_quota_is_quiet_while_there_is_plenty_left() -> None:
@@ -309,14 +314,16 @@ def test_quota_is_quiet_while_there_is_plenty_left() -> None:
     ровно к тому дню, когда она нужна. Та же логика, что у остальных разделов
     `/status`: нечего показать — строки нет.
     """
-    assert "эмбеддинг" not in render(_status(quota=_quota(12)), timezone=TIMEZONE).lower()
+    report = render(_status(quota=_quota(_model(spent=12))), timezone=TIMEZONE)
+
+    assert "Запросов сегодня" not in report
 
 
 def test_quota_appears_when_half_is_gone() -> None:
     """Половина — момент, когда предупреждение ещё что-то меняет."""
-    report = render(_status(quota=_quota(700)), timezone=TIMEZONE)
+    report = render(_status(quota=_quota(_model(spent=700))), timezone=TIMEZONE)
 
-    assert "700 из 1000" in report
+    assert "gemini-embedding-001: 700 из 1000" in report
 
 
 def test_exhausted_quota_says_when_it_comes_back() -> None:
@@ -325,12 +332,12 @@ def test_exhausted_quota_says_when_it_comes_back() -> None:
     Сброс — в полночь по тихоокеанскому времени, показывается в таймзоне
     владельца: 07:00 UTC это 10:00 в Москве.
     """
-    report = render(_status(quota=_quota(1000, refused=14)), timezone=TIMEZONE)
+    report = render(_status(quota=_quota(_model(spent=1000, refused=14))), timezone=TIMEZONE)
 
     assert "🔴" in report
     assert "1000 из 1000" in report
     assert "10:00" in report
-    assert "Отказов сегодня: 14" in report
+    assert "отказов 14" in report
 
 
 def test_unknown_limit_is_never_shown_as_a_number() -> None:
@@ -339,10 +346,53 @@ def test_unknown_limit_is_never_shown_as_a_number() -> None:
     Число из головы читалось бы как измеренное — та же ошибка, из-за которой
     цены в проекте помечены датой проверки.
     """
-    report = render(_status(quota=_quota(40, limit=None)), timezone=TIMEZONE)
-    line = report.split("Запросов к эмбеддингам")[1].splitlines()[0]
+    report = render(
+        _status(quota=_quota(_model("gemini-3.5-flash-lite", spent=40, limit=None))),
+        timezone=TIMEZONE,
+    )
+    [line] = [row for row in report.splitlines() if "gemini-3.5-flash-lite" in row]
 
     assert "лимит неизвестен" in line
     # Единственное число в строке — израсходованное. Остатка нет, потому что
-    # он неизвестен, а не потому что он ноль.
-    assert [word for word in line.replace(":", " ").split() if word.isdigit()] == ["40"]
+    # он неизвестен, а не потому что он ноль. Число в имени модели не считается:
+    # оно часть имени, а не счёт.
+    numbers = [word for word in line.replace(":", " ").split() if word.isdigit()]
+    assert numbers == ["40"]
+
+
+def test_every_model_gets_its_own_line_with_its_own_limit() -> None:
+    """Лимит провайдер держит на модель, а не на проект.
+
+    Метрика в теле `429` называется
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier`, и на живом дне это
+    видно глазами: `3.6-flash` встала на двадцати, а `3.5-flash-lite` за те же
+    сутки сделала двадцать два и не отказала ни разу. Одно общее число «58»
+    не отвечает на вопрос, ради которого его смотрят.
+    """
+    report = render(
+        _status(
+            quota=_quota(
+                _model("gemini-3.5-flash-lite", spent=34, limit=None),
+                _model("gemini-3.6-flash", spent=18, limit=20),
+            )
+        ),
+        timezone=TIMEZONE,
+    )
+
+    assert "gemini-3.6-flash: 18 из 20" in report
+    assert "gemini-3.5-flash-lite: 34 — лимит неизвестен" in report
+
+
+def test_a_model_that_only_got_refusals_is_still_shown() -> None:
+    """Отказ провайдера — его собственное «больше нельзя», и он вернее счётчика.
+
+    Наш счёт занижен, если тем же ключом пользуется что-то ещё; модель, которая
+    сегодня только отказывала, обязана быть видна, даже если успешных вызовов
+    у неё ноль.
+    """
+    report = render(
+        _status(quota=_quota(_model("gemini-3.6-flash", spent=0, refused=6, limit=20))),
+        timezone=TIMEZONE,
+    )
+
+    assert "gemini-3.6-flash: 0 из 20, отказов 6" in report

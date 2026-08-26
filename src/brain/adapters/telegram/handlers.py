@@ -40,6 +40,7 @@ from brain.adapters.telegram.notifier import (
 from brain.config import Settings
 from brain.core import digest, enrich, ingest
 from brain.core import status as core_status
+from brain.core.llm import limits
 from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import search
@@ -104,7 +105,10 @@ def build_router(settings: Settings) -> Router:
         """Что сейчас происходит — чтобы не лезть в терминал с телефона."""
         collected = await core_status.collect(
             settings.brain_timezone,
-            quota_limits=(settings.embedding_daily_quota, settings.enrich_daily_quota),
+            # Лимиты провайдер держит на модель, поэтому наружу уходят поправки
+            # владельца, привязанные к именам моделей, а не два числа на тир:
+            # известные лимиты знает `core/llm/limits`, а `.env` их перебивает.
+            quota_overrides=limits.configured(settings),
         )
         await message.answer(status_text.render(collected, timezone=settings.brain_timezone))
 

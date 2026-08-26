@@ -11,6 +11,12 @@
 не вызовом обработчика напрямую. Иначе проверялись бы наши представления
 о том, как aiogram разбирает `callback_data`.
 
+**`model=None` здесь передаётся осознанно** и означает «сводка собирается сухим
+рендером»: этот файл про расписание, слоты и кнопки, а не про текст. Лид,
+который пишет модель, проверяется в `test_present_digest`. Умолчания у этого
+аргумента нет намеренно — забытый параметр в воркере выглядел бы как
+работающая сводка.
+
 Требует поднятого Postgres: `just up`.
 """
 
@@ -134,7 +140,9 @@ async def test_empty_archive_stays_silent_and_says_why() -> None:
     """
     notifier = FakeNotifier()
 
-    sent = await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    sent = await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     assert sent == []
     assert notifier.mornings == []
@@ -146,7 +154,9 @@ async def test_morning_summary_goes_out_and_is_written_down() -> None:
     await _entry_with_tasks()
     notifier = FakeNotifier()
 
-    sent = await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    sent = await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     assert sent == [TouchSlot.MORNING]
     assert len(notifier.mornings) == 1
@@ -163,9 +173,15 @@ async def test_a_second_tick_in_the_same_day_sends_nothing() -> None:
     await _entry_with_tasks()
     notifier = FakeNotifier()
 
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
     await service.tick(
-        now=MORNING + timedelta(minutes=5), timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
+    await service.tick(
+        now=MORNING + timedelta(minutes=5),
+        timezone=TIMEZONE,
+        chat_id=CHAT_ID,
+        notifier=notifier,
+        model=None,
     )
 
     assert len(notifier.mornings) == 1
@@ -176,7 +192,9 @@ async def test_pause_silences_the_summary_but_records_why() -> None:
     await quiet.pause(MORNING - timedelta(hours=1))
     notifier = FakeNotifier()
 
-    sent = await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    sent = await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     assert sent == []
     assert notifier.mornings == []
@@ -194,7 +212,9 @@ async def test_loop_is_marked_asked_only_after_the_summary_leaves() -> None:
     loop_id = await loops.create(entry_id=entry_id, unit_id=None, question="куда дальше")
     notifier = FakeNotifier()
 
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     asked = await loops.by_id(loop_id)
     assert asked is not None
@@ -225,7 +245,9 @@ async def test_thrice_snoozed_loop_changes_the_question() -> None:
         moment += loops.INTERVAL
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, _, _, asked_loop = notifier.mornings[0]
     assert asked_loop == loop_id
@@ -249,7 +271,9 @@ async def test_thrice_snoozed_loop_changes_the_question_in_the_text_too() -> Non
         moment += loops.INTERVAL
 
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     _, text, _, _ = notifier.mornings[0]
     assert "Закрыть или переформулируешь?" in text
@@ -267,7 +291,9 @@ async def test_closing_a_deed_from_the_summary_removes_it_tomorrow(
     await _entry_with_tasks()
     notifier = FakeNotifier()
 
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
     _, first_text, commitment_ids, _ = notifier.mornings[0]
     assert "купить хлеб" in first_text
 
@@ -284,7 +310,9 @@ async def test_closing_a_deed_from_the_summary_removes_it_tomorrow(
     assert session.calls_named("AnswerCallbackQuery")
 
     tomorrow = MORNING + timedelta(days=1)
-    await service.tick(now=tomorrow, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=tomorrow, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
 
     assert len(notifier.mornings) == 2
     _, second_text, remaining, _ = notifier.mornings[1]
@@ -297,7 +325,9 @@ async def test_stranger_cannot_close_someone_elses_deed(dispatcher: Dispatcher, 
     """Whitelist висит и на нажатиях — иначе чужой закрывал бы чужие дела."""
     await _entry_with_tasks()
     notifier = FakeNotifier()
-    await service.tick(now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=MORNING, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
     _, _, commitment_ids, _ = notifier.mornings[0]
 
     await dispatcher.feed_update(
@@ -310,7 +340,9 @@ async def test_stranger_cannot_close_someone_elses_deed(dispatcher: Dispatcher, 
     )
 
     tomorrow = MORNING + timedelta(days=1)
-    await service.tick(now=tomorrow, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(
+        now=tomorrow, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None
+    )
     _, _, still_open, _ = notifier.mornings[1]
     assert len(still_open) == 2
 
@@ -324,7 +356,7 @@ async def test_evening_is_silent_without_disputed_entries() -> None:
     await _entry_with_tasks()
     notifier = FakeNotifier()
 
-    await service.tick(now=NIGHT, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier)
+    await service.tick(now=NIGHT, timezone=TIMEZONE, chat_id=CHAT_ID, notifier=notifier, model=None)
 
     assert notifier.evenings == []
     recorded = await touches.of_day(NIGHT.date())

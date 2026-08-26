@@ -22,7 +22,10 @@
 import argparse
 import asyncio
 import logging
+import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -32,12 +35,12 @@ from brain.core import enrich as enrichment
 from brain.core import llm, present
 from brain.core.digest import commitments
 from brain.core.enrich import repository as enrich_repository
-from brain.core.llm.gemini import CHEAP
+from brain.core.llm import limits
 from brain.core.memory.repository import working_text
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.ports import LanguageModel
+from brain.core.present.repository import TitleTarget
 from brain.core.retrieval import repository as retrieval_repository
-from brain.core.retrieval.gemini import EMBEDDING
 from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
 from brain.storage.db import dispose_engine, session_scope
 from brain.storage.models.annotation import Annotation, AnnotationType
@@ -130,7 +133,7 @@ async def reindex(*, dry_run: bool) -> int:
     print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
     # Одна запись — один запрос к эмбеддингам: все её чанки уходят одним
     # батчем. Индексация архива поэтому упирается в квоту раньше разметки.
-    await _report_cost(len(entry_ids), tier=EMBEDDING, limit=get_settings().embedding_daily_quota)
+    await _report_cost(len(entry_ids), model=get_settings().embedding_model)
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
@@ -167,8 +170,7 @@ async def reenrich(*, dry_run: bool) -> int:
     settings = get_settings()
     await _report_cost(
         enrichment.requests_for(len(entries), batch_limit=settings.enrich_batch_limit),
-        tier=CHEAP,
-        limit=settings.enrich_daily_quota,
+        model=settings.enrich_model,
     )
 
     if dry_run:
@@ -281,7 +283,7 @@ async def reenrich_stale(*, dry_run: bool) -> int:
 
     print(f"Записей с разметкой до ADR-0012: {len(entry_ids)}")
     print("  " + ", ".join(str(entry_id) for entry_id in entry_ids))
-    await _report_cost(planned, tier=CHEAP, limit=settings.enrich_daily_quota)
+    await _report_cost(planned, model=settings.enrich_model)
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не поставлено. Уберите --dry-run.")
@@ -295,8 +297,34 @@ async def reenrich_stale(*, dry_run: bool) -> int:
     return len(batches)
 
 
+# Сколько дел берёт `--preview` без числа. Десять — это ровно один вызов
+# и десять названий подряд на экране: по меньшему судить не о чем, а большее
+# уже не окинуть глазом, ради чего предпросмотр и затевался.
+PREVIEW_DEFAULT = 10
+
+# Ширина отрезка «было». Смысловая единица режется примерно по 80 символов
+# (ADR-0012), так что сотня показывает почти любой отрезок целиком, а многоточие
+# появляется только у выброса. Больше ставить нельзя: строка перестанет
+# помещаться в терминал и переносом порвёт пару «было/стало», которую владелец
+# и сравнивает глазами.
+PREVIEW_WIDTH = 100
+
+# Отрезок печатается в одну строку: в расшифровке попадаются переводы строки,
+# и без склейки блок «было/стало» развалился бы посреди сравнения.
+_SPACES = re.compile(r"\s+")
+
+# Как называется вид в предпросмотре. Из `present.titles` сюда приходят
+# служебные `commitment`/`loop`, а читает вывод владелец.
+_KINDS = {present.titles.COMMITMENT: "дело", present.titles.LOOP: "петля"}
+
+
 async def backfill_titles(
-    *, model: LanguageModel, dry_run: bool, recompute: bool, limit: int | None
+    *,
+    model: LanguageModel,
+    dry_run: bool,
+    recompute: bool,
+    limit: int | None,
+    preview: int | None = None,
 ) -> int:
     """Назвать дела и петли, которые заведены до Задачи 4 или названы старой моделью.
 
@@ -312,17 +340,32 @@ async def backfill_titles(
     **`--limit` нужен потому, что лимит бесплатного тира — 20 запросов в сутки
     на модель.** Владелец раскладывает прогон на части и видит цену до того,
     как её платит: `--dry-run` печатает, сколько запросов уйдёт и сколько
-    их сегодня уже потрачено.
+    сегодня уже потрачено **этой самой моделью** — суммой по тиру этот вопрос
+    не решался, у соседних моделей лимиты другие.
+
+    **`--preview N` отвечает на другой вопрос — не «сколько это стоит»,
+    а «что получится».** Смета без единого названия предпросмотром не была:
+    результат и есть то, ради чего в неё смотрят. Ключ берёт одну пачку,
+    зовёт модель по-настоящему и не пишет в базу ничего.
 
     Модель приходит снаружи, а не строится здесь: её выбирает `main()` —
     и она же подставляется тестами, которым живой провайдер недоступен
     и не нужен.
     """
-    targets = await present.titles.pending(recompute=recompute, limit=limit)
+    # У предпросмотра своё N, и оно вытесняет `--limit`: оба говорят, сколько
+    # дел взять, но `--limit` делит **запись** на дни, а предпросмотр ничего
+    # не пишет и делить ему нечего. Оставить работать оба значило бы завести
+    # два числа на один вопрос.
+    targets = await present.titles.pending(
+        recompute=recompute, limit=preview if preview is not None else limit
+    )
 
     if not targets:
         print("Названия есть у всех открытых дел и петель.")
         return 0
+
+    if preview is not None:
+        return await _preview_titles(model, targets)
 
     deeds = [target for target in targets if target.kind == present.titles.COMMITMENT]
     loops = [target for target in targets if target.kind == present.titles.LOOP]
@@ -335,7 +378,10 @@ async def backfill_titles(
     batch = present.titles.BATCH_LIMIT
     planned = present.titles.requests_for(len(deeds), batch_limit=batch)
     planned += present.titles.requests_for(len(loops), batch_limit=batch)
-    await _report_cost(planned, tier=CHEAP, limit=get_settings().enrich_daily_quota)
+    # Модель спрашивается у самой модели, а не у настроек: прогон пойдёт той,
+    # что пришла сюда параметром, — и если `main()` когда-нибудь подставит
+    # другую, строка расхода поедет за ней, а не останется про `TITLES_MODEL`.
+    await _report_cost(planned, model=model.model)
 
     if dry_run:
         print("\nЭто прогон вхолостую: ничего не записано. Уберите --dry-run.")
@@ -348,34 +394,139 @@ async def backfill_titles(
     return named
 
 
-async def _report_cost(planned: int, *, tier: str, limit: int | None) -> None:
-    """Сказать, во сколько запросов обойдётся команда и хватит ли остатка.
+async def _preview_titles(model: LanguageModel, targets: Sequence[TitleTarget]) -> int:
+    """Показать одну пачку названий рядом с отрезками. **В базу не пишет.**
+
+    Вернуть, сколько из показанного прошло гвард, — то же число, что легло бы
+    в базу при настоящем прогоне.
+
+    Печатается пара строк на дело: отрезок, который владелец видит сейчас,
+    и название, которое встало бы на его место. Одного результата мало —
+    по нему не видно, **что изменилось**, а решать владелец собирается именно
+    это: стоит ли смена отрезка на название семидесяти строк в базе.
+    """
+    # Цена печатается до вызова, как у соседей: предупреждение после того, как
+    # запрос ушёл, ничего не меняет. Вызов один на вид — пачка одна.
+    planned = len({target.kind for target in targets})
+    await _report_cost(planned, model=model.model)
+
+    shown = await present.titles.preview(model, targets)
+    if len(shown) < len(targets):
+        print(
+            f"\nВзято {len(shown)} из {len(targets)}: предпросмотр — это одна пачка,"
+            f" а в неё помещается {present.titles.BATCH_LIMIT}."
+        )
+
+    print()
+    for item in shown:
+        print(f"{_KINDS.get(item.target.kind, item.target.kind)} {item.target.id}")
+        print(f"было:  {_one_line(item.target.text)}")
+        print(f"стало: {item.title or '—'}")
+        if item.title is None:
+            # Молчание модели ничем не отличается от отказа по последствиям:
+            # дело останется с отрезком. Значит, и показано должно быть так же.
+            print("       ✗ в базу не попадёт: модель не ответила про это дело")
+        elif item.refusal is not None:
+            print(f"       ✗ в базу не попадёт: {item.refusal}")
+        print()
+
+    passed = sum(1 for item in shown if item.title is not None and item.refusal is None)
+    print(f"Прошло проверку: {passed} из {len(shown)}. В базу не записано ничего.")
+    print("  Настоящий прогон: just backfill-titles")
+    return passed
+
+
+def _one_line(text: str) -> str:
+    """Отрезок одной строкой и не шире `PREVIEW_WIDTH`."""
+    body = _SPACES.sub(" ", text).strip()
+    return body if len(body) <= PREVIEW_WIDTH else f"{body[:PREVIEW_WIDTH]}…"
+
+
+async def _report_cost(planned: int, *, model: str) -> None:
+    """Сказать, во сколько запросов обойдётся команда и хватит ли остатка **этой модели**.
 
     Появилось после 20 августа 2026: суточная квота кончилась вслепую, потому
     что расход было неоткуда взять, а цену команды — неоткуда узнать.
 
+    **Считается моделью, а не тиром** (с 26.08.2026). Тир складывает несравнимое:
+    26 августа в тире `cheap` работали три модели, сумма по ним вышла 58, и число
+    это не отвечало на единственный вопрос, ради которого строку читают, —
+    пойдёт ли прогон сейчас. У `3.6-flash` в тот день двадцать запросов уже
+    кончились, а `3.5-flash-lite` за те же сутки сделала двадцать два и не
+    отказала ни разу. Лимит провайдер держит на модель и сказал это дословно:
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier` в теле `429`.
+
     Печатается **до** постановки заданий: предупреждение после того, как всё
     поставлено, ничего не меняет.
     """
+    settings = get_settings()
     now = datetime.now(UTC)
-    used = await quota.used(now, tier=tier, limit=limit)
+    overrides = limits.configured(settings)
+    spending = {usage.model: usage for usage in await quota.by_model(now, overrides=overrides)}
+    # Модели, которая сегодня ещё не звалась, в разбивке нет вовсе — это ноль
+    # расхода, а не отсутствие ответа. Лимит у неё при этом известен заранее,
+    # и промолчать о нём значило бы потерять единственную полезную половину строки.
+    usage = spending.get(model) or quota.ModelUsage(
+        model=model,
+        spent=0,
+        refused=0,
+        limit=limits.daily_limit(model, override=overrides.get(model)),
+    )
 
     print(f"\nЗапросов к модели уйдёт: {planned}")
-    if used.limit is None:
-        print(f"  Сегодня уже потрачено: {used.spent}. Суточный лимит неизвестен.")
-        return
+    print(f"  {_spending(usage, planned)}")
 
-    left = used.left or 0
-    print(f"  Сегодня потрачено: {used.spent} из {used.limit}, останется {max(0, left - planned)}.")
-    if planned > left:
-        resets = quota.resets_at(now)
+    # Время сброса — в часах владельца, а не в UTC: строка кончается словами
+    # «по вашему времени», и до 26.08.2026 они были неправдой на два часа.
+    resets = quota.resets_at(now).astimezone(ZoneInfo(settings.brain_timezone))
+    left = usage.left
+
+    if left is not None and planned > left:
         print(
-            f"  ⚠️  Не хватит: остаток {used.left}. Часть заданий упрётся в квоту\n"
+            f"  ⚠️  Не хватит: остаток {left}. Часть заданий упрётся в квоту\n"
             f"     и будет ждать сброса — он в {resets:%H:%M %d.%m} по вашему времени."
+        )
+    elif usage.refused:
+        # Отказ провайдера вернее нашего счётчика: тем же ключом мог
+        # пользоваться кто-то ещё, и тогда наш счёт занижен. Начинать прогон
+        # после сегодняшнего `429` — это платить временем за тот же ответ.
+        print(
+            f"  ⚠️  Сегодня эта модель уже отказывала ({usage.refused}). Прогон может встать\n"
+            f"     на первом запросе; сброс квоты в {resets:%H:%M %d.%m} по вашему времени."
         )
 
 
-async def main() -> None:
+def _spending(usage: quota.ModelUsage, planned: int) -> str:
+    """Строка про расход модели. Родня той, что `/status` шлёт в телефон.
+
+    Формат намеренно тот же: одно и то же число, названное в двух местах
+    по-разному, читается как два разных числа.
+    """
+    if usage.limit is None:
+        # Лимит неизвестен — так и сказано. Выдуманное число здесь читалось бы
+        # как измеренное, а у `3.5-flash-lite` границы никто не видел.
+        line = f"{usage.model}: сегодня {usage.spent} — лимит неизвестен"
+    else:
+        left = usage.left or 0
+        line = (
+            f"{usage.model}: сегодня {usage.spent} из {usage.limit},"
+            f" останется {max(0, left - planned)}"
+        )
+
+    if usage.refused:
+        line += f", отказов {usage.refused}"
+
+    return f"🔴 {line}" if usage.exhausted or usage.refused else line
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Разбор аргументов отдельно от работы.
+
+    Отдельной функцией — чтобы значения по умолчанию и взаимоисключения
+    проверялись тестом. Они часть договора с владельцем: «`--preview` без числа
+    стоит один вызов» — обещание, а не деталь, и жить оно должно там, где его
+    можно прочитать проверкой.
+    """
     parser = argparse.ArgumentParser(description="Эксплуатационные команды Brain")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -428,10 +579,27 @@ async def main() -> None:
         "backfill-titles",
         help="назвать открытые дела и петли, у которых названия нет",
     )
-    titles_command.add_argument(
+    # Смета и предпросмотр отвечают на разные вопросы и противоречат друг другу:
+    # `--dry-run` обещает не звать модель, `--preview` зовёт её обязательно.
+    # Argparse откажет вслух — молчаливое «один победил другого» оставило бы
+    # владельца в уверенности, что цену он тоже увидел.
+    without_writing = titles_command.add_mutually_exclusive_group()
+    without_writing.add_argument(
         "--dry-run",
         action="store_true",
-        help="показать, что было бы сделано, и ничего не менять",
+        help="показать цену прогона в запросах и ничего не менять",
+    )
+    without_writing.add_argument(
+        "--preview",
+        type=int,
+        nargs="?",
+        const=PREVIEW_DEFAULT,
+        default=None,
+        help=(
+            "назвать одну пачку из N дел по-настоящему и показать названия "
+            f"рядом с отрезками, не записывая ничего (по умолчанию {PREVIEW_DEFAULT}; "
+            "N заменяет --limit)"
+        ),
     )
     titles_command.add_argument(
         "--recompute",
@@ -445,7 +613,11 @@ async def main() -> None:
         help="сколько дел взять за прогон: суточный лимит модели — 20 запросов",
     )
 
-    arguments = parser.parse_args()
+    return parser
+
+
+async def main() -> None:
+    arguments = build_parser().parse_args()
     get_runtime_settings()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -470,6 +642,7 @@ async def main() -> None:
                 dry_run=arguments.dry_run,
                 recompute=arguments.recompute,
                 limit=arguments.limit,
+                preview=arguments.preview,
             )
     finally:
         await dispose_engine()

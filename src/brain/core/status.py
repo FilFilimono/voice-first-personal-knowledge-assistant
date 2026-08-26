@@ -14,6 +14,7 @@
 моделями (ADR-0008), и заводить их отражение в ORM ради трёх счётчиков незачем.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -21,10 +22,8 @@ from sqlalchemy import func, or_, select, text
 
 import brain.core.quota as quota_counter
 from brain.core import digest, enrich
-from brain.core.llm.gemini import CHEAP
 from brain.core.memory import repository
 from brain.core.retrieval import repository as retrieval
-from brain.core.retrieval.gemini import EMBEDDING
 from brain.core.scheduler.queue import HEARTBEAT, HEARTBEAT_STALE_MINUTES
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry, EntryKind
@@ -91,10 +90,13 @@ class Quota:
     Существует затем, чтобы в лимит не упирались вслепую. 20 августа 2026
     воркер встал из-за исчерпанной квоты эмбеддингов, и узнать заранее,
     сколько израсходовано, было неоткуда.
+
+    **Разбивкой по моделям, а не двумя тирами** (с 26.08.2026). Лимит провайдер
+    держит на модель, и раньше строка «потрачено 58» складывала расход четырёх
+    моделей с разными лимитами в одно число, из которого не следовало ничего.
     """
 
-    embedding: quota_counter.Usage
-    enrich: quota_counter.Usage
+    models: tuple[quota_counter.ModelUsage, ...]
     resets_at: datetime
 
 
@@ -153,22 +155,22 @@ async def _touches(now: datetime, timezone: str) -> Touches:
     )
 
 
-async def _quota(now: datetime, limits: tuple[int | None, int | None]) -> Quota:
+async def _quota(now: datetime, overrides: Mapping[str, int]) -> Quota:
     """Расход запросов за текущие сутки провайдера.
 
-    Тиры считаются раздельно: квоты у них разные, и «осталось 40» про один
-    ничего не говорит про другой.
+    Модели считаются раздельно: лимит провайдер держит на модель, и «осталось
+    двадцать» про одну ничего не говорит про другую — на живом дне `3.6-flash`
+    упёрлась в двадцать, а `3.5-flash-lite` за те же сутки сделала двадцать два
+    и не отказала ни разу.
     """
-    embedding_limit, enrich_limit = limits
     return Quota(
-        embedding=await quota_counter.used(now, tier=EMBEDDING, limit=embedding_limit),
-        enrich=await quota_counter.used(now, tier=CHEAP, limit=enrich_limit),
+        models=tuple(await quota_counter.by_model(now, overrides=overrides)),
         resets_at=quota_counter.resets_at(now),
     )
 
 
 async def collect(
-    timezone: str, *, quota_limits: tuple[int | None, int | None] = (None, None)
+    timezone: str, *, quota_overrides: Mapping[str, int] | None = None
 ) -> SystemStatus:
     """Собрать состояние. Один проход по базе, никаких внешних вызовов."""
     async with session_scope() as session:
@@ -301,5 +303,5 @@ async def collect(
         topics=int(topics),
         archive_age_days=0 if oldest is None else (datetime.now(UTC) - oldest).days,
         touches=await _touches(datetime.now(UTC), timezone),
-        quota=await _quota(datetime.now(UTC), quota_limits),
+        quota=await _quota(datetime.now(UTC), quota_overrides or {}),
     )

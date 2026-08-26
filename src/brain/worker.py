@@ -210,6 +210,11 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     # же разметкой, и разметку оно не роняет: `jobs._name_fresh` глотает отказ
     # названий нарочно.
     namer = llm.build_model(settings, model=settings.titles_model)
+    # Модель утренней сводки — тоже своя, и пробы при старте у неё тоже нет.
+    # Зовётся она раз в сутки: проба при каждом перезапуске воркера стоила бы
+    # дороже самой сводки. Неверное имя видно первой же строкой в логе касаний,
+    # и касания оно не роняет — сводка уходит сухим рендером (ADR-0015, п. 5).
+    summariser = llm.build_model(settings, model=settings.digest_model)
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
@@ -381,6 +386,7 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
             notifier=notifier,
             chat_id=settings.telegram_allowed_user_ids[0],
             timezone=settings.brain_timezone,
+            model=summariser,
         )
 
     @pgq.sm.schedule(HEARTBEAT, HEARTBEAT_SCHEDULE)

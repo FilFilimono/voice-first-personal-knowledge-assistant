@@ -54,14 +54,27 @@ def test_unknown_status_is_treated_as_fatal() -> None:
 def test_quota_advice_does_not_send_the_owner_to_env() -> None:
     """Главная неправда старого текста: «поправьте EMBEDDING_MODEL в .env».
 
-    Квота считается на проект, а не на модель. Смена имени модели её не вернёт,
-    зато уведёт владельца чинить то, что не сломано.
+    Смена имени модели — не способ чинить кончившуюся квоту вслепую, и совет
+    не должен звать в `.env` первым делом.
     """
     text = advice(429, SETTING)
 
     assert SETTING not in text
     assert "квота" in text.lower()
-    assert "проект" in text
+
+
+def test_quota_advice_says_the_limit_is_per_model() -> None:
+    """Второй текст оказался тоже неправдой, и это сказал сам провайдер.
+
+    В теле `429` приходит метрика
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier` со значением 20 — то есть
+    на проект **и на модель**. Совет «менять имя модели незачем» уводил владельца
+    ждать полуночи там, где хватило бы соседней модели с целым лимитом.
+    """
+    text = advice(429, SETTING)
+
+    assert "на модель" in text
+    assert "менять имя модели незачем" not in text
 
 
 def test_retired_model_advice_names_the_setting() -> None:

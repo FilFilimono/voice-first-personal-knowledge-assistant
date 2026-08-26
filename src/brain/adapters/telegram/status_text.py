@@ -11,6 +11,7 @@
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
+from brain.core.quota import ModelUsage
 from brain.core.status import SystemStatus, Touches
 from brain.storage.models.touch import SilenceReason
 
@@ -67,9 +68,7 @@ def render(status: SystemStatus, *, timezone: str) -> str:
         # вместе с командой, которая их возвращает.
         lines.append(f"❌ Упало: {status.jobs_failed} — вернуть: just failed, just requeue <id>")
 
-    quota_line = _quota(status, timezone=timezone)
-    if quota_line:
-        lines.append(quota_line)
+    lines.extend(_quota(status, timezone=timezone))
 
     lines.append("")
     lines.extend(_touches(status, timezone=timezone))
@@ -149,31 +148,67 @@ SILENCE = {
 }
 
 
-def _quota(status: SystemStatus, *, timezone: str) -> str:
-    """Сколько запросов к провайдеру осталось на сегодня.
+def _quota(status: SystemStatus, *, timezone: str) -> list[str]:
+    """Сколько запросов к провайдеру осталось на сегодня — **по моделям**.
 
-    Показывается **только когда есть о чём сказать**: пока израсходована
-    небольшая часть, строка молчит, как и остальные разделы `/status`.
-
-    Появилась после 20 августа 2026, когда воркер упёрся в суточную квоту
+    Появилось после 20 августа 2026, когда воркер упёрся в суточную квоту
     эмбеддингов вслепую и не поднялся вовсе. Отвечает на единственный вопрос,
     которого тогда не хватило: сколько ещё можно.
-    """
-    used = status.quota.embedding
-    if used.limit is None:
-        return f"📊 Запросов к эмбеддингам сегодня: {used.spent} (лимит неизвестен)"
 
-    # Порог показа. Ниже — не новость: строка каждый день сообщала бы, что
-    # всё в порядке, и её перестали бы читать до того дня, когда она нужна.
-    if used.spent < used.limit // 2 and not used.refused:
-        return ""
+    **Одним числом на всё это не отвечается**, и с 26 августа 2026 не
+    отвечается вовсе: лимит провайдер держит на модель
+    (`GenerateRequestsPerDayPerProjectPerModel-FreeTier` в теле `429`), а в один
+    день система зовёт четыре разных. «Потрачено 58» складывало расход модели,
+    у которой осталось ноль из двадцати, с расходом модели, у которой лимит
+    другой и заведомо больше.
+
+    Показывается **только то, о чём есть что сказать**, — как и остальные
+    разделы `/status`. Молчит модель, у которой известный лимит истрачен меньше
+    чем наполовину и отказов не было: строка, каждый день сообщающая «всё
+    в порядке», перестаёт читаться ровно к тому дню, когда она нужна.
+    """
+    worth_saying = [usage for usage in status.quota.models if _worth_saying(usage)]
+    if not worth_saying:
+        return []
 
     resets = status.quota.resets_at.astimezone(ZoneInfo(timezone))
-    mark = "🔴" if used.exhausted else "📊"
-    line = f"{mark} Запросов к эмбеддингам: {used.spent} из {used.limit}, сброс в {resets:%H:%M}"
-    if used.refused:
-        line += f"\n   Отказов сегодня: {used.refused}"
-    return line
+    return [
+        f"📊 Запросов сегодня, сброс в {resets:%H:%M}",
+        *(f"   {_model_quota(usage)}" for usage in worth_saying),
+    ]
+
+
+def _worth_saying(usage: ModelUsage) -> bool:
+    """Есть ли про модель новость.
+
+    Неизвестный лимит — всегда новость: остатка нет, и единственное, чем
+    владелец может распорядиться, это само число потраченного.
+    """
+    if usage.refused:
+        return True
+    if usage.limit is None:
+        return usage.spent > 0
+    return usage.spent >= usage.limit // 2
+
+
+def _model_quota(usage: ModelUsage) -> str:
+    """Строка про одну модель. Лимит — только если он **известен**.
+
+    Выдумывать его нельзя: число из головы читается как измеренное — та же
+    ошибка, из-за которой в проекте цены помечены датой проверки.
+    """
+    if usage.limit is None:
+        spent = f"{usage.model}: {usage.spent} — лимит неизвестен"
+    else:
+        spent = f"{usage.model}: {usage.spent} из {usage.limit}"
+
+    if usage.refused:
+        # Отказ провайдера — это его собственный ответ «больше нельзя»,
+        # и он вернее нашего счётчика: тем же ключом мог пользоваться
+        # кто-то ещё, и тогда наш счёт занижен.
+        spent += f", отказов {usage.refused}"
+
+    return f"🔴 {spent}" if usage.exhausted or usage.refused else spent
 
 
 def _touches(status: SystemStatus, *, timezone: str) -> list[str]:

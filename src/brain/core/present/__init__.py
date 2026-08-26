@@ -18,26 +18,27 @@
 
     cleanup.py     чистка расшифровки: промпт, схема ответа, разбор
     titles.py      названия дел и петель: пачка, проверка, запись
+    digest.py      лид утренней сводки: вход модели, промпт, отказ
     guard.py       проверка написанного моделью перед показом
     pacing.py      что замолкает первым, когда квота на исходе
     repository.py  чтение из базы, которое для этого нужно
-
-Дальше сюда придёт лид утренней сводки (задача 7).
 """
 
-from brain.core.present import guard, titles
+from brain.core.present import digest, guard, titles
 from brain.core.present.cleanup import PROMPT, PURPOSE, clean_one, parse
 from brain.core.present.pacing import cosmetic_allowed
 
-# `guard` и `titles` берутся модулями целиком: их выражения зовутся `check`,
-# `reproach`, `parse`, `name` — в общем пространстве пакета такие имена
-# ничего не сказали бы о том, что именно проверяется и что именно называется.
-# У чистки имена свои (`clean_one`), поэтому она поднята наверх.
+# `guard`, `titles` и `digest` берутся модулями целиком: их выражения зовутся
+# `check`, `reproach`, `parse`, `name`, `write` — в общем пространстве пакета
+# такие имена ничего не сказали бы о том, что именно проверяется, что именно
+# называется и что пишется. У чистки имена свои (`clean_one`), поэтому она
+# поднята наверх.
 __all__ = [
     "PROMPT",
     "PURPOSE",
     "clean_one",
     "cosmetic_allowed",
+    "digest",
     "guard",
     "parse",
     "titles",

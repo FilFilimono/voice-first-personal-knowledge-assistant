@@ -6,13 +6,14 @@
 «можно ли тратить запрос».
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select, update
 
 from brain.core.llm import CHEAP
-from brain.core.memory.repository import is_private_now
+from brain.core.memory.repository import display_text, is_private_now
 from brain.storage.db import session_scope
 from brain.storage.models.commitment import LIVE_STATES, Commitment
 from brain.storage.models.entry import Entry
@@ -121,6 +122,67 @@ async def targets_to_name(*, recompute: bool, limit: int | None) -> list[TitleTa
         TitleTarget(kind=LOOP, id=int(row[0]), text=str(row[1]), is_private=False) for row in loops
     ]
     return targets if limit is None else targets[:limit]
+
+
+async def public_among(kind: str, ids: Sequence[int]) -> set[int]:
+    """Какие из этих дел (или петель) заведены **не приватной** записью.
+
+    Спрашивается перед тем, как собрать вход модели для сводки. Приватное дело
+    из сводки при этом не исчезает — владельцу его собственная запись
+    показывается, — но наружу не уходит (инвариант 5).
+
+    Вопрос задаётся отдельным запросом, а не колонкой у уже прочитанного дела:
+    приватность включается задним числом (`entry_overrides`), и «приватна ли
+    запись» отвечает только `memory.is_private_now()`. Дело, прочитанное
+    сводкой минуту назад, могло стать приватным нажатием кнопки.
+    """
+    if not ids:
+        return set()
+
+    table = Commitment if kind == COMMITMENT else Loop
+    async with session_scope() as session:
+        rows = await session.scalars(
+            select(table.id)
+            .join(Entry, Entry.id == table.source_entry_id)
+            .where(table.id.in_(ids), ~is_private_now())
+        )
+    return {int(found) for found in rows.all()}
+
+
+@dataclass(frozen=True, slots=True)
+class Recorded:
+    """Запись владельца в том виде, в каком он её сам видел."""
+
+    entry_id: int
+    text: str
+
+
+async def recorded_between(start: datetime, end: datetime, *, limit: int) -> list[Recorded]:
+    """Записи за отрезок времени — контекст, из которого пишется лид сводки.
+
+    **Текст показной, а не рабочий.** Модель, пишущая для владельца, обязана
+    читать то же, что читает он: дословная расшифровка с «э» и оборванными
+    началами — это шум, за понимание которого платит вызов.
+
+    Приватные не берутся вовсе, как и везде, где текст собирается наружу.
+    Отбор по `created_at`, а не по дате разметки: «что записано вчера» —
+    вопрос про день владельца, и разметка к нему отношения не имеет.
+    """
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Entry.id, display_text())
+                .where(
+                    Entry.created_at >= start,
+                    Entry.created_at < end,
+                    ~is_private_now(),
+                )
+                .order_by(Entry.id)
+                .limit(limit)
+            )
+        ).all()
+
+    return [Recorded(entry_id=int(row[0]), text=str(row[1])) for row in rows if row[1]]
 
 
 async def save_titles(kind: str, named: dict[int, str]) -> int:

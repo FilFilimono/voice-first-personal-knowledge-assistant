@@ -30,7 +30,9 @@ from brain.core.digest import (
     touches,
     weekly,
 )
-from brain.core.ports import Notifier
+from brain.core.ports import LanguageModel, Notifier
+from brain.core.present import digest as lead
+from brain.core.present import guard
 from brain.storage.models.touch import SilenceReason, TouchCategory, TouchSlot
 
 logger = logging.getLogger(__name__)
@@ -43,12 +45,24 @@ EVENING_BATCH = 3
 
 
 async def tick(
-    *, now: datetime, timezone: str, chat_id: int, notifier: Notifier
+    *,
+    now: datetime,
+    timezone: str,
+    chat_id: int,
+    notifier: Notifier,
+    model: LanguageModel | None,
 ) -> list[TouchSlot]:
     """Один проход. Возвращает слоты, по которым что-то ушло.
 
     Ничего не отправляет, если отправлять нечего: это основной режим на молодом
     архиве, а не редкий угол (ADR-0013).
+
+    `model` пишет лид утренней сводки (ADR-0015, п. 5). Аргумент обязателен
+    и без умолчания намеренно: умолчание `None` означало бы, что забытый
+    параметр в воркере выглядит как работающая сводка — ровно тот почерк,
+    которым в проекте уже потерялась `loops.is_stuck`. `None` передаётся
+    осознанно и значит «сухой рендер»: так тик зовут тесты, которые про
+    расписание, а не про текст.
     """
     # Долг — первым и всегда: он не зависит от слотов, от паузы и от бюджета,
     # потому что не является сообщением.
@@ -62,7 +76,7 @@ async def tick(
     for slot in slots.due(now, timezone):
         if slot in done:
             continue
-        if await _handle(slot, day, now, timezone, chat_id, notifier, silent=silent):
+        if await _handle(slot, day, now, timezone, chat_id, notifier, silent=silent, model=model):
             sent.append(slot)
     return sent
 
@@ -76,6 +90,7 @@ async def _handle(
     notifier: Notifier,
     *,
     silent: bool,
+    model: LanguageModel | None,
 ) -> bool:
     """Разобраться с одним слотом. `True` — сообщение ушло."""
     if silent:
@@ -91,7 +106,7 @@ async def _handle(
         await touches.record_silence(slot, day, reason=SilenceReason.OVER_BUDGET)
         return False
 
-    prepared = await _prepare(slot, now, timezone)
+    prepared = await _prepare(slot, now, timezone, model)
     if prepared is None:
         await touches.record_silence(slot, day, reason=SilenceReason.NOTHING_TO_SAY)
         return False
@@ -117,14 +132,23 @@ async def _handle(
 
 
 async def _prepare(
-    slot: TouchSlot, now: datetime, timezone: str
+    slot: TouchSlot, now: datetime, timezone: str, model: LanguageModel | None
 ) -> tuple[str, dict[str, object]] | None:
-    """Текст и нагрузка касания. `None` — сказать нечего."""
+    """Текст и нагрузка касания. `None` — сказать нечего.
+
+    **Модель зовётся здесь, то есть до того, как слот занят.** Порядок ровно
+    тот же, что был: сначала собрать текст, потом занять место в журнале,
+    потом отправить. Цена — при гонке двух тиков лид напишется дважды, а слот
+    достанется одному; переставлять из-за этого нельзя, потому что занятый слот
+    при упавшей сборке стоит целого дня молчания, а лишний вызов — одного
+    запроса из двадцати. Гонка при этом умозрительная: воркер один и тикает
+    раз в пять минут.
+    """
     if slot is TouchSlot.MORNING:
         content = await morning.collect(now)
         if content.empty:
             return None
-        return render.morning(content), {
+        return render.morning(content, written=await _lead(model, content, now, timezone)), {
             "commitment_ids": [item.id for item in content.commitments],
             "loop_id": content.loop.id if content.loop else None,
             # Правило про три откладывания — часть замысла, а не оформления
@@ -158,6 +182,50 @@ async def _prepare(
     if review is None:
         return None
     return render.weekly(review), {}
+
+
+async def _lead(
+    model: LanguageModel | None, content: morning.Morning, now: datetime, timezone: str
+) -> guard.Written | None:
+    """Лид сводки от модели. `None` — сводка уйдёт сухим рендером.
+
+    Отбор уже сделан: в модель уходит ровно то, что владелец увидит, — те же
+    три дела и та же петля. Возраст и состояние дела прикладываются, потому что
+    без них лид получится пересказом количества; **счётчик откладываний петли
+    не прикладывается**, и это решение владельца — см. `core/present/digest`.
+
+    **Бюджет считает код.** Сухие строки уже написаны, и сколько слов осталось
+    лиду, знает только тот, кто их поставил: сорок секунд из `vision.md` §5.1 —
+    это про всё сообщение, а не про то, что написала модель. Сухой рендер
+    собирается для счёта дважды — он чистая функция, и второй вызов стоит
+    склейки десятка строк.
+    """
+    if model is None:
+        return None
+
+    return await lead.write(
+        model,
+        deeds=[
+            lead.Deed(
+                id=item.id,
+                # То же, что увидит владелец: название, а если его нет —
+                # снимок единицы. Владельцу оно достанется подрезанным
+                # по ширине строки, модели — целиком.
+                text=item.title or item.text,
+                created_at=item.created_at,
+                state=item.state,
+            )
+            for item in content.commitments
+        ],
+        question=(
+            None
+            if content.loop is None
+            else lead.Question(id=content.loop.id, text=content.loop.title or content.loop.question)
+        ),
+        now=now,
+        timezone=timezone,
+        words=lead.WORD_BUDGET - len(render.morning(content).split()),
+    )
 
 
 async def _send(
