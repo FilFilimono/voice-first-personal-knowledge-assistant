@@ -140,7 +140,7 @@ async def _touches(now: datetime, timezone: str) -> Touches:
     day = digest.slots.local_date(now, timezone)
     today = await digest.touches.of_day(day)
     budget = await digest.touches.budget(day)
-    open_commitments, open_loops = await digest.service.counts()
+    open_commitments, open_loops = await digest.service.counts(now)
 
     return Touches(
         morning=today.get(TouchSlot.MORNING),

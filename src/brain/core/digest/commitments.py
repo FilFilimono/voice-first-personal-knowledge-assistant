@@ -18,12 +18,19 @@
 **Три подряд идущие задачи — три дела.** Схлопывать соседние единицы одного
 типа нельзя: это необратимо стирает число дел, а сводка считает их поштучно
 (ADR-0012, блок «Обновление»).
+
+**Состояний четыре, и переход между ними один — `set_state`.** Второй двери
+здесь быть не должно: правило «отложенное дело обязано иметь срок» держится
+не схемой, а тем, что состояние и срок пишутся одним UPDATE. Разведи их
+по двум функциям — и однажды одна из них поставит `snoozed` без срока, а дело
+после этого не покажется никогда и ни в чём: ни в сводке, ни в `/status`.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, update
+from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -94,17 +101,32 @@ async def create_in(session: AsyncSession, *, entry_id: int, annotation_id: int,
     return created
 
 
-async def open_ones(limit: int | None = None) -> list[Commitment]:
-    """Незакрытые дела, от старых к новым.
+def shown_now(now: datetime) -> ColumnElement[bool]:
+    """Условие «дело сегодня видно». Одно место, где это решается.
+
+    Открытое и взятое в работу видно всегда: `in_progress` не уходит из сводки,
+    иначе начатое и брошенное перестало бы напоминать о себе. Отложенное
+    возвращается своим сроком — и возвращается **само**, отдельного задания,
+    которое «разбудит» его, нет: задание, не сработавшее в срок, спрятало бы
+    дело навсегда и молча, а условие в запросе так сломаться не может.
+    """
+    return or_(
+        Commitment.state.in_((CommitmentState.OPEN, CommitmentState.IN_PROGRESS)),
+        and_(Commitment.state == CommitmentState.SNOOZED, Commitment.snoozed_until <= now),
+    )
+
+
+async def open_ones(now: datetime, limit: int | None = None) -> list[Commitment]:
+    """Дела, которые сегодня висят, от старых к новым.
 
     Порядок — возраст: `vision.md` §7 требует эскалации вверх по важности,
     а не по частоте, и «висит дольше всех» — единственная мера важности,
-    которая у системы есть без спроса у владельца.
+    которая у системы есть без спроса у владельца. Взятое в работу поэтому
+    остаётся на своём месте, а не поднимается наверх: подъём был бы наградой
+    за начало, то есть счётчиком усердия (`vision.md` §7.0, принцип 5).
     """
     statement = (
-        select(Commitment)
-        .where(Commitment.state == CommitmentState.OPEN)
-        .order_by(Commitment.created_at, Commitment.id)
+        select(Commitment).where(shown_now(now)).order_by(Commitment.created_at, Commitment.id)
     )
     if limit is not None:
         statement = statement.limit(limit)
@@ -113,30 +135,95 @@ async def open_ones(limit: int | None = None) -> list[Commitment]:
         return list((await session.scalars(statement)).all())
 
 
-async def open_count() -> int:
-    """Сколько дел висит. Нужно `/status` и порогу недельного ревью."""
-    async with session_scope() as session:
-        rows = await session.scalars(
-            select(Commitment.id).where(Commitment.state == CommitmentState.OPEN)
-        )
-    return len(list(rows))
+async def open_count(now: datetime) -> int:
+    """Сколько дел висит. Нужно `/status` и порогу недельного ревью.
 
-
-async def close(commitment_id: int, state: CommitmentState, *, now: datetime) -> bool:
-    """Закрыть дело. `False` — оно уже закрыто.
-
-    Нажать кнопку можно сколько угодно раз: она живёт в переписке вечно.
-    Вторая попытка не должна переписывать «сделал» на «не актуально» —
-    та же причина, что у повторного «да» под вопросом про напоминание.
+    Считает ровно то же, что показывает сводка: разъехавшись, число в `/status`
+    противоречило бы списку в сообщении, и владелец не смог бы понять, кто из
+    двоих врёт.
     """
     async with session_scope() as session:
-        changed = await session.scalar(
-            update(Commitment)
-            .where(Commitment.id == commitment_id, Commitment.state == CommitmentState.OPEN)
-            .values(state=state, state_changed_at=now)
-            .returning(Commitment.id)
+        count = await session.scalar(
+            select(func.count()).select_from(Commitment).where(shown_now(now))
         )
-    return changed is not None
+    return int(count or 0)
+
+
+# Сроки откладывания. Дни, а не «часы до», потому что считаются они по календарю
+# владельца — см. `snooze_term`.
+TERMS = {"day": 1, "week": 7, "month": 30}
+
+
+def snooze_term(now: datetime, *, term: str, timezone: str) -> datetime:
+    """До какого момента прятать дело. Полночь по календарю владельца.
+
+    «До завтра», отсчитанное сутками от нажатия, вернуло бы дело послезавтра:
+    отложили в одиннадцать утра — сутки кончаются в одиннадцать следующего дня,
+    а сводка приходит в девять. Поэтому срок — начало нужного дня, а не
+    «плюс столько-то часов».
+    """
+    zone = ZoneInfo(timezone)
+    day = (now.astimezone(zone) + timedelta(days=TERMS[term])).date()
+    return datetime.combine(day, time.min, tzinfo=zone)
+
+
+def return_target(previous: CommitmentState) -> CommitmentState:
+    """Куда возвращает «Вернуть». Обычно — в прежнее состояние.
+
+    Единственное исключение — прежний `snoozed`: срок к моменту возврата уже
+    стёрт переходом, и вернуть дело в «отложено» значило бы отложить его
+    без срока, то есть спрятать навсегда. Возврат идёт в `open`, и владелец
+    видит дело в ближайшей сводке — то есть ошибается система в сторону
+    «показать лишнее», а не «потерять молча».
+    """
+    return CommitmentState.OPEN if previous is CommitmentState.SNOOZED else previous
+
+
+async def set_state(
+    commitment_id: int,
+    state: CommitmentState,
+    *,
+    now: datetime,
+    until: datetime | None = None,
+) -> CommitmentState | None:
+    """Перевести дело в состояние. Возвращает **прежнее** — или `None`, если дела нет.
+
+    Прежнее состояние возвращается не для отчётности: на нём стоит отмена
+    последнего действия. Кнопка «Вернуть» везёт его в `callback_data`, потому
+    что по данным его уже не восстановить — дело могло быть «в работе» до того,
+    как его завершили, и возврат всегда в `open` молча стёр бы то, что владелец
+    про это дело уже сказал.
+
+    **Срок и состояние пишутся одной транзакцией**, и иначе быть не может:
+    это один UPDATE. Дело в `snoozed` без срока не показалось бы больше
+    никогда, а заметить это было бы неоткуда — оно просто перестало бы
+    приходить. Отсюда же отказ на `snoozed` без `until`: не бывает.
+
+    Повтор ничего не двигает: кнопка живёт в переписке вечно, и второе нажатие
+    «Завершить» не должно переносить дело в другую неделю ревью.
+    """
+    if state is CommitmentState.SNOOZED and until is None:
+        raise ValueError("отложить дело без срока нельзя: оно исчезло бы навсегда")
+    if state is not CommitmentState.SNOOZED and until is not None:
+        raise ValueError(f"срок бывает только у отложенного дела, а не у {state}")
+
+    async with session_scope() as session:
+        previous = await session.scalar(
+            select(Commitment.state).where(Commitment.id == commitment_id).with_for_update()
+        )
+        if previous is None:
+            return None
+        if previous is state and state is not CommitmentState.SNOOZED:
+            return previous
+
+        await session.execute(
+            update(Commitment)
+            .where(Commitment.id == commitment_id)
+            # Срок гасится при любом уходе из `snoozed`: пережив переход,
+            # он однажды спрятал бы дело, которое никто не откладывал.
+            .values(state=state, state_changed_at=now, snoozed_until=until)
+        )
+    return previous
 
 
 async def by_id(commitment_id: int) -> Commitment | None:

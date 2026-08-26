@@ -15,7 +15,6 @@ def _summary(times_asked: int) -> Morning:
         commitments=[],
         open_commitments=0,
         loop=Loop(id=1, question="куда дальше", times_asked=times_asked),
-        unsorted=[],
     )
 
 

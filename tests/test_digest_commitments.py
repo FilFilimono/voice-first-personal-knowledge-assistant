@@ -8,7 +8,7 @@
 Требует поднятого Postgres: `just up`.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -91,7 +91,7 @@ async def test_tasks_become_commitments_and_thoughts_do_not() -> None:
     entry_id = await _entry(TEXT)
     await _annotate(entry_id, TEXT)
 
-    open_now = await commitments.open_ones()
+    open_now = await commitments.open_ones(NOW)
 
     assert len(open_now) == 3
     assert [item.text for item in open_now] == [
@@ -112,7 +112,7 @@ async def test_reenrichment_does_not_duplicate_commitments() -> None:
     await _annotate(entry_id, TEXT)
     await _annotate(entry_id, TEXT)
 
-    assert len(await commitments.open_ones()) == 3
+    assert len(await commitments.open_ones(NOW)) == 3
 
 
 async def test_closed_commitment_survives_reenrichment() -> None:
@@ -125,12 +125,12 @@ async def test_closed_commitment_survives_reenrichment() -> None:
     entry_id = await _entry(TEXT)
     await _annotate(entry_id, TEXT)
 
-    first = (await commitments.open_ones())[0]
-    await commitments.close(first.id, CommitmentState.DONE, now=NOW)
+    first = (await commitments.open_ones(NOW))[0]
+    await commitments.set_state(first.id, CommitmentState.DONE, now=NOW)
 
     await _annotate(entry_id, TEXT)
 
-    still_open = await commitments.open_ones()
+    still_open = await commitments.open_ones(NOW)
     assert len(still_open) == 2
     assert first.text not in [item.text for item in still_open]
 
@@ -143,10 +143,10 @@ async def test_closing_stamps_the_time_and_the_kind() -> None:
     """
     entry_id = await _entry(TEXT)
     await _annotate(entry_id, TEXT)
-    items = await commitments.open_ones()
+    items = await commitments.open_ones(NOW)
 
-    await commitments.close(items[0].id, CommitmentState.DONE, now=NOW)
-    await commitments.close(items[1].id, CommitmentState.DROPPED, now=NOW)
+    await commitments.set_state(items[0].id, CommitmentState.DONE, now=NOW)
+    await commitments.set_state(items[1].id, CommitmentState.DROPPED, now=NOW)
 
     done = await commitments.closed_between(NOW, NOW, state=CommitmentState.DONE)
     dropped = await commitments.closed_between(NOW, NOW, state=CommitmentState.DROPPED)
@@ -155,19 +155,28 @@ async def test_closing_stamps_the_time_and_the_kind() -> None:
     assert [item.text for item in dropped] == ["позвонить маме."]
 
 
-async def test_closing_twice_is_harmless() -> None:
+async def test_closing_twice_moves_nothing() -> None:
     """Кнопка живёт в переписке вечно, нажать её можно сколько угодно раз.
 
-    Та же причина, что у повторного «да» под вопросом про напоминание.
+    Повтор не должен переносить дело в другую неделю ревью: «что закрыл
+    за неделю» считается по `state_changed_at`, и второе нажатие в среду
+    забрало бы у прошлой недели то, что было закрыто в ней.
+
+    Отказывать в **другом** состоянии при этом больше нельзя: состояний
+    четыре, и переход между ними — обычный ход, а не промах. От промаха
+    защищает отмена под самим нажатием, а не запрет в базе.
     """
     entry_id = await _entry(TEXT)
     await _annotate(entry_id, TEXT)
-    item = (await commitments.open_ones())[0]
+    item = (await commitments.open_ones(NOW))[0]
 
-    assert await commitments.close(item.id, CommitmentState.DONE, now=NOW)
-    assert not await commitments.close(item.id, CommitmentState.DROPPED, now=NOW)
+    assert await commitments.set_state(item.id, CommitmentState.DONE, now=NOW)
+    later = NOW + timedelta(days=3)
+    assert await commitments.set_state(item.id, CommitmentState.DONE, now=later)
 
-    assert len(await commitments.open_ones()) == 2
+    still = await commitments.closed_between(NOW, NOW, state=CommitmentState.DONE)
+    assert [found.id for found in still] == [item.id]
+    assert len(await commitments.open_ones(NOW)) == 2
 
 
 async def test_commitment_keeps_a_snapshot_of_its_text() -> None:
@@ -176,7 +185,7 @@ async def test_commitment_keeps_a_snapshot_of_its_text() -> None:
     entry_id = await _entry(TEXT)
     await _annotate(entry_id, TEXT)
 
-    item = (await commitments.open_ones())[0]
+    item = (await commitments.open_ones(NOW))[0]
 
     assert item.text
     assert item.source_entry_id == entry_id

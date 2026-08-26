@@ -145,7 +145,7 @@ async def collect(now: datetime) -> Weekly | None:
         topics=[(str(name), int(count)) for name, count in topics],
         done=await commitment_store.closed_between(since, now, state=CommitmentState.DONE),
         dropped=await commitment_store.closed_between(since, now, state=CommitmentState.DROPPED),
-        open_commitments=await commitment_store.open_count(),
+        open_commitments=await commitment_store.open_count(now),
         open_loops=await loops.open_count(),
         oldest_loop_days=_days(await loops.oldest_open_age(now)),
         hint=await _hint(),

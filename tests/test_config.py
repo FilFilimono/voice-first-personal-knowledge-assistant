@@ -148,7 +148,7 @@ def test_cleanup_defaults_match_the_measured_choice() -> None:
     settings = _settings()
 
     assert settings.cleanup_model == "gemini-3.6-flash"
-    assert settings.cleanup_wait_sec == 15
+    assert settings.cleanup_wait_sec == 60
 
 
 def test_titles_model_does_not_follow_the_cleanup_model() -> None:

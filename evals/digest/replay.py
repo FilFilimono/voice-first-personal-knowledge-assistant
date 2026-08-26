@@ -80,7 +80,7 @@ async def _slot(slot: TouchSlot, moment: datetime, timezone: str, shown: set[int
     в проде то же множество приходит из журнала.
     """
     if slot is TouchSlot.MORNING:
-        content = await morning.collect(moment, timezone)
+        content = await morning.collect(moment)
         if content.empty:
             return Outcome(slot, None, SilenceReason.NOTHING_TO_SAY)
         return Outcome(slot, render.morning(content), None)

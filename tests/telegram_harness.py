@@ -24,7 +24,15 @@ from aiogram.methods import (
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, Message, Update, User, Voice
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+    User,
+    Voice,
+)
 
 OWNER_ID = 111
 STRANGER_ID = 222
@@ -178,8 +186,16 @@ def make_callback_update(
     message_id: int,
     update_id: int = 3,
     user_id: int = OWNER_ID,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> Update:
-    """Нажатие кнопки под сообщением бота."""
+    """Нажатие кнопки под сообщением бота.
+
+    Кнопки сообщения приезжают вместе с нажатием — так их и присылает Telegram.
+    Обработчику сводки это не удобство, а вход: он перерисовывает ряд одного
+    дела и остальные ряды берёт из того, что пришло. Без `reply_markup`
+    проверялась бы работа с сообщением, у которого кнопок нет, — а это другой,
+    запасной путь.
+    """
     return Update(
         update_id=update_id,
         callback_query=CallbackQuery(
@@ -193,6 +209,7 @@ def make_callback_update(
                 chat=Chat(id=CHAT_ID, type="private"),
                 from_user=User(id=999, is_bot=True, first_name="Brain"),
                 text="Похоже на напоминание.",
+                reply_markup=reply_markup,
             ),
         ),
     )

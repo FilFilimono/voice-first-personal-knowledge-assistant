@@ -121,7 +121,7 @@ async def _prepare(
 ) -> tuple[str, dict[str, object]] | None:
     """Текст и нагрузка касания. `None` — сказать нечего."""
     if slot is TouchSlot.MORNING:
-        content = await morning.collect(now, timezone)
+        content = await morning.collect(now)
         if content.empty:
             return None
         return render.morning(content), {
@@ -208,6 +208,10 @@ async def _after(slot: TouchSlot, payload: dict[str, object], now: datetime) -> 
         await loops.mark_asked(loop_id, now=now)
 
 
-async def counts() -> tuple[int, int]:
-    """Сколько дел и петель висит. Нужно `/status`."""
-    return await commitments.open_count(), await loops.open_count()
+async def counts(now: datetime) -> tuple[int, int]:
+    """Сколько дел и петель висит. Нужно `/status`.
+
+    Момент нужен делам: отложенное до срока не висит, и число в `/status`
+    обязано совпадать с тем, что в это же утро показала сводка.
+    """
+    return await commitments.open_count(now), await loops.open_count()

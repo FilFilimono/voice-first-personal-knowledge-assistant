@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 from brain.core.llm import CHEAP
 from brain.core.memory.repository import is_private_now
 from brain.storage.db import session_scope
-from brain.storage.models.commitment import Commitment, CommitmentState
+from brain.storage.models.commitment import LIVE_STATES, Commitment
 from brain.storage.models.entry import Entry
 from brain.storage.models.llm_call import LlmCall
 from brain.storage.models.loop import Loop, LoopStatus
@@ -91,7 +91,10 @@ async def targets_to_name(*, recompute: bool, limit: int | None) -> list[TitleTa
                 select(Commitment.id, Commitment.text)
                 .join(Entry, Entry.id == Commitment.source_entry_id)
                 .where(
-                    Commitment.state == CommitmentState.OPEN,
+                    # Все живые состояния, а не только `open`: взятое в работу
+                    # и отложенное владелец увидит в сводке, и безымянным оно
+                    # там будет выглядеть так же плохо.
+                    Commitment.state.in_(LIVE_STATES),
                     ~is_private_now(),
                     *([] if recompute else [Commitment.title.is_(None)]),
                 )

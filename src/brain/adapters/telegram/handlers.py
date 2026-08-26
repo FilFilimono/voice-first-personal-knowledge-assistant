@@ -15,13 +15,15 @@
 """
 
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 
 import brain.core.retrieval.embeddings as embeddings
 from brain.adapters.telegram import digest_keyboards, search_text, status_text
@@ -378,20 +380,77 @@ def build_router(settings: Settings) -> Router:
             await message.edit_text(_made_private(result), reply_markup=None)
 
     @router.callback_query(F.data.startswith(f"{digest_keyboards.DEED_PREFIX}:"))
-    async def close_commitment(callback: CallbackQuery) -> None:
-        """«Сделал» или «неактуально» под делом в утренней сводке.
+    async def deed_button(callback: CallbackQuery) -> None:
+        """Кнопки под делом в утренней сводке — все три уровня и отмена.
 
-        Текст сводки не переписывается: в ней несколько дел, и стирать весь
-        список из-за одного нажатия нельзя. Ответом служит всплывающая
-        подсказка — её видит только владелец и только сейчас.
+        **Текст сводки не переписывается**: в ней несколько дел, и стирать весь
+        список из-за одного нажатия нельзя. Меняются только кнопки, и только
+        у того дела, на которое нажали.
+
+        **Ни одного вызова модели на нажатие.** Перерисовка идёт из того, что
+        пришло вместе с нажатием: Telegram присылает сообщение вместе с его
+        кнопками, а в кнопках лежат идентификаторы дел и их порядок. Своей
+        таблицы ожидающих вопросов в проекте нет и здесь не заводится.
         """
         if callback.data is None:  # pragma: no cover — фильтр выше
             return
 
-        _, action, raw_id = callback.data.split(":", maxsplit=2)
-        state = CommitmentState.DONE if action == digest_keyboards.DONE else CommitmentState.DROPPED
-        closed = await digest.commitments.close(int(raw_id), state, now=datetime.now(UTC))
-        await callback.answer(_closed_deed(state) if closed else ALREADY_CLOSED)
+        _, action, *rest = callback.data.split(":")
+        commitment_id = int(rest[-1])
+        message = callback.message if isinstance(callback.message, Message) else None
+
+        if action == digest_keyboards.SEEN:
+            # Подпись состояния — надпись, а не кнопка: рядов без кнопок
+            # в Telegram не бывает. Нажатие на неё ничего не делает нарочно.
+            await callback.answer()
+            return
+
+        if action == digest_keyboards.PICK:
+            await _redraw(message, commitment_id, digest_keyboards.choice_rows(commitment_id))
+            await callback.answer()
+            return
+
+        if action == digest_keyboards.SNOOZE:
+            await _redraw(message, commitment_id, digest_keyboards.term_rows(commitment_id))
+            await callback.answer()
+            return
+
+        if action == digest_keyboards.COLLAPSE:
+            await _fold(message, commitment_id)
+            await callback.answer()
+            return
+
+        now = datetime.now(UTC)
+        if action == digest_keyboards.UNDO:
+            # Возврат — единственное место, где состояние приходит снаружи:
+            # прежнее по данным уже не восстановить, и оно едет в кнопке.
+            # `return_target` прогоняется ещё раз, потому что значение съездило
+            # в Telegram и обратно, а «отложено» без срока прячет дело навсегда.
+            await digest.commitments.set_state(
+                commitment_id,
+                digest.commitments.return_target(CommitmentState(rest[0])),
+                now=now,
+            )
+            await _fold(message, commitment_id)
+            await callback.answer(RETURNED)
+            return
+
+        change = _deed_change(action, rest, now=now, timezone=settings.brain_timezone)
+        if change is None:
+            # Незнакомое нажатие — наша же ошибка в грамматике кнопок. Молча
+            # закрыть дело было бы хуже всего: владелец не просил.
+            logger.error("нажатие под делом с непонятным действием: %s", callback.data)
+            await callback.answer()
+            return
+
+        state, until = change
+        previous = await digest.commitments.set_state(commitment_id, state, now=now, until=until)
+        if previous is None:
+            await callback.answer(DEED_LOST)
+            return
+
+        await _redraw(message, commitment_id, _rows_after(commitment_id, state, previous))
+        await callback.answer(digest_keyboards.STATE_LABELS[state] + ".")
 
     @router.callback_query(F.data.startswith(f"{digest_keyboards.LOOP_PREFIX}:"))
     async def loop_button(callback: CallbackQuery) -> None:
@@ -445,16 +504,20 @@ def build_router(settings: Settings) -> Router:
     return router
 
 
-ALREADY_CLOSED = "Уже закрыто."
+RETURNED = "Вернул."
+DEED_LOST = "Не нашёл этого дела — возможно, запись переразметили."
 SETTLED = "Принял."
 LOOP_CREATED = "🔁 Завёл открытый вопрос. Буду возвращаться к нему."
 LOOP_NOT_FOUND = "Не нашёл открытого вопроса в этой записи — возможно, её переразметили."
+# Ответ повторяет глагол кнопки и остаётся безличным: «Закрыл» и «Убрал» —
+# это система отчитывается за владельца в прошедшем времени, ровно то, из-за
+# чего подписи и переписали.
 LOOP_ANSWERS = {
-    digest_keyboards.CLOSED: "🔁 Закрыл.",
-    digest_keyboards.IRRELEVANT: "🔁 Убрал как неактуальное.",
+    digest_keyboards.CLOSED: "🔁 Решено.",
+    digest_keyboards.IRRELEVANT: "🔁 Отпало.",
     digest_keyboards.THINKING: "🔁 Вернусь через две недели.",
     digest_keyboards.REPHRASE: (
-        "🔁 Закрыл. Запишите мысль заново, как она звучит сейчас — "
+        "🔁 Убрал этот вопрос. Запишите мысль заново, как она звучит сейчас — "
         "новая формулировка получит свой разбор."
     ),
 }
@@ -478,8 +541,87 @@ async def _answer_loop(action: str, loop_id: int) -> str:
     return LOOP_ANSWERS.get(action, "🔁 Готово.")
 
 
-def _closed_deed(state: CommitmentState) -> str:
-    return "✓ Закрыл." if state is CommitmentState.DONE else "✕ Убрал как неактуальное."
+# Во что переводит нажатие второго уровня. Словарём, а не цепочкой `if` с
+# «остальное — завершить»: у незнакомого действия не должно быть состояния
+# по умолчанию, и уж точно не «завершено».
+DEED_STATES = {
+    digest_keyboards.DONE: CommitmentState.DONE,
+    digest_keyboards.WORK: CommitmentState.IN_PROGRESS,
+    digest_keyboards.DROP: CommitmentState.DROPPED,
+}
+
+
+def _deed_change(
+    action: str, rest: list[str], *, now: datetime, timezone: str
+) -> tuple[CommitmentState, datetime | None] | None:
+    """Во что переводит нажатие и с каким сроком. `None` — нажатие непонятное.
+
+    Срок берётся отсюда, а не из ядра, по одной причине: он зависит от таймзоны
+    владельца, а её знает настройка бота. Сам расчёт — в ядре
+    (`digest.commitments.snooze_term`), потому что «До завтра» означает
+    «к завтрашней сводке», и это правило замысла, а не оформления.
+    """
+    if action == digest_keyboards.UNTIL and rest[0] in digest.commitments.TERMS:
+        return CommitmentState.SNOOZED, digest.commitments.snooze_term(
+            now, term=rest[0], timezone=timezone
+        )
+    state = DEED_STATES.get(action)
+    return None if state is None else (state, None)
+
+
+def _rows_after(
+    commitment_id: int, state: CommitmentState, previous: CommitmentState
+) -> list[list[InlineKeyboardButton]]:
+    """Что показать под делом после перехода.
+
+    Три состояния из четырёх убирают дело из сводки — после них действовать
+    больше не над чем, и подтверждение с отменой на своём месте.
+
+    `in_progress` **оставляет дело на месте**, и в этом вся разница: пометил
+    «в работе», через час сделал — а завершить нечем до завтрашней сводки,
+    потому что ряд свернулся в подтверждение. Поэтому выбор остаётся открытым.
+    Отмена там не нужна вовсе: дело видно в сводке, состояние видно значком,
+    и поменять его можно в любой момент теми же кнопками.
+    """
+    if state is CommitmentState.IN_PROGRESS:
+        return digest_keyboards.choice_rows(commitment_id)
+    return [
+        digest_keyboards.confirmed_row(
+            commitment_id, state, back_to=digest.commitments.return_target(previous)
+        )
+    ]
+
+
+async def _redraw(
+    message: Message | None, commitment_id: int, rows: list[list[InlineKeyboardButton]]
+) -> None:
+    """Перерисовать ряды одного дела в сообщении сводки.
+
+    Молча ничего не делает, если кнопок нет: сообщение может быть слишком
+    старым, чтобы Telegram прислал его целиком. Состояние дела к этому моменту
+    уже изменено — перерисовка косметическая, и ронять из-за неё нажатие
+    не за что.
+    """
+    if message is None or message.reply_markup is None:
+        return
+    with suppress(TelegramBadRequest):
+        await message.edit_reply_markup(
+            reply_markup=digest_keyboards.redraw(message.reply_markup, commitment_id, rows)
+        )
+
+
+async def _fold(message: Message | None, commitment_id: int) -> None:
+    """Свернуть дело обратно в номер — после «Назад» и после отмены.
+
+    Номер берётся из самой клавиатуры: порядок рядов совпадает с нумерацией
+    в тексте сводки, а текст мы после отправки не перечитываем.
+    """
+    if message is None or message.reply_markup is None:
+        return
+    number = digest_keyboards.deed_numbers(message.reply_markup).get(commitment_id)
+    if number is None:  # pragma: no cover — кнопка не из этой сводки
+        return
+    await _redraw(message, commitment_id, [digest_keyboards.deed_row(number, commitment_id)])
 
 
 def _answered(outcome: reminders.ScheduleOutcome) -> str:

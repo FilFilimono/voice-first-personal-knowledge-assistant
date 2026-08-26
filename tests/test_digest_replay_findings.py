@@ -24,7 +24,9 @@ from brain.storage.models.touch import TouchSlot
 
 pytestmark = pytest.mark.integration
 
-TIMEZONE = "Europe/Rome"
+# Таймзона записей задаётся прямо во вставке: сборке сводки она больше
+# не нужна — вчерашнее неразобранное из сводки убрано, а с ним и единственное
+# место, где день владельца влиял на её содержание.
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
 
 
@@ -112,14 +114,16 @@ async def test_unsorted_alone_is_not_a_reason_to_send_the_summary() -> None:
     """Дыра 2: сводка 17 августа состояла целиком из «Со вчера ждут разбора: 2».
 
     Сообщение, у которого всё содержание — указание на несделанное, нарушает
-    принцип 1 §7.0 ровно тем же, чем нарушал бы вечерний упрёк. Строка про
-    неразобранное — приписка, а не повод отправить.
+    принцип 1 §7.0 ровно тем же, чем нарушал бы вечерний упрёк. Тогда строка
+    про неразобранное осталась припиской, а не поводом отправить; позже она
+    ушла из сводки совсем (`digest/morning.py`), и утверждение от этого только
+    усилилось: спорная запись в базе есть, а сводка молчит.
     """
     await _disputed_entry("вчерашняя спорная", age=timedelta(days=1), key="c")
 
-    content = await morning.collect(NOW, TIMEZONE)
+    content = await morning.collect(NOW)
 
-    assert content.unsorted
+    assert await evening.disputed()
     assert not content.commitments
     assert content.loop is None
     assert content.empty
