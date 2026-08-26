@@ -128,3 +128,36 @@ def test_empty_thinking_level_means_not_set_at_all() -> None:
 
 def test_thinking_level_still_reaches_the_settings() -> None:
     assert Settings(_env_file=None, cleanup_thinking_level="low").cleanup_thinking_level == "low"
+
+
+def test_cleanup_defaults_match_the_measured_choice() -> None:
+    """Запуск **без `.env`** обязан поднимать чистку на выбранной модели.
+
+    Пока `.env` заполнен, дефолты не видно. Но новая машина, CI и чужая копия
+    берут именно их — а стоявшая здесь когда-то `gemini-3.7-flash` отдаёт
+    один-два токена в секунду и на настоящий запрос чистки не отвечает вовсе
+    (живые вызовы 25.08.2026). Хуже всего то, что проверка при старте сказала
+    бы «модель чистки доступна»: пробе хватает короткого ответа. Система
+    соврала бы о собственной исправности, а чистка молча висела бы в ретраях.
+
+    С 26.08.2026 здесь `gemini-3.6-flash`: сравнение дало 0.89 записей без
+    замечаний против 0.70 у `3.5-flash-lite`, имён она не трогает и слов
+    не выдумывает. Ожидание при этом оставлено прежним — оно решается своим
+    замером латентности, а не заодно со сменой модели.
+    """
+    settings = _settings()
+
+    assert settings.cleanup_model == "gemini-3.6-flash"
+    assert settings.cleanup_wait_sec == 15
+
+
+def test_titles_model_does_not_follow_the_cleanup_model() -> None:
+    """Названия снимаются отдельно от чистки, хотя сегодня модель у них одна.
+
+    Название лежит в базе и показывается месяцами, а вычищенный текст правится
+    следующим прогоном: модель, переписывающая имена, в названиях опаснее,
+    и убирать её оттуда надо, не трогая чистку.
+    """
+    assert Settings(_env_file=None, cleanup_model="gemini-3.5-flash-lite").titles_model == (
+        "gemini-3.6-flash"
+    )

@@ -65,6 +65,14 @@ reenrich *args:
 backfill-commitments *args:
     uv run python -m brain.maintenance backfill-commitments {{args}}
 
+# Названия открытым делам и петлям. Нужна живая модель, пачками по 25.
+# `--dry-run` первым: печатает, сколько названий нужно и во сколько запросов
+# это обойдётся. `--recompute` пересчитывает и уже проставленные — без него
+# смена TITLES_MODEL оставила бы старые названия навсегда. `--limit` делит
+# прогон на части: суточный лимит бесплатного тира — 20 запросов на модель.
+backfill-titles *args:
+    uv run python -m brain.maintenance backfill-titles {{args}}
+
 # Прогон eval классификации: accuracy, матрица ошибок, доля ошибок среди
 # «уверен». Разметку набора делает владелец — иначе меряем модель моделью.
 eval-classification *args:

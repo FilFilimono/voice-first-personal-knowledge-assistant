@@ -155,6 +155,64 @@ def test_stretched_interjection_is_not_a_name() -> None:
     assert report.ok
 
 
+def test_latin_mumbling_is_not_a_lost_name() -> None:
+    """Мычание, записанное латиницей, — не имя, а то, ради чего чистка заведена.
+
+    Форма наблюдена на живом архиве (прогон 25.08.2026, 70 записей): расшифровка
+    пишет паузу владельца латинскими буквами, чистка её убирает — и признак
+    «латиница = имя собственное» объявлял это потерянным именем. Три замечания
+    из восемнадцати были такими.
+
+    Сама фраза придумана по форме: живой речи владельца в репозитории нет
+    (ADR-0002, дополнение от 19 августа).
+    """
+    report = checks.compare("надо eh посмотреть фильм", "Надо посмотреть фильм.")
+
+    assert report.lost_names == []
+    assert report.ok
+
+
+def test_single_latin_letter_from_markup_is_not_a_lost_name() -> None:
+    """Обломки разметки («</i>») расшифровка приносит в текст, а чистка убирает.
+
+    Одиночная латинская буква — это либо мычание, либо мусор разметки; именем
+    собственным она не бывает ни разу на семидесяти записях.
+    """
+    report = checks.compare("первая мысль </i>  <i> вторая мысль", "Первая мысль, вторая мысль.")
+
+    assert report.lost_names == []
+    assert report.ok
+
+
+def test_latin_letter_glued_to_a_number_is_not_a_name_but_the_number_still_counts() -> None:
+    """«5x» — это множитель, а не имя; потерянная при этом пятёрка — настоящая потеря.
+
+    Обе стороны в одном тесте нарочно: послабление на латиницу не должно
+    заодно погасить проверку чисел, а она — единственное, что здесь ловится.
+    """
+    report = checks.compare("взять 5x по 50 евро", "Взять 50 евро.")
+
+    assert report.lost_names == []
+    assert report.lost_numbers == ["5"]
+    assert not report.ok
+
+
+def test_capital_latin_abbreviation_stays_a_name() -> None:
+    """Короткая аббревиатура заглавными — имя: так её и пишет расшифровка."""
+    report = checks.compare("завтра CV чек", "Завтра чек.")
+
+    assert report.lost_names == ["CV"]
+    assert not report.ok
+
+
+def test_lower_case_latin_word_stays_a_name() -> None:
+    """Латинское слово от трёх букв — имя, даже со строчной: «rag», «clot», «connection»."""
+    report = checks.compare("надо написать rag для него", "Надо написать для него.")
+
+    assert report.lost_names == ["rag"]
+    assert not report.ok
+
+
 def test_name_survives_in_lower_case() -> None:
     """Имя на месте, но с маленькой буквы — потери смысла нет, замечания тоже."""
     report = checks.compare("поговорить с Мариной", "поговорить с мариной")
@@ -177,11 +235,75 @@ def test_dropped_number_is_reported_in_its_original_form() -> None:
     assert report.lost_numbers == ["19:40"]
 
 
+def test_bare_digit_swallowed_between_numbers_is_still_caught() -> None:
+    """Главная обратная сторона: одинокая цифра рядом с числами — настоящая потеря.
+
+    Форма наблюдена на живом архиве (прогон 25.08.2026, запись 68): в перечислении
+    через запятую чистка проглотила отдельно стоящую цифру, и замер это поймал.
+    Ослабляя проверки на имена и отрицания, погасить **это** нельзя — иначе замер
+    перестанет отличать законную чистку от порчи текста.
+    """
+    report = checks.compare("в списке 12 3, 14, возможно, 15", "В списке 12, 14, возможно, 15.")
+
+    assert report.lost_numbers == ["3"]
+    assert not report.ok
+
+
+def test_name_that_changed_form_is_still_caught() -> None:
+    """Имя не пропало, а изменило форму, — для замера это потеря, и так и надо.
+
+    Форма наблюдена на живом архиве (прогон 25.08.2026, запись 7): чистка
+    переписала имя в другом падеже вместе с соседним словом. Смысл угадан верно,
+    но лексику трогать ей не велено, и замечание здесь законное.
+    """
+    report = checks.compare("надо разобрать Марины чек", "Надо разобрать Маринин чек.")
+
+    assert report.lost_names == ["Марины"]
+    assert not report.ok
+
+
 def test_invented_number_is_a_new_word() -> None:
     """Число, которого не было, ловится как выдумка — отдельного поля для него нет."""
     report = checks.compare("напомни вечером", "Напомни в 19:00.")
 
     assert "19:00" in report.new_words
+    assert not report.ok
+
+
+def test_repeated_negation_is_not_a_loss() -> None:
+    """«не не забывать» → «не забывать» — снят самоповтор, отрицание на месте.
+
+    Форма наблюдена на живом архиве (прогон 25.08.2026): отрицания считались
+    числом вхождений, и снятый самоповтор читался как «было 2, стало 1».
+    Это ровно то, ради чего чистка заведена.
+    """
+    report = checks.compare("надо не не забывать про это", "Надо не забывать про это.")
+
+    assert report.lost_negations == 0
+    assert report.ok
+
+
+def test_negation_repeated_through_a_filler_is_not_a_loss() -> None:
+    """Тот же самоповтор, но с паразитом посередине: «не, ну, не» → «не».
+
+    Слово между повторами — из тех, что чистке убирать велено промптом,
+    поэтому повтор остаётся повтором, а не двумя разными отрицаниями.
+    """
+    report = checks.compare("нужно не, ну, не забывать про это", "Нужно не забывать про это.")
+
+    assert report.lost_negations == 0
+    assert report.ok
+
+
+def test_one_of_two_separate_negations_is_still_caught() -> None:
+    """Обратная сторона послабления: два разных «не» — это два отрицания.
+
+    Между ними стоит смысловое слово, а не паразит, — значит, слиться
+    в самоповтор они не могут, и пропажа второго обязана остаться замечанием.
+    """
+    report = checks.compare("решил не ехать и не звонить", "Решил не ехать и звонить.")
+
+    assert report.lost_negations == 1
     assert not report.ok
 
 

@@ -29,11 +29,13 @@ from sqlalchemy import func, select
 import brain.core.quota as quota
 from brain.config import get_runtime_settings, get_settings
 from brain.core import enrich as enrichment
+from brain.core import llm, present
 from brain.core.digest import commitments
 from brain.core.enrich import repository as enrich_repository
 from brain.core.llm.gemini import CHEAP
 from brain.core.memory.repository import working_text
 from brain.core.memory.unit_of_work import capture_transaction
+from brain.core.ports import LanguageModel
 from brain.core.retrieval import repository as retrieval_repository
 from brain.core.retrieval.gemini import EMBEDDING
 from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
@@ -293,6 +295,59 @@ async def reenrich_stale(*, dry_run: bool) -> int:
     return len(batches)
 
 
+async def backfill_titles(
+    *, model: LanguageModel, dry_run: bool, recompute: bool, limit: int | None
+) -> int:
+    """Назвать дела и петли, которые заведены до Задачи 4 или названы старой моделью.
+
+    Считается **по данным** (`title IS NULL` у открытых), а не по журналу
+    очереди, — так же и по той же причине, что у соседних команд.
+
+    **`--recompute` — не удобство, а условие, при котором задачу вообще можно
+    было делать.** Команда, умеющая только заполнять пустое, закрепляет в базе
+    результат первой попавшейся модели: смена `TITLES_MODEL` или улучшение
+    чистки не тронули бы старые названия никогда. Ровно из-за этого Задачу 4
+    и откладывали.
+
+    **`--limit` нужен потому, что лимит бесплатного тира — 20 запросов в сутки
+    на модель.** Владелец раскладывает прогон на части и видит цену до того,
+    как её платит: `--dry-run` печатает, сколько запросов уйдёт и сколько
+    их сегодня уже потрачено.
+
+    Модель приходит снаружи, а не строится здесь: её выбирает `main()` —
+    и она же подставляется тестами, которым живой провайдер недоступен
+    и не нужен.
+    """
+    targets = await present.titles.pending(recompute=recompute, limit=limit)
+
+    if not targets:
+        print("Названия есть у всех открытых дел и петель.")
+        return 0
+
+    deeds = [target for target in targets if target.kind == present.titles.COMMITMENT]
+    loops = [target for target in targets if target.kind == present.titles.LOOP]
+    print(f"Без названия: дел {len(deeds)}, петель {len(loops)}")
+    if recompute:
+        print("  --recompute: названия будут пересчитаны, включая уже проставленные.")
+
+    # Пачки считаются по видам порознь: дело № 5 и петля № 5 — разные строки,
+    # и в одном конверте их номера значили бы разное (см. `present/titles`).
+    batch = present.titles.BATCH_LIMIT
+    planned = present.titles.requests_for(len(deeds), batch_limit=batch)
+    planned += present.titles.requests_for(len(loops), batch_limit=batch)
+    await _report_cost(planned, tier=CHEAP, limit=get_settings().enrich_daily_quota)
+
+    if dry_run:
+        print("\nЭто прогон вхолостую: ничего не записано. Уберите --dry-run.")
+        return 0
+
+    named = await present.titles.name(model, targets)
+    print(f"\nНазваний проставлено: {named} из {len(targets)}.")
+    if named < len(targets):
+        print("  Остальные показываются прежним отрезком — модель или гвард их не приняли.")
+    return named
+
+
 async def _report_cost(planned: int, *, tier: str, limit: int | None) -> None:
     """Сказать, во сколько запросов обойдётся команда и хватит ли остатка.
 
@@ -369,6 +424,27 @@ async def main() -> None:
         help="показать, что было бы сделано, и ничего не менять",
     )
 
+    titles_command = commands.add_parser(
+        "backfill-titles",
+        help="назвать открытые дела и петли, у которых названия нет",
+    )
+    titles_command.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показать, что было бы сделано, и ничего не менять",
+    )
+    titles_command.add_argument(
+        "--recompute",
+        action="store_true",
+        help="пересчитать и уже проставленные названия — после смены модели",
+    )
+    titles_command.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="сколько дел взять за прогон: суточный лимит модели — 20 запросов",
+    )
+
     arguments = parser.parse_args()
     get_runtime_settings()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -385,6 +461,16 @@ async def main() -> None:
                 await reenrich(dry_run=arguments.dry_run)
         elif arguments.command == "backfill-commitments":
             await backfill_commitments(dry_run=arguments.dry_run)
+        elif arguments.command == "backfill-titles":
+            # Модель строится здесь, а не внутри команды: команда получает её
+            # готовой и потому проверяется без живого провайдера.
+            settings = get_settings()
+            await backfill_titles(
+                model=llm.build_model(settings, model=settings.titles_model),
+                dry_run=arguments.dry_run,
+                recompute=arguments.recompute,
+                limit=arguments.limit,
+            )
     finally:
         await dispose_engine()
 

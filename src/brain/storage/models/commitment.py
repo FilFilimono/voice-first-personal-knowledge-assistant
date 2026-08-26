@@ -84,6 +84,16 @@ class Commitment(Base):
     span_start: Mapped[int] = mapped_column(Integer, nullable=False)
     span_end: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # Как дело называется по-русски (ADR-0015, п. 4). Пишет модель, проверяет
+    # гвард, показывает сводка.
+    #
+    # **Nullable, и это часть замысла, а не недоделка.** Пусто означает
+    # «названия нет», и тогда показывается прежний отрезок: отказ модели, отказ
+    # гварда и пустой ответ — все три обязаны деградировать в обрезок, а не
+    # прятать дело из сводки. Поэтому же названия нет у закрытых дел: их никто
+    # не читает, и платить за них запросом не за что.
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     state: Mapped[CommitmentState] = mapped_column(
         Enum(
             CommitmentState,

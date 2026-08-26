@@ -114,6 +114,9 @@ async def _annotate(entry_id: int, notifier: FakeNotifier) -> None:
     await jobs.enrich(
         entry_id=entry_id,
         model=model,
+        # Модель названий отдельная и здесь ничего не называет: разметка типа
+        # `loop` дел не заводит, а петля появится только от нажатия кнопки.
+        titler=ScriptedModel([{}]),
         embedder=StubEmbedder(),
         notifier=notifier,
         limit=25,

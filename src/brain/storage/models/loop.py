@@ -64,6 +64,12 @@ class Loop(Base):
     # Текст петли снимком — как у дела, и по той же причине.
     question: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Как вопрос звучит одной строкой (ADR-0015, п. 4). Nullable по той же
+    # причине, что у дела: пусто — показывается прежний вопрос, обрезанный
+    # по счётчику. Петля в сводке одна, и без названия она читается как кусок
+    # речи посреди сообщения — но кусок речи лучше, чем пропавший вопрос.
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     status: Mapped[LoopStatus] = mapped_column(
         Enum(LoopStatus, name="loop_status", values_callable=lambda e: [m.value for m in e]),
         nullable=False,

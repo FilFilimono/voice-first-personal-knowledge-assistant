@@ -25,6 +25,12 @@ from brain.core.enrich.reply import NAMES
 
 # Сколько символов записи показывать в списке. Больше — и сводка перестаёт
 # читаться за сорок секунд, меньше — и по обрывку не узнать, о чём речь.
+#
+# С Задачи 4 это **запасной путь**, а не основной: у дела и петли есть
+# написанное название (ADR-0015, п. 4), и обрезок показывается, только когда
+# названия нет — модель не ответила, ответила не тем или её ответ отверг гвард.
+# Удалять его нельзя никогда, ровно как сухой рендер сводки: он и есть
+# та мягкая деградация, которой куплена недетерминированность.
 SNIPPET = 70
 
 # Возраст петли, после которого `vision.md` §6 велит читать его как перегрузку,
@@ -52,7 +58,7 @@ def morning(content: Morning) -> str:
         # Номер — единственный способ связать кнопку с делом, не обрезая
         # его до неузнаваемости.
         lines += [
-            f"{number}. {snippet(item.text)}"
+            f"{number}. {snippet(item.title or item.text)}"
             for number, item in enumerate(content.commitments, start=1)
         ]
         hidden = content.open_commitments - len(content.commitments)
@@ -62,7 +68,7 @@ def morning(content: Morning) -> str:
     if content.loop is not None:
         lines += [
             "",
-            f"🔁 Ты хотел разобраться: {snippet(content.loop.question)}",
+            f"🔁 Ты хотел разобраться: {snippet(content.loop.title or content.loop.question)}",
             _asking(content),
         ]
 

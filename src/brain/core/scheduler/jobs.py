@@ -534,6 +534,7 @@ async def enrich(
     *,
     entry_id: int,
     model: LanguageModel,
+    titler: LanguageModel,
     embedder: Embedder,
     notifier: Notifier,
     limit: int,
@@ -549,6 +550,11 @@ async def enrich(
     Без этой ветки `just reenrich --stale` ставил задания, которым нечего было
     делать: обычная выборка берёт неразмеченное, а перепрогон нужен как раз
     для размеченного (найдено разбором очереди 20 августа 2026).
+
+    `titler` — **вторая модель, а не та же**: разметка и названия выбираются
+    порознь (`TITLES_MODEL`, ADR-0015). Он обязателен в подписи намеренно: имей
+    он умолчание, забытая проводка выглядела бы работающей — тот самый почерк,
+    которым в проекте уже терялась `loops.is_stuck`.
     """
     outcome = await enrichment.annotate_pending(model, embedder, limit=limit, entry_ids=entry_ids)
     if outcome.annotated == 0:
@@ -556,7 +562,34 @@ async def enrich(
         return 0
 
     await _show_annotations(notifier, outcome.entry_ids)
+    await _name_fresh(titler)
     return int(outcome.annotated)
+
+
+async def _name_fresh(titler: LanguageModel) -> None:
+    """Назвать дела и петли, у которых названия ещё нет.
+
+    **Пачка ограничена одним вызовом.** Без потолка первое же задание разметки
+    после включения этой задачи утащило бы в модель весь накопленный архив —
+    три запроса из двадцати суточных за раз, и это при живом темпе. Старое
+    разгребается командой `just backfill-titles`, где владелец видит цену
+    в запросах до того, как её платит.
+
+    **Отказ названий не роняет разметку.** Исключение отсюда ушло бы наверх,
+    задание разметки попало бы в ретраи — и разметило бы пачку второй раз,
+    то есть заплатило бы двумя вызовами за уже сделанную работу. Названия
+    дешевле потерять: их доставит следующая запись или команда.
+
+    Под квотой названия молчат первыми, как чистка: `vision.md` §7 и ADR-0015,
+    п. 6 — косметика отключается раньше расшифровки, напоминаний и разметки.
+    """
+    if not await present.cosmetic_allowed(datetime.now(UTC)):
+        return
+
+    try:
+        await present.titles.name_open(titler, limit=present.titles.BATCH_LIMIT)
+    except Exception:
+        logger.exception("названия не проставлены — дела покажутся отрезком")
 
 
 async def _show_annotations(notifier: Notifier, entry_ids: list[int]) -> None:

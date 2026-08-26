@@ -198,6 +198,18 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
         model=settings.cleanup_model,
         thinking_level=settings.cleanup_thinking_level,
     )
+    # Модель названий — тоже своя. Сегодня в `TITLES_MODEL` и `CLEANUP_MODEL`
+    # стоит одно и то же имя, но снимать их надо порознь: вычищенный текст
+    # правится следующим прогоном, а название лежит в базе и показывается
+    # месяцами (ADR-0015, п. 4).
+    #
+    # Пробы при старте у неё нет, в отличие от трёх остальных: бесплатный тир
+    # даёт 20 запросов в сутки на модель, а воркер в разработке
+    # перезапускается по десятку раз в день — проба съедала бы половину
+    # дневного бюджета названий ради строки в логе. Неверное имя видно первой
+    # же разметкой, и разметку оно не роняет: `jobs._name_fresh` глотает отказ
+    # названий нарочно.
+    namer = llm.build_model(settings, model=settings.titles_model)
 
     # Проверка моделей — до того, как воркер возьмёт первое задание. Иначе
     # неверное имя выясняется на первом голосовом, пятью попытками подряд
@@ -323,6 +335,7 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
             entry_id=payload.get("entry_id", 0),
             entry_ids=payload.get("entry_ids"),
             model=model,
+            titler=namer,
             embedder=embedder,
             notifier=notifier,
             limit=settings.enrich_batch_limit,
