@@ -57,14 +57,9 @@ logger = logging.getLogger(__name__)
 # при этом **не досылается никогда**: привычка наступает снова, в свой срок.
 LATE = timedelta(hours=6)
 
-# Час, в который спрашивать, если время суток в записи не названо. Девять —
-# тот же якорь дня, что у утренней сводки (`vision.md` §7.0, принцип 4):
-# у дня должна быть одна предсказуемая точка, а не две.
-#
-# Умолчание здесь законно, в отличие от ритма: час решает, **когда в течение
-# дня**, и ошибка в нём сдвигает сообщение. Ритм же решает, **будет ли
-# сообщение вообще**, и потому не угадывается никогда (`recurrence.hour_of`).
-DEFAULT_HOUR = 9
+# Час, в который спрашивать, если время суток в записи не названо.
+# Значение и объяснение — `config.habit_hour`; здесь константы больше нет,
+# чтобы час не оказался записан в двух местах и не разошёлся молча.
 
 
 async def create(
@@ -179,7 +174,7 @@ async def proposal(entry_id: int) -> Proposal | None:
         unit_id=int(unit_id),
         text=recurrence.clause(unit),
         rhythm=recurrence.parse(unit),
-        hour=recurrence.hour_of(unit, DEFAULT_HOUR),
+        hour=recurrence.hour_of(unit, get_settings().habit_hour),
     )
 
 

@@ -65,6 +65,7 @@ class FakeNotifier:
         # и «сделать приватной». Четвёртое поле — предлагали ли завести петлю.
         self.annotated: list[tuple[int, int, str, int]] = []
         self.loop_offers: list[int] = []
+        self.habit_offers: list[int] = []
         # Касания Фазы 4. Разделены по способу отправки, а не свалены в `sent`:
         # «пришло беззвучно» и «пришло с кнопками» — разные утверждения,
         # и тесты обязаны уметь их различать.
@@ -91,10 +92,17 @@ class FakeNotifier:
         *,
         entry_id: int,
         offer_loop: bool = False,
+        offer_habit: bool = False,
     ) -> None:
         self.annotated.append((chat_id, message_id, text, entry_id))
         if offer_loop:
             self.loop_offers.append(entry_id)
+        # Предложение привычки видно заглушке с 01.09.2026: до переноса признак
+        # считался внутри `TelegramNotifier`, и путевой тест был вынужден
+        # поднимать настоящий адаптер поверх поддельной сессии, чтобы увидеть
+        # кнопку. Признак приезжает готовым — значит и проверяется здесь.
+        if offer_habit:
+            self.habit_offers.append(entry_id)
 
     async def send_morning(
         self,

@@ -10,7 +10,6 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from brain.adapters.telegram import digest_keyboards
-from brain.core.digest import habits
 from brain.storage.models.annotation import AnnotationType
 
 logger = logging.getLogger(__name__)
@@ -154,6 +153,7 @@ class TelegramNotifier:
         *,
         entry_id: int,
         offer_loop: bool = False,
+        offer_habit: bool = False,
     ) -> None:
         """Дописать разметку к подтверждению приёма и повесить кнопки.
 
@@ -162,14 +162,13 @@ class TelegramNotifier:
         в Telegram уведомления не шлёт, так что появление разметки владельца
         не дёргает.
 
-        **Про привычку спрашивает ядро, а не вызывающий код** — в отличие
-        от петли, чей признак приезжает готовым. Причина в том, что признаков
-        два, а не один: разметка нашла привычку **и** по этой записи её ещё
-        не завели. Второе знает только `digest.habits`, и посчитанное здесь
-        оно разошлось бы с тем, что делает нажатие: кнопка живёт в переписке
-        вечно, а нажатая второй раз обязана не завести второе ежедневное
-        сообщение. Инвариант 1 цел — адаптер идёт в базу через сервис ядра,
-        а не сам.
+        **Оба признака приезжают готовыми и здесь не считаются.** Первая
+        редакция 01.09.2026 спрашивала про привычку прямо отсюда, вызовом
+        `digest.habits.proposal`. Инвариант 1 при этом формально не нарушался
+        — адаптер шёл в базу через сервис ядра, — но место было неверное:
+        «когда предлагать» решает замысел, а не оформление, и второй
+        отправитель однажды решил бы иначе. Признак перенесён в `jobs.py`,
+        рядом с `offer_loop`.
         """
         await self._edit(
             chat_id,
@@ -178,7 +177,7 @@ class TelegramNotifier:
             markup=annotation_keyboard(
                 entry_id,
                 offer_loop=offer_loop,
-                offer_habit=await habits.proposal(entry_id) is not None,
+                offer_habit=offer_habit,
             ),
         )
 
