@@ -46,6 +46,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.commitment import CommitmentState
+from brain.storage.models.habit import Rhythm
 
 # Дела: `deed:done:17`, `deed:until:week:17`, `deed:undo:in_progress:17`.
 DEED_PREFIX = "deed"
@@ -73,6 +74,13 @@ OK = "ok"
 WRONG = "wrong"
 SET = "set"
 
+# Привычки: `habit:new:17` — заведение по кнопке под разбором,
+# `habit:daily:17` — выбранный ритм, `habit:other:17` — второй ряд ритмов.
+# Число всегда номер **записи**, а не привычки: привычки в этот момент ещё
+# нет, а кнопка живёт в переписке вечно и должна работать и через месяц.
+HABIT_PREFIX = "habit"
+OTHER = "other"
+
 
 def deed_data(action: str, commitment_id: int) -> str:
     return f"{DEED_PREFIX}:{action}:{commitment_id}"
@@ -84,6 +92,60 @@ def loop_data(action: str, loop_id: int) -> str:
 
 def evening_data(action: str, entry_id: int) -> str:
     return f"{EVENING_PREFIX}:{action}:{entry_id}"
+
+
+def habit_data(action: str, entry_id: int) -> str:
+    return f"{HABIT_PREFIX}:{action}:{entry_id}"
+
+
+# Ритмы кнопками — ровно те, что названы в `vision.md` §5.11: каждый день ·
+# через день · только по будням · свой вариант. Первые три в ряд, четвёртый
+# разворачивает второй ряд.
+#
+# **Умолчания в этом списке нет намеренно.** Ни одна кнопка не подсвечена
+# и ни одна не срабатывает сама: угаданный ритм — это ежедневное сообщение,
+# выбранное за владельца, и ошибка в нём обнаружится не разговором,
+# а раздражением (§5.11).
+#
+# «Свой вариант» **не открывает поле ввода**, а разворачивает второй ряд, и это
+# то же решение, что у «Изменить формулировку» у петли: в этой системе способ
+# что-то сказать — записать это, а строка, введённая в ответ на кнопку,
+# не получила бы ни разметки, ни разбора и осела бы в чужой таблице. Ритмы
+# второго ряда покрывают всё, что система умеет разбирать, кроме названных
+# дней недели («по понедельникам и четвергам») — те приходят только из слов
+# записи, потому что кнопкой их пришлось бы собирать из семи нажатий.
+RHYTHM_LABELS: tuple[tuple[Rhythm, str], ...] = (
+    (Rhythm.DAILY, "Каждый день"),
+    (Rhythm.EVERY_OTHER_DAY, "Через день"),
+    (Rhythm.WEEKDAYS, "По будням"),
+)
+OTHER_RHYTHM_LABELS: tuple[tuple[Rhythm, str], ...] = (
+    (Rhythm.WEEKENDS, "По выходным"),
+    (Rhythm.TIMES_PER_WEEK, "Раз в неделю"),
+)
+OTHER_LABEL = "Свой вариант"
+
+
+def rhythm_keyboard(entry_id: int, *, other: bool = False) -> InlineKeyboardMarkup:
+    """Чем спрашивают ритм, когда в записи его нет.
+
+    Спрашивают, а не угадывают, — `vision.md` §5.11. Вопрос задаётся правкой
+    того же сообщения, под которым нажали «Привычка»: одна запись стоит одного
+    уведомления, и подтверждение ритма — часть того же разбора, а не второе
+    сообщение.
+    """
+    labels = OTHER_RHYTHM_LABELS if other else RHYTHM_LABELS
+    rows = [
+        [
+            InlineKeyboardButton(text=label, callback_data=habit_data(rhythm.value, entry_id))
+            for rhythm, label in labels
+        ]
+    ]
+    if not other:
+        rows.append(
+            [InlineKeyboardButton(text=OTHER_LABEL, callback_data=habit_data(OTHER, entry_id))]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # Подписи утверждены владельцем и меняются только им. Правило, по которому

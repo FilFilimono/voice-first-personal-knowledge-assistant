@@ -57,6 +57,12 @@ MORNING = datetime(2026, 8, 20, 7, 30, tzinfo=UTC)
 LIVE_ENTRY = 53
 SECOND_DEED = "Фильм, да,"
 
+# Живая запись, на которой вскрылась обрезка предпросмотра: 249 символов,
+# и слово, из которого модель собрала название, стоит на 146-м. Взята именно
+# она, а не «строка подлиннее» из головы, — обрезка ловится длиной настоящей
+# записи, а не выдуманной.
+LONG_ENTRY = 76
+
 # Название, которое модель могла бы написать по второму делу этой записи.
 FILM_TITLE = "Досмотреть фильм"
 
@@ -737,3 +743,83 @@ async def test_preview_shows_the_deed_the_model_skipped(
     shown = capsys.readouterr().out
     assert shown.count("было:  ") == 2
     assert "модель не ответила" in shown
+
+
+def test_prompt_prefers_the_record_but_does_not_obey_it_blindly() -> None:
+    """Три претензии владельца к первому живому предпросмотру, 27.08.2026.
+
+    Первая редакция промпта держала два правила разом — «название состоит
+    из слов записи» и «глагол в инфинитиве», — и они конфликтуют. Где в записи
+    нет инфинитива, модель обязана нарушить одно из двух, и оба нарушения
+    вышли негодными: «Решить проблему бота» дописала действие, которого владелец
+    не называл, а «Подразобрать техники» взяла разговорную форму дословно,
+    потому что заменять слово записи было запрещено.
+
+    Развязка — предпочтением вместо запрета, и три случая названы поимённо.
+    Проверяется текст промпта, а не ответ модели: качество названий меряет
+    живой прогон, и его делает владелец.
+    """
+    body = titles.PROMPT.lower()
+
+    # Разговорная форма уступает литературной — с примером, а не общим словом:
+    # «пиши грамотно» модель читает как пожелание (замер 19.08.2026 на разметке).
+    assert "подразобрать" in body
+
+    # Констатация не превращается в действие выдумыванием глагола.
+    assert "не выдумывай глагол" in body
+
+    # Пустой ответ — допустимый, а не поломка: отрезок честнее пустого названия.
+    assert "верни пустую строку" in body
+
+    # Порядок тот же, что в чистке: правило раньше списка, иначе оно читается
+    # как оговорка к нему.
+    assert body.index("главное правило") < body.index("подразобрать")
+
+
+@pytest.mark.integration
+async def test_preview_shows_the_whole_span_not_its_first_hundred_characters(
+    migrated_database: str,
+    archive: list[archive_module.Entry],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Предпросмотр сверяет название с источником — обрезка отнимала у него смысл.
+
+    27.08.2026: модель назвала дело словом со 146-го символа записи, а строка
+    «было:» показывала первые сто. Владелец не смог отличить слово записи
+    от выдумки модели и решил, что гвард пропустил выдумку. Гвард отработал
+    верно — врал предпросмотр, то есть ровно тот инструмент, который заведён,
+    чтобы смотреть глазами до записи в базу.
+    """
+    text = archive_module.entry(archive, LONG_ENTRY).text
+    entry_id = await _live_entry(migrated_database, archive, LONG_ENTRY)
+    await _whole_entry_deed(migrated_database, entry_id, text)
+
+    await maintenance.backfill_titles(
+        model=Titler(FILM_TITLE), dry_run=False, recompute=False, limit=None, preview=1
+    )
+
+    shown = capsys.readouterr().out
+    was = next(line for line in shown.splitlines() if line.startswith("было:"))
+    # Переводы строк по-прежнему склеиваются: без этого пара «было/стало»
+    # развалилась бы посреди сравнения. Обрезки нет.
+    assert re.sub(r"\s+", " ", text).strip() in was
+    assert "…" not in was
+
+
+async def _whole_entry_deed(url: str, entry_id: int, text: str) -> None:
+    """Дело длиной в целую запись: короткий отрезок обрезку не поймал бы."""
+    engine = create_async_engine(url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Commitment).values(
+                    source_entry_id=entry_id,
+                    source_unit_id=None,
+                    text=text,
+                    span_start=0,
+                    span_end=len(text),
+                    state="open",
+                )
+            )
+    finally:
+        await engine.dispose()

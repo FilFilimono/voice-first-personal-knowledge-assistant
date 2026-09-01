@@ -38,15 +38,16 @@ from brain.adapters.telegram.notifier import (
     yes_no_keyboard,
 )
 from brain.config import Settings
-from brain.core import digest, enrich, ingest
+from brain.core import digest, enrich, ingest, llm
 from brain.core import status as core_status
 from brain.core.llm import limits
 from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.retrieval import search
-from brain.core.scheduler import reminders
+from brain.core.scheduler import recurrence, reminders
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.commitment import CommitmentState
+from brain.storage.models.habit import Rhythm
 from brain.storage.models.loop import LoopStatus
 from brain.storage.models.override import OverrideAction
 
@@ -64,6 +65,14 @@ PRIVATE_VOICE_REFUSED = (
 )
 SEARCH_FAILED = "Поиск не отработал — посмотрите логи. Записи целы."
 
+# Тексты среза по темам. Молчание здесь — обычный исход: тем меньше двух
+# означает, что срезом это не назовёшь (`core/digest/by_topic`).
+NO_TOPICS = (
+    "Пока не из чего собрать срез: тем за последние дни меньше двух.\n"
+    "Это не поломка — темы появляются из разметки, когда материал разнообразнее."
+)
+NO_SUCH_TOPIC = "Не нашёл, что вспомнить по теме «{topic}».\n\nЗа последние дни были: {known}."
+
 # Сколько результатов показывать. Пять — потому что recall меряется на пяти
 # (ADR-0006), и показывать больше, чем меряешь, значит не знать цену выдачи.
 RESULTS = 5
@@ -72,6 +81,7 @@ HELP = (
     "Пишите или наговаривайте — сохраню.\n"
     "Скажите «напомни завтра в 10 …» — напомню.\n\n"
     "/find <что искать> — поиск по архиву\n"
+    "/recall — о чём вы думали за неделю; /recall <тема> — вспомнить подробно\n"
     "/status — всё ли работает\n"
     "/private on — приватный режим: записи не уходят наружу, голосовые "
     "не принимаются\n"
@@ -177,6 +187,44 @@ def build_router(settings: Settings) -> Router:
             return
 
         await message.answer(search_text.render(query, found, today=datetime.now(UTC)))
+
+    @router.message(Command("recall"))
+    async def recall(message: Message, command: CommandObject) -> None:
+        """Срез по темам, а по названной теме — одна запись.
+
+        Две команды в одной намеренно. Без темы это вопрос «о чём я думал»,
+        с темой — «покажи». Разделять их на `/topics` и `/recall` значило бы
+        просить владельца помнить две команды ради одного разговора.
+
+        **Конкретная запись выдаётся только на спрос** (`vision.md` §5.4):
+        срез называет темы и приглашает, а достаёт запись уже вторая команда.
+        Тем и отличается от всплывания старого, которое приходит само и без
+        повода.
+        """
+        now = datetime.now(UTC)
+        days = settings.topics_period_days
+        # Модель строится всегда, а зовётся только при `RECALL_WRITTEN=true`:
+        # `build_model` в сеть не ходит, а ветвление здесь стоило бы `None`
+        # в двух местах ниже. Так же собран воркер.
+        writer = llm.build_model(settings, model=settings.digest_model)
+
+        topic = (command.args or "").strip()
+        if not topic:
+            found = await digest.by_topic.collect(now, days=days)
+            if found is None:
+                await message.answer(NO_TOPICS)
+                return
+            await message.answer(await digest.by_topic.text(writer, found, days=days, now=now))
+            return
+
+        remembered = await digest.by_topic.pick(topic, now)
+        if remembered is None:
+            known = await digest.by_topic.names(now, days=days)
+            listed = ", ".join(known) if known else "пока никаких"
+            await message.answer(NO_SUCH_TOPIC.format(topic=topic, known=listed))
+            return
+
+        await message.answer(digest.render.resurfaced(remembered, timezone=settings.brain_timezone))
 
     @router.message(F.voice)
     async def voice(message: Message) -> None:
@@ -473,6 +521,57 @@ def build_router(settings: Settings) -> Router:
 
         await callback.answer(await _answer_loop(action, identifier))
 
+    @router.callback_query(F.data.startswith(f"{digest_keyboards.HABIT_PREFIX}:"))
+    async def habit_button(callback: CallbackQuery) -> None:
+        """Кнопки привычки под разбором: заведение и выбор ритма.
+
+        Три нажатия, и все три про одну запись — номер в `callback_data` всегда
+        её, а не привычки: привычки в этот момент может ещё не быть.
+
+            habit:new:17      «Привычка» — завести, если ритм понятен из слов
+            habit:other:17    «Свой вариант» — развернуть второй ряд ритмов
+            habit:daily:17    выбранный ритм
+
+        **Ритм спрашивается, а не угадывается** (`vision.md` §5.11): разобранный
+        из слов записи ритм заводит привычку сразу, а неразобранный превращает
+        кнопки в вопрос. Умолчания нет намеренно — угаданный ритм это ежедневное
+        сообщение, выбранное за владельца.
+        """
+        if callback.data is None:  # pragma: no cover — фильтр выше
+            return
+
+        _, action, raw_id = callback.data.split(":", maxsplit=2)
+        entry_id = int(raw_id)
+        message = callback.message if isinstance(callback.message, Message) else None
+
+        offered = await digest.habits.proposal(entry_id)
+        if offered is None:
+            # Привычку либо уже завели этой же кнопкой, либо запись переразметили
+            # между показом и нажатием: кнопка живёт в переписке вечно,
+            # а разметка — нет.
+            await callback.answer(HABIT_NOT_FOUND, show_alert=True)
+            return
+
+        if action == digest_keyboards.OTHER:
+            await _ask_rhythm(message, entry_id, other=True)
+            await callback.answer()
+            return
+
+        chosen = None if action == digest_keyboards.NEW else Rhythm(action)
+        created = await digest.habits.confirm(
+            offered, chosen=chosen, now=datetime.now(UTC), timezone=settings.brain_timezone
+        )
+        if created is None:
+            # Ритма нет ни в словах, ни в нажатии — значит спрашиваем.
+            await _ask_rhythm(message, entry_id, other=False)
+            await callback.answer()
+            return
+
+        if message is not None:
+            with suppress(TelegramBadRequest):
+                await message.edit_reply_markup(reply_markup=None)
+        await callback.answer(_habit_created(offered, chosen), show_alert=True)
+
     @router.callback_query(F.data.startswith(f"{digest_keyboards.EVENING_PREFIX}:"))
     async def evening_button(callback: CallbackQuery) -> None:
         """Кнопки вечернего разбора: «ок», «не туда» и выбор типа."""
@@ -511,6 +610,36 @@ def build_router(settings: Settings) -> Router:
 RETURNED = "Вернул."
 DEED_LOST = "Не нашёл этого дела — возможно, запись переразметили."
 SETTLED = "Принял."
+HABIT_NOT_FOUND = "Не нашёл здесь привычки — возможно, она уже заведена или запись переразметили."
+
+
+async def _ask_rhythm(message: Message | None, entry_id: int, *, other: bool) -> None:
+    """Спросить ритм, заменив кнопки под тем же сообщением.
+
+    Текст разбора остаётся на месте: выбирать ритм, не видя записи, — то же
+    самое, что выбирать тип вслепую в «не туда».
+    """
+    if message is None:  # pragma: no cover — сообщение приходит вместе с нажатием
+        return
+    with suppress(TelegramBadRequest):
+        await message.edit_reply_markup(
+            reply_markup=digest_keyboards.rhythm_keyboard(entry_id, other=other)
+        )
+
+
+def _habit_created(offered: digest.habits.Proposal, chosen: Rhythm | None) -> str:
+    """Что сказать после заведения. Ритм повторяется словами владельца.
+
+    Повторяется намеренно: привычка начинает присылать сообщения сама, и
+    единственный момент, когда владелец видит, **на что именно** он согласился,
+    — этот. Формулировка берётся его: «два раза в неделю», а не «по
+    понедельникам и четвергам», даже когда дни совпали (`recurrence.describe`).
+    """
+    found = offered.rhythm if chosen is None else recurrence.chosen(chosen)
+    said = recurrence.describe(found) if found is not None else ""
+    return f"🌱 Привычка: {said}. Спрошу в {offered.hour}:00, как продвижение."
+
+
 LOOP_CREATED = "🔁 Завёл открытый вопрос. Буду возвращаться к нему."
 LOOP_NOT_FOUND = "Не нашёл открытого вопроса в этой записи — возможно, её переразметили."
 # Ответ повторяет глагол кнопки и остаётся безличным: «Закрыл» и «Убрал» —

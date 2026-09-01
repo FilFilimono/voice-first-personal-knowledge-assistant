@@ -39,6 +39,7 @@ from brain.core.ports import (
     Transcriber,
     Transcription,
 )
+from brain.core.retrieval import links
 from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
 from brain.core.scheduler.queue import CLEANUP, ENRICH, INDEX, SHOW_TRANSCRIPT
@@ -519,15 +520,98 @@ async def _reminder_text(reminder: Reminder) -> str:
     return f"⏰ {reminder.text}\n\n⚠️ Просрочено: должно было прийти {due:%d.%m в %H:%M}."
 
 
-async def index(*, entry_id: int, embedder: Embedder) -> None:
-    """Разрезать запись на чанки и посчитать вектора.
+async def index(
+    *, entry_id: int, embedder: Embedder, notifier: Notifier, model: LanguageModel
+) -> None:
+    """Разрезать запись на чанки, посчитать вектора и показать связи.
 
-    Молчаливое задание: владельцу об индексации знать незачем, он о ней
-    не просил. Наружу оно проявляется только тем, что запись начинает
+    Индексация — задание молчаливое: владельцу о ней знать незачем, он о ней
+    не просил. Наружу она проявляется только тем, что запись начинает
     находиться, — и `/status` показывает, сколько записей ещё ждут индекса.
+
+    **Связи считаются здесь и не молчат.** Место выбрано не для удобства:
+    связь считается вектором (инвариант 8), а вектор появляется ровно в этом
+    задании и ни секундой раньше. Позже — в разметке — было бы поздно: `vision
+    .md` §5.4 обещает связь **в момент записи**, а разметка приходит через
+    минуту после чистки.
     """
     chunks = await index_entry(embedder, entry_id=entry_id)
     logger.info("запись %s проиндексирована: чанков %s", entry_id, chunks)
+
+    try:
+        await _show_links(entry_id, notifier=notifier, model=model)
+    except Exception:
+        # Связь дешевле потерять, чем переиндексировать запись. Исключение
+        # отсюда ушло бы наверх, задание попало бы в ретраи — и пересчитало бы
+        # вектора, уже посчитанные и оплаченные, ради косметического
+        # сообщения. Тот же обмен, что у названий в `_name_fresh`.
+        logger.exception("связи по записи %s не показаны", entry_id)
+
+
+async def _show_links(entry_id: int, *, notifier: Notifier, model: LanguageModel) -> None:
+    """Сказать владельцу, с чем перекликается только что сделанная запись.
+
+    Три условия молчания, и каждое куплено:
+
+    **Выключено настройкой.** `LINKS_ENABLED=false` — механизм срабатывает
+    на каждой записи, и снимать его надо не правкой кода.
+
+    **Запись не свежая.** Связь показывается только по свежему приёму —
+    то же окно, что у перерисовки подтверждения. Без этого условия `just
+    reindex` разослал бы связи по всему архиву разом: пересчёт индекса зовёт
+    ровно это задание, и отличить пересчёт от приёма можно только по возрасту
+    записи.
+
+    **Связей нет.** Обычный исход, а не сбой: на архиве в 85 записей связь
+    находится у каждой пятой.
+
+    Сообщение уходит **отдельным и беззвучным**. Отдельным — потому что
+    подтверждение приёма к этому моменту либо ещё дословное, либо уже занято
+    разметкой, и дописать в него связь значило бы драться с двумя другими
+    заданиями за одно и то же сообщение. Беззвучным — потому что владелец
+    в этот момент и так смотрит в телефон: он только что сделал запись.
+    """
+    settings = get_settings()
+    if not settings.links_enabled:
+        return
+
+    entry = await repository.get_entry(entry_id)
+    if entry is None:  # pragma: no cover — запись только что индексировали
+        return
+
+    age = datetime.now(UTC) - entry.created_at
+    if age > ACK_WINDOW:
+        logger.info("связи по записи %s не показаны: приёму уже %s", entry_id, age)
+        return
+
+    chat_id = entry.meta.get("chat_id")
+    if not isinstance(chat_id, int):
+        logger.info("связи по записи %s некому показать: в записи нет чата", entry_id)
+        return
+
+    found = await links.related(entry_id, rules=links.from_settings(settings))
+    if not found:
+        return
+
+    # Показывается **вычищенный** текст записи, если он уже есть: связь читается
+    # рядом с ним, и «э-э-э» в одном сообщении с чистой цитатой выглядело бы
+    # сбоем. Модель фразу пишет только при `RECALL_WRITTEN=true`.
+    shown = await repository.display_of(entry_id) or ""
+    await notifier.send_quietly(
+        chat_id,
+        await present.recall.link_text(
+            model,
+            text=shown,
+            links=found,
+            timezone=entry.timezone,
+            now=datetime.now(UTC),
+        ),
+    )
+    logger.info(
+        "связи по записи %s показаны: %s",
+        entry_id,
+        ", ".join(f"{link.entry_id} ({link.similarity:.2f})" for link in found),
+    )
 
 
 async def enrich(

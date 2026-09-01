@@ -19,12 +19,13 @@
     cleanup.py     чистка расшифровки: промпт, схема ответа, разбор
     titles.py      названия дел и петель: пачка, проверка, запись
     digest.py      лид утренней сводки: вход модели, промпт, отказ
+    recall.py      связь и срез по темам: шаблон кода, модель — за флагом
     guard.py       проверка написанного моделью перед показом
     pacing.py      что замолкает первым, когда квота на исходе
     repository.py  чтение из базы, которое для этого нужно
 """
 
-from brain.core.present import digest, guard, titles
+from brain.core.present import digest, guard, recall, titles
 from brain.core.present.cleanup import PROMPT, PURPOSE, clean_one, parse
 from brain.core.present.pacing import cosmetic_allowed
 
@@ -41,5 +42,6 @@ __all__ = [
     "digest",
     "guard",
     "parse",
+    "recall",
     "titles",
 ]

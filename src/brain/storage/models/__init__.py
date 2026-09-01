@@ -13,6 +13,7 @@ from brain.storage.models.base import Base
 from brain.storage.models.chunk import DIMENSIONS, FTS_CONFIG, Chunk
 from brain.storage.models.commitment import Commitment, CommitmentState
 from brain.storage.models.entry import Entry, EntryKind, EntrySource
+from brain.storage.models.habit import Habit, HabitStatus, Rhythm
 from brain.storage.models.llm_call import LlmCall
 from brain.storage.models.loop import Loop, LoopStatus
 from brain.storage.models.override import EntryOverride, OverrideAction
@@ -40,6 +41,8 @@ __all__ = [
     "EntrySource",
     "EntryTopic",
     "EntryUnit",
+    "Habit",
+    "HabitStatus",
     "LlmCall",
     "Loop",
     "LoopStatus",
@@ -49,6 +52,7 @@ __all__ = [
     "QuietPeriod",
     "Reminder",
     "ReminderTrigger",
+    "Rhythm",
     "SilenceReason",
     "Topic",
     "Touch",

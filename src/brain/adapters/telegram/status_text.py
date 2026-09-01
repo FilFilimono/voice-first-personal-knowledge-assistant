@@ -234,6 +234,13 @@ def _touches(status: SystemStatus, *, timezone: str) -> list[str]:
     if hanging:
         lines.append(f"📌 Висит: {', '.join(hanging)}")
 
+    if touches.habits:
+        # Отдельной строкой, а не в «Висит»: привычка не висит и не ждёт
+        # закрытия — она наступает снова (`vision.md` §5.11). Попав в тот же
+        # список, она читалась бы как незакрытое дело, то есть ровно так,
+        # как её читать нельзя.
+        lines.append(f"🌱 Привычек: {touches.habits}")
+
     lines.append(f"💬 Касаний сегодня: {touches.spent} из {touches.budget}")
 
     if touches.auto_resolved:

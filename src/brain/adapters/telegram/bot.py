@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # чтобы не приходилось вспоминать синтаксис.
 COMMANDS = [
     BotCommand(command="find", description="поиск по архиву: /find экзамен"),
+    BotCommand(command="recall", description="о чём думали за неделю: /recall или /recall тема"),
     BotCommand(command="status", description="всё ли работает"),
     BotCommand(command="private", description="приватный режим: on / off / без аргумента"),
     BotCommand(command="start", description="что я умею"),

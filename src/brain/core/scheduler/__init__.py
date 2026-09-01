@@ -16,6 +16,6 @@
 когда пакет уже собран.
 """
 
-from brain.core.scheduler import queue, reminders
+from brain.core.scheduler import queue, recurrence, reminders
 
-__all__ = ["queue", "reminders"]
+__all__ = ["queue", "recurrence", "reminders"]

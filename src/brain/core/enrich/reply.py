@@ -21,6 +21,7 @@ from brain.storage.models.annotation import AnnotationState, AnnotationType
 NAMES: dict[AnnotationType, str] = {
     AnnotationType.THOUGHT: "мысль",
     AnnotationType.TASK: "задача",
+    AnnotationType.HABIT: "привычка",
     AnnotationType.EVENT: "событие",
     AnnotationType.LOOP: "открытый вопрос",
     AnnotationType.DECISION: "решение",

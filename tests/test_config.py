@@ -161,3 +161,25 @@ def test_titles_model_does_not_follow_the_cleanup_model() -> None:
     assert Settings(_env_file=None, cleanup_model="gemini-3.5-flash-lite").titles_model == (
         "gemini-3.6-flash"
     )
+
+
+def test_links_are_off_until_the_owner_turns_them_on() -> None:
+    """Механизм на пути приёма не включается сам.
+
+    Связь считается в задании индексации, то есть на **каждой** записи, и
+    первая её редакция пришла с `True` и без единого теста: непроверенный код,
+    рассылающий сообщения, оказался бы на самом горячем пути системы. Правило
+    поэтому общее — ничто не включается по умолчанию, пока не проверено живьём
+    (решение владельца 01.09.2026).
+    """
+    assert _settings().links_enabled is False
+
+
+def test_the_phrase_of_a_link_is_written_by_code_until_billing() -> None:
+    """Фразу связи по умолчанию пишет шаблон, а не модель.
+
+    Бесплатный тир — 20 запросов в сутки на модель, из них 15 заняты чисткой,
+    названиями и лидом сводки. Связь срабатывает на каждой записи: при живом
+    темпе 9.4 записи в день модельная фраза одна вынесла бы дневной остаток.
+    """
+    assert _settings().recall_written is False

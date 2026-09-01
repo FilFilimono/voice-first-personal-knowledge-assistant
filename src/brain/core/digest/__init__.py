@@ -22,10 +22,12 @@
 
 Что где лежит:
 
+    by_topic.py     срез по темам за период и «вспомним подробно»
     slots.py        чистая арифметика времени: чей момент наступил
     touches.py      журнал касаний и бюджет
     quiet.py        пауза и «сегодня выходной»
     commitments.py  дела: заведение из единиц разметки и закрытие
+    habits.py       привычки: свой ритм напоминаний, вне бюджета и беззвучно
     loops.py        открытые петли — ядро системы по `vision.md` §5.2
     resurface.py    всплывание старого
     evening.py      спорные записи и долг, который не копится
@@ -35,8 +37,10 @@
 """
 
 from brain.core.digest import (
+    by_topic,
     commitments,
     evening,
+    habits,
     loops,
     morning,
     quiet,
@@ -50,8 +54,10 @@ from brain.core.digest import (
 from brain.core.digest.service import tick
 
 __all__ = [
+    "by_topic",
     "commitments",
     "evening",
+    "habits",
     "loops",
     "morning",
     "quiet",

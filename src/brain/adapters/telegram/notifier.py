@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from brain.adapters.telegram import digest_keyboards
+from brain.core.digest import habits
 from brain.storage.models.annotation import AnnotationType
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,9 @@ def annotation_data(action: str, entry_id: int) -> str:
     return f"{ANNOTATION_PREFIX}:{action}:{entry_id}"
 
 
-def annotation_keyboard(entry_id: int, *, offer_loop: bool = False) -> InlineKeyboardMarkup:
+def annotation_keyboard(
+    entry_id: int, *, offer_loop: bool = False, offer_habit: bool = False
+) -> InlineKeyboardMarkup:
     """Кнопки под готовым разбором.
 
     «Не туда» открывает список типов, а не правит что-то само: нажатие без
@@ -65,9 +68,11 @@ def annotation_keyboard(entry_id: int, *, offer_loop: bool = False) -> InlineKey
     ни архиву, ни eval'у. Два нажатия вместо одного — цена за то, чтобы
     поправка была материалом, а не жалобой.
 
-    Третья кнопка появляется, когда разметка нашла открытый вопрос. Петля
-    заводится только с подтверждением (`vision.md` §5.2), но спрашивать
-    отдельным сообщением нельзя: одна запись стоит одного уведомления.
+    Третья и четвёртая кнопки появляются, когда разметка нашла открытый вопрос
+    или привычку. Обе вещи заводятся **только с подтверждения** (`vision.md`
+    §5.2 и §5.11), но спрашивать отдельным сообщением нельзя: одна запись стоит
+    одного уведомления. У привычки цена ошибки при этом выше, чем у петли:
+    молча заведённая привычка — это ежедневное сообщение, о котором не просили.
     """
     rows = [
         [
@@ -83,6 +88,15 @@ def annotation_keyboard(entry_id: int, *, offer_loop: bool = False) -> InlineKey
                 InlineKeyboardButton(
                     text="🔁 Открытый вопрос",
                     callback_data=digest_keyboards.loop_data(digest_keyboards.NEW, entry_id),
+                )
+            ]
+        )
+    if offer_habit:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🌱 Привычка",
+                    callback_data=digest_keyboards.habit_data(digest_keyboards.NEW, entry_id),
                 )
             ]
         )
@@ -147,12 +161,25 @@ class TelegramNotifier:
         уведомления, и разбор — не повод его удваивать. Правка сообщения
         в Telegram уведомления не шлёт, так что появление разметки владельца
         не дёргает.
+
+        **Про привычку спрашивает ядро, а не вызывающий код** — в отличие
+        от петли, чей признак приезжает готовым. Причина в том, что признаков
+        два, а не один: разметка нашла привычку **и** по этой записи её ещё
+        не завели. Второе знает только `digest.habits`, и посчитанное здесь
+        оно разошлось бы с тем, что делает нажатие: кнопка живёт в переписке
+        вечно, а нажатая второй раз обязана не завести второе ежедневное
+        сообщение. Инвариант 1 цел — адаптер идёт в базу через сервис ядра,
+        а не сам.
         """
         await self._edit(
             chat_id,
             message_id,
             text,
-            markup=annotation_keyboard(entry_id, offer_loop=offer_loop),
+            markup=annotation_keyboard(
+                entry_id,
+                offer_loop=offer_loop,
+                offer_habit=await habits.proposal(entry_id) is not None,
+            ),
         )
 
     async def send_morning(

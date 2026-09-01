@@ -38,6 +38,7 @@ NO_TOUCHES = Touches(
     quiet_until=None,
     open_commitments=0,
     open_loops=0,
+    habits=0,
     auto_resolved=0,
 )
 
@@ -233,6 +234,7 @@ def test_missing_summary_and_silent_summary_read_differently() -> None:
                 quiet_until=None,
                 open_commitments=0,
                 open_loops=0,
+                habits=0,
                 auto_resolved=0,
             )
         ),
@@ -254,6 +256,7 @@ def test_quiet_period_is_visible_with_the_way_out() -> None:
                 quiet_until=datetime(2026, 8, 27, 9, 0, tzinfo=UTC),
                 open_commitments=0,
                 open_loops=0,
+                habits=0,
                 auto_resolved=0,
             )
         ),
@@ -279,6 +282,7 @@ def test_auto_resolved_debt_is_answerable_but_never_pushed() -> None:
                 quiet_until=None,
                 open_commitments=4,
                 open_loops=2,
+                habits=0,
                 auto_resolved=3,
             )
         ),

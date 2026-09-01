@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from brain.adapters.telegram.bot import build_dispatcher
 from brain.config import Settings
 from brain.core.scheduler import jobs
+from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.entry import Entry, EntryKind, EntrySource
 from brain.storage.models.override import EntryOverride, OverrideAction
 from brain.storage.models.topic import Topic
@@ -175,7 +176,11 @@ async def test_wrong_button_opens_the_list_of_types(
 
     labels = [label for label, _ in session.last_buttons()]
     assert "мысль" in labels and "служебное" in labels
-    assert len(labels) == 9, "типов девять, и все должны быть доступны"
+    # Считается по enum'у, а не числом: типов стало десять, когда появилась
+    # привычка, и в этой строке стояла бы девятка, ничего не объясняя.
+    # Утверждение здесь — «доступны все», а не «их столько-то».
+    assert len(labels) == len(AnnotationType), "все типы должны быть доступны"
+    assert "привычка" in labels
 
 
 async def test_choosing_a_type_writes_an_override(

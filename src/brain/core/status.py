@@ -78,6 +78,11 @@ class Touches:
     quiet_until: datetime | None
     open_commitments: int
     open_loops: int
+    # Сколько привычек живо. Стоит здесь по той же причине, по которой здесь
+    # вообще всё: привычка — единственный механизм, который шлёт сообщения
+    # сам и каждый день, и увидеть его со стороны больше негде. Забытая
+    # привычка выглядит как бот, который зачем-то пишет по утрам.
+    habits: int
     # Сколько записей зафиксировалось само. Владельцу об этом не сообщают
     # (`vision.md` §7.0, принцип 2) — но спросить он вправе.
     auto_resolved: int
@@ -151,6 +156,7 @@ async def _touches(now: datetime, timezone: str) -> Touches:
         quiet_until=await digest.quiet.until(now),
         open_commitments=open_commitments,
         open_loops=open_loops,
+        habits=await digest.habits.open_count(),
         auto_resolved=await digest.evening.auto_resolved_count(),
     )
 

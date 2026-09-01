@@ -328,8 +328,20 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
 
     @pgq.qm.entrypoint(INDEX, executor_factory=retry_executor, on_failure="hold")
     async def index(job: Job) -> None:
+        """Чанки и вектора, а следом — связи (`vision.md` §5.4).
+
+        Связи живут здесь, потому что здесь появляется вектор, а считаются они
+        вектором и без модели (инвариант 8). `summariser` передаётся не ради
+        расчёта: он пишет **фразу** связи, и только при `RECALL_WRITTEN=true`.
+        Выключено — модель не зовётся ни разу, а фразу собирает шаблон кода.
+        """
         payload = payload_of(job)
-        await jobs.index(entry_id=payload["entry_id"], embedder=embedder)
+        await jobs.index(
+            entry_id=payload["entry_id"],
+            embedder=embedder,
+            notifier=notifier,
+            model=summariser,
+        )
 
     @pgq.qm.entrypoint(ENRICH, executor_factory=retry_executor, on_failure="hold")
     async def enrich(job: Job) -> None:

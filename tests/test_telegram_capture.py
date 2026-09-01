@@ -20,8 +20,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
 
 from brain.adapters.telegram.bot import COMMANDS, build_dispatcher, register_commands
+from brain.adapters.telegram.handlers import build_router
 from brain.config import Settings
 from brain.core.quota import ModelUsage
 from brain.core.status import Quota, SystemStatus, Touches, WorkerStatus
@@ -39,6 +41,16 @@ from tests.telegram_harness import (
 ACK = "Принял."
 SLOW_DATABASE = 0.5
 ACK_BUDGET = 0.3
+
+
+def _settings() -> Settings:
+    """Настройки без чтения `.env`: тест не должен зависеть от машины."""
+    return Settings(
+        _env_file=None,
+        telegram_bot_token="123:test-token",
+        google_api_key="AI-test",
+        telegram_allowed_user_ids=[OWNER_ID],
+    )
 
 
 class PrivateModeSpy:
@@ -93,13 +105,7 @@ def dispatcher(
         "brain.adapters.telegram.handlers.repository.switch_private_mode", private_mode.switch
     )
 
-    settings = Settings(
-        _env_file=None,
-        telegram_bot_token="123:test-token",
-        google_api_key="AI-test",
-        telegram_allowed_user_ids=[OWNER_ID],
-    )
-    return build_dispatcher(settings)
+    return build_dispatcher(_settings())
 
 
 @pytest.fixture
@@ -211,6 +217,7 @@ async def test_status_reports_the_worker_first(
             quiet_until=None,
             open_commitments=0,
             open_loops=0,
+            habits=0,
             auto_resolved=0,
         ),
     )
@@ -230,11 +237,47 @@ async def test_status_reports_the_worker_first(
     assert "без расшифровки: 2" in report
 
 
-async def test_command_menu_lists_every_command_the_bot_answers() -> None:
-    """Меню не должно обещать того, чего бот не понимает, и наоборот."""
-    promised = {command.command for command in COMMANDS}
+# Команды, которых в меню нет намеренно. Все три про тишину: их нажимают,
+# когда бот мешает, и подсказывать их наравне с поиском значило бы предлагать
+# себя выключить. Узнать о них можно из `/start` — он их перечисляет.
+QUIET_COMMANDS = frozenset({"pause", "dayoff", "resume"})
 
-    assert promised == {"start", "status", "private", "find"}
+
+def _answered_commands() -> set[str]:
+    """Команды, на которые у бота есть обработчик. Из роутера, а не из списка."""
+    return {
+        command
+        for handler in build_router(_settings()).message.handlers
+        for filter_ in handler.filters or []
+        if isinstance(filter_.callback, Command)
+        for command in filter_.callback.commands
+        if isinstance(command, str)
+    }
+
+
+async def test_command_menu_promises_only_what_the_bot_answers() -> None:
+    """Меню не обещает того, чего бот не понимает.
+
+    **Утверждение снято с роутера, а не с прибитого списка** — правка 01.09.2026.
+    До неё здесь стояло сравнение с пятёркой имён, и оно ломалось на каждой
+    новой команде, ничего при этом не проверяя: «pause», «dayoff» и «resume»
+    бот отвечал и тогда, а в списке их не было. То есть тест выглядел проверкой
+    свойства, а был списком ожидаемых значений.
+
+    `/recall` в меню появился по `vision.md` §14: команда, которой нет
+    в подсказке, для владельца не существует.
+    """
+    assert {command.command for command in COMMANDS} <= _answered_commands()
+
+
+async def test_only_the_quiet_commands_are_kept_out_of_the_menu() -> None:
+    """Обратная сторона: команда, которую бот отвечает, из меню не пропадает молча.
+
+    Разница между «отвечает» и «подсказывает» пиннится набором, а не числом:
+    новая команда, забытая в меню, обязана уронить этот тест и заставить
+    решить — прятать её намеренно или показать.
+    """
+    assert _answered_commands() - {command.command for command in COMMANDS} == QUIET_COMMANDS
 
 
 async def test_command_menu_is_registered_on_start(bot: Bot, session: FakeSession) -> None:

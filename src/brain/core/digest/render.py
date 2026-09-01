@@ -16,6 +16,7 @@
   Формулировка спасает не всегда; счётчик долга не спасает никогда.
 """
 
+from collections.abc import Sequence
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -26,7 +27,10 @@ from brain.core.digest.resurface import Old
 from brain.core.digest.weekly import Weekly
 from brain.core.enrich.reply import NAMES
 from brain.core.present.guard import Written
+from brain.core.retrieval.links import Link
+from brain.core.scheduler import recurrence
 from brain.storage.models.commitment import Commitment, CommitmentState
+from brain.storage.models.habit import Habit
 
 # Сколько символов записи показывать в списке. Больше — и сводка перестаёт
 # читаться за сорок секунд, меньше — и по обрывку не узнать, о чём речь.
@@ -174,6 +178,50 @@ def _guess(item: Disputed) -> str:
     if item.alternative_type is not None:
         return f"{NAMES[item.type]} или {NAMES[item.alternative_type]}?"
     return f"похоже на «{NAMES[item.type]}», но уверенности нет"
+
+
+def habit(item: Habit, said: Sequence[Link] = (), *, timezone: str) -> str:
+    """Напоминание привычки. Даёт повод рассказать, а не требует отчёта.
+
+    Три правила `vision.md` §5.11 держатся здесь построчно, и каждое из них
+    легко нарушить, ничего не заметив.
+
+    **Несёт контекст, а не одно название.** Голое «почитай книгу» — будильник,
+    а от будильника отписываются. Поэтому вместе с напоминанием показывается
+    то, что владелец **сам говорил по этой теме**: связанные записи, считанные
+    векторной близостью (`vision.md` §5.4, инвариант 8). Связей нет — обычный
+    исход, а не сбой: тогда остаётся ритм и вопрос, и это всё ещё не будильник,
+    потому что вопрос открытый.
+
+    **Вопрос про ход, а не про факт.** Не «сделал или нет»: это счётчик,
+    запрещённый §7.0 п.5, и отвечают на него кнопкой, а не словами.
+    Спрашивается продвижение — и отвечается голосом, то есть новой записью.
+
+    **Вчерашнего здесь нет ни в каком виде.** Ни «пропустил», ни «третий день»,
+    ни сколько раз спрашивали: не выполненная вчера привычка не долг, она
+    просто наступает снова (§5.11 и §7.0, принципы 2 и 5). Данных для такой
+    строки в таблице нет по построению — но написать её можно и из `created_at`,
+    и это стоит помнить при любой правке.
+    """
+    lines = [f"🌱 {recurrence.NAMES[item.rhythm].capitalize()}: {snippet(item.text, limit=120)}"]
+
+    for link in said:
+        when = link.created_at.astimezone(ZoneInfo(timezone))
+        lines += ["", f"Ты говорил об этом {when:%d.%m}:", f"«{snippet(link.text, limit=200)}»"]
+
+    lines += ["", HABIT_QUESTION]
+    return "\n".join(lines)
+
+
+# Вопрос под привычкой. Открытый и про движение: «сделал?» отвечается одним
+# словом и ничего не оставляет в архиве, а «что мешает» вытаскивает мысль —
+# ровно то, ради чего привычка и заведена отдельным типом (`vision.md` §5.11,
+# последний абзац: привычка — носитель раскачки).
+#
+# Шаблон кода, а не текст модели. Полный режим (`vision.md`, план Фазы 4)
+# отдаёт этот вопрос модели, и ветка под него пишется вместе с настройкой,
+# которой сейчас нет, — см. отчёт блока B.
+HABIT_QUESTION = "Как продвижение? Что получается, что мешает?"
 
 
 def resurfaced(old: Old, *, timezone: str) -> str:
