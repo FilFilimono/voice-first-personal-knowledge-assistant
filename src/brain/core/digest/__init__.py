@@ -29,6 +29,7 @@
     commitments.py  дела: заведение из единиц разметки и закрытие
     habits.py       привычки: свой ритм напоминаний, вне бюджета и беззвучно
     loops.py        открытые петли — ядро системы по `vision.md` §5.2
+    prompting.py    раскачка: набор вопросов, правило выбора и разбор ответа
     resurface.py    всплывание старого
     evening.py      спорные записи и долг, который не копится
     weekly.py       недельное ревью, включающееся по данным
@@ -43,6 +44,7 @@ from brain.core.digest import (
     habits,
     loops,
     morning,
+    prompting,
     quiet,
     render,
     resurface,
@@ -60,6 +62,7 @@ __all__ = [
     "habits",
     "loops",
     "morning",
+    "prompting",
     "quiet",
     "render",
     "resurface",

@@ -245,6 +245,11 @@ def build_router(settings: Settings) -> Router:
             ack_message_id=ack.message_id,
             file_id=message.voice.file_id,
             duration_sec=message.voice.duration,
+            # Голосом отвечают чаще, чем текстом, — это основной вход системы.
+            # Забыть связку здесь значило бы, что раскачка работает только
+            # для набранного руками, ровно как напоминания работали только
+            # для текста (дыра 16 августа).
+            answers=await _answering(message),
         )
 
         try:
@@ -288,6 +293,7 @@ def build_router(settings: Settings) -> Router:
             message_id=message.message_id,
             ack_message_id=ack.message_id,
             text=message.text,
+            answers=await _answering(message),
         )
 
         try:
@@ -605,6 +611,26 @@ def build_router(settings: Settings) -> Router:
             await callback.answer(f"📌 {enrich.NAMES[chosen]}")
 
     return router
+
+
+async def _answering(message: Message) -> dict[str, object] | None:
+    """На какой вопрос раскачки отвечает это сообщение. `None` — ни на какой.
+
+    Ответ на вопрос бота обязан лечь **записью архива**, а не пройти мимо: без
+    этого раскачка даёт повод сказать и теряет сказанное, то есть делает
+    половину дела (план Фазы 4, блок A, пункт 6). Отличие от ответа на «когда
+    напомнить?» здесь принципиальное: там реплика диалога, и записью она
+    не становится; здесь запись и есть смысл вопроса.
+
+    Связка держится на `reply_to_message` — том же приёме, что у напоминаний.
+    Своей таблицы ожидающих вопросов в проекте нет: состояние вопроса живёт
+    в самой переписке, и перезапуск бота его не ломает.
+    """
+    replied_to = message.reply_to_message
+    if replied_to is None:
+        return None
+    found = await digest.prompting.answered(replied_to.message_id)
+    return None if found is None else found.as_meta()
 
 
 RETURNED = "Вернул."

@@ -24,6 +24,7 @@ from brain.core.digest import (
     habits,
     loops,
     morning,
+    prompting,
     quiet,
     render,
     resurface,
@@ -136,7 +137,7 @@ async def _handle(
         return False
 
     try:
-        await _send(slot, chat_id, text, payload, notifier)
+        message_id = await _send(slot, chat_id, text, payload, notifier)
     except Exception:
         # Слот остаётся занятым намеренно. Повтор отправки рискует прислать
         # то же самое дважды, а пропущенная сводка стоит одного дня — завтра
@@ -145,13 +146,75 @@ async def _handle(
         return False
 
     await _after(slot, payload, now)
+    # Идентификатор ушедшего сообщения дописывается в журнал **после** отправки:
+    # до неё его не существует. По нему потом узнаётся, что владелец отвечает
+    # именно на вопрос раскачки, — тем же приёмом, каким ответ на «когда
+    # напомнить?» узнаётся по `ack_message_id` в `entries.meta`.
+    if "prompting" in payload:
+        await touches.remember_message(slot, day, message_id=message_id)
     return True
 
 
 async def _prepare(
     slot: TouchSlot, now: datetime, timezone: str, model: LanguageModel | None
 ) -> tuple[str, dict[str, object]] | None:
-    """Текст и нагрузка касания. `None` — сказать нечего.
+    """Текст и нагрузка касания вместе с раскачкой. `None` — сказать нечего.
+
+    **Раскачка не отдельный слот, а приписка к существующим**, и это не экономия
+    на схеме: `touch_slot` — тип в базе, новое значение стоит миграции, а второе
+    сообщение в то же утро стоит владельца. Приписка при этом решает и главное
+    — молчание слота превращается в повод сказать: до блока A утро без дел
+    и без петли записывало `nothing_to_say` и не приходило вовсе, а это ровно
+    диагноз фазы («бот не даёт повода что-то сказать»).
+
+    **Один вопрос в сообщении** держится здесь и проверяется по готовому тексту
+    слота, а не перебором случаев: сводка с петлёй уже кончается «Сдвинулось?»,
+    и вторая вопросительная строка под ней — ловушка допроса
+    (`docs/prompting_sources.md`, §1.3).
+    """
+    prepared = await _content(slot, now, timezone, model)
+    asked = await _prompting(slot, prepared, now, timezone, model)
+
+    if asked is None:
+        return prepared
+
+    if prepared is None:
+        # Слоту сказать нечего — тогда вопрос и есть всё сообщение. Кнопок
+        # под ним нет, поэтому уйдёт оно беззвучно (`vision.md` §7.1).
+        return prompting.alone(asked.text), {
+            "prompting": prompting.payload(asked),
+            "prompting_only": True,
+        }
+
+    text, payload = prepared
+    payload["prompting"] = prompting.payload(asked)
+    return prompting.attach(text, asked.text), payload
+
+
+async def _prompting(
+    slot: TouchSlot,
+    prepared: tuple[str, dict[str, object]] | None,
+    now: datetime,
+    timezone: str,
+    model: LanguageModel | None,
+) -> prompting.Question | None:
+    """Вопрос раскачки для этого слота. `None` — сегодня без него.
+
+    Слоты — настройка, а не константа (решение владельца № 2), и по умолчанию
+    там только утро: каждый слот это отдельный запрос в сутки в полном режиме,
+    и упирается это в квоту, а не во вкус.
+    """
+    if slot not in prompting.SLOTS:
+        return None
+    if prepared is not None and not prompting.fits(prepared[0]):
+        return None
+    return await prompting.pick(now=now, timezone=timezone, model=model)
+
+
+async def _content(
+    slot: TouchSlot, now: datetime, timezone: str, model: LanguageModel | None
+) -> tuple[str, dict[str, object]] | None:
+    """Что слот говорит сам по себе. `None` — сказать нечего.
 
     **Модель зовётся здесь, то есть до того, как слот занят.** Порядок ровно
     тот же, что был: сначала собрать текст, потом занять место в журнале,
@@ -251,27 +314,35 @@ async def _send(
     text: str,
     payload: dict[str, object],
     notifier: Notifier,
-) -> None:
-    """Отправить — тем способом, который подходит слоту."""
+) -> int:
+    """Отправить — тем способом, который подходит слоту. Вернуть номер сообщения.
+
+    Номер нужен раскачке: ответ владельца узнаётся по тому, на какое сообщение
+    он отвечает, и другого способа связать сказанное с вопросом нет.
+    """
+    if payload.get("prompting_only") is True:
+        # Слоту нечего было сказать, и всё сообщение — это вопрос. Кнопок
+        # под ним нет, отвечают на него словами, значит уходит он так же,
+        # как прочие инициативные касания: беззвучно (`vision.md` §7.1).
+        return await notifier.send_quietly(chat_id, text)
+
     if slot is TouchSlot.MORNING:
         loop_id = payload.get("loop_id")
-        await notifier.send_morning(
+        return await notifier.send_morning(
             chat_id,
             text,
             commitment_ids=[int(item) for item in _ids(payload, "commitment_ids")],
             loop_id=int(loop_id) if isinstance(loop_id, int) else None,
             loop_stuck=payload.get("loop_stuck") is True,
         )
-        return
 
     if slot is TouchSlot.EVENING:
-        await notifier.send_evening(
+        return await notifier.send_evening(
             chat_id, text, entry_ids=[int(item) for item in _ids(payload, "entry_ids")]
         )
-        return
 
     # Всплывание и ревью — беззвучно и без кнопок (`vision.md` §7).
-    await notifier.send_quietly(chat_id, text)
+    return await notifier.send_quietly(chat_id, text)
 
 
 def _ids(payload: dict[str, object], key: str) -> list[int]:

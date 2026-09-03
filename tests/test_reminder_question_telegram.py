@@ -83,7 +83,17 @@ def dispatcher(
     async def not_private() -> bool:
         return False
 
+    async def no_prompting(message_id: int) -> None:
+        """Раскачка тут ни при чём: этот файл про «когда напомнить?».
+
+        Заглушка нужна потому, что ответ на сообщение бота с Фазы 4 сначала
+        спрашивает журнал касаний — не ответ ли это на вопрос раскачки
+        (`vision.md` §5.9). Запрос настоящий, а быстрый тест в базу не ходит.
+        """
+        return None
+
     monkeypatch.setattr("brain.adapters.telegram.handlers.capture_transaction", fake_transaction)
+    monkeypatch.setattr("brain.adapters.telegram.handlers.digest.prompting.answered", no_prompting)
     monkeypatch.setattr("brain.adapters.telegram.handlers.repository.is_private_mode", not_private)
     monkeypatch.setattr(
         "brain.adapters.telegram.handlers.repository.entry_by_ack_message", store.find_by_ack

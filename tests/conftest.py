@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator, Callable, Iterator
 from pathlib import Path
 
@@ -33,7 +34,18 @@ ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 
 # Имя намеренно не пересекается с рабочим `brain`: фикстура эту базу дропает,
 # и промахнуться здесь нельзя.
-INTEGRATION_DB = "brain_integration"
+#
+# **Суффикс из окружения — чтобы два прогона не дрались за одну базу.**
+# До 01.09.2026 имя было одно на всех, и это стоило дня дважды: фикстура
+# дропает базу `WITH (FORCE)`, то есть **из-под чужой сессии**, и соседний
+# прогон падал `ConnectionDoesNotExistError` и `DuplicateDatabaseError`.
+# Ломался при этом не код, а прогон — и ошибка, пришедшая от соседа,
+# читается как своя. Один раз это стоило отката двух блоков, второй —
+# испорченной охоты за шатким тестом.
+#
+# По умолчанию суффикса нет: одиночный прогон обязан работать без всякой
+# настройки, а `PYTEST_DB_SUFFIX` ставится только там, где прогонов два.
+INTEGRATION_DB = "brain_integration" + os.environ.get("PYTEST_DB_SUFFIX", "")
 
 
 def _app_with_db_state(reachable: bool) -> FastAPI:

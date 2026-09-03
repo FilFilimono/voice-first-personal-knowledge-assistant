@@ -98,6 +98,32 @@ async def _record(
     return written is not None
 
 
+async def remember_message(slot: TouchSlot, day: date, *, message_id: int) -> None:
+    """Дописать в нагрузку номер ушедшего сообщения.
+
+    Единственное место, где строка журнала правится после записи, и правится
+    она **после отправки**: до неё номера не существует. Ради него порядок
+    «сначала занять слот, потом отправлять» не меняется — занятый слот при
+    упавшей отправке стоит одного дня, а перевёрнутый порядок стоил бы двух
+    одинаковых сообщений при гонке тиков.
+
+    Нужен он раскачке: ответ владельца узнаётся по тому, на какое сообщение
+    он отвечает (`digest/prompting.answered`). Своей таблицы ожидающих вопросов
+    в проекте нет — состояние вопроса живёт в самой переписке, как у «когда
+    напомнить?».
+    """
+    async with session_scope() as session:
+        row = await session.scalar(select(Touch).where(Touch.slot == slot, Touch.local_date == day))
+        if row is None:  # pragma: no cover — строку только что вставили сами
+            return
+        # Присваивание новым словарём, а не правкой на месте: JSONB
+        # не отслеживает изменения внутри, и правка вложенного ключа уехала бы
+        # в никуда молча.
+        payload = dict(row.payload)
+        payload["prompting"] = {**dict(payload.get("prompting") or {}), "message_id": message_id}
+        row.payload = payload
+
+
 async def of_day(day: date) -> dict[TouchSlot, Touch]:
     """Что уже случилось с каждым слотом за эти сутки — отправка или молчание."""
     async with session_scope() as session:

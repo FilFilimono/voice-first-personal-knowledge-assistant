@@ -14,9 +14,11 @@
 в обработчике не попала бы никуда.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from brain.core.ports import CaptureUnitOfWork, EntryDraft
 from brain.core.scheduler import reminders
@@ -37,6 +39,9 @@ class IncomingText:
     message_id: int
     ack_message_id: int
     text: str
+    # На что это ответ, если владелец отвечает на вопрос раскачки (`vision.md`
+    # §5.9). Обычная запись — это `None`, и таких большинство.
+    answers: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +53,7 @@ class IncomingVoice:
     ack_message_id: int
     file_id: str
     duration_sec: int
+    answers: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +109,12 @@ async def capture_text(
             is_private=is_private,
             timezone=timezone,
             dedup_key=dedup_key(message.chat_id, message.message_id),
-            meta=_meta(message.chat_id, message.message_id, message.ack_message_id),
+            meta=_meta(
+                message.chat_id,
+                message.message_id,
+                message.ack_message_id,
+                answers=message.answers,
+            ),
         )
     )
     if entry_id is None:
@@ -171,6 +182,7 @@ async def capture_voice(
                 message.message_id,
                 message.ack_message_id,
                 file_id=message.file_id,
+                answers=message.answers,
             ),
         )
     )
@@ -194,8 +206,16 @@ def _meta(
     ack_message_id: int,
     *,
     file_id: str | None = None,
+    answers: Mapping[str, Any] | None = None,
 ) -> dict[str, object]:
-    """Служебное от адаптера. `ack_message_id` — то сообщение, которое правится."""
+    """Служебное от адаптера. `ack_message_id` — то сообщение, которое правится.
+
+    `answers` — связь с вопросом раскачки, на который эта запись отвечает
+    (`vision.md` §5.9). Лежит здесь, а не отдельной таблицей и не колонкой,
+    по той же причине, по которой здесь лежит `ack_message_id`: связка с
+    перепиской — служебное поле записи, а `entries` не правится (инвариант 3),
+    так что записать её можно только в момент вставки.
+    """
     meta: dict[str, object] = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -203,4 +223,6 @@ def _meta(
     }
     if file_id is not None:
         meta["file_id"] = file_id
+    if answers is not None:
+        meta["answers"] = dict(answers)
     return meta
