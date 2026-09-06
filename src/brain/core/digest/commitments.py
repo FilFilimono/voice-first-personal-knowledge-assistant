@@ -27,16 +27,20 @@
 """
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
+from brain.core.digest import touches
 from brain.storage.db import session_scope
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.commitment import Commitment, CommitmentState
+from brain.storage.models.entry import Entry
+from brain.storage.models.topic import EntryTopic
 from brain.storage.models.unit import EntryUnit
 
 logger = logging.getLogger(__name__)
@@ -133,6 +137,83 @@ async def open_ones(now: datetime, limit: int | None = None) -> list[Commitment]
 
     async with session_scope() as session:
         return list((await session.scalars(statement)).all())
+
+
+async def for_morning(now: datetime, limit: int) -> list[Commitment]:
+    """Дела, которые показывает утро. Не старейшие — и это главная правка дня.
+
+    **Претензия владельца 6 сентября 2026, дословно:** «висит раз, два, три
+    и ещё 64. Эти три я вижу каждое утро, они одинаковые. Самая ненужная
+    херня, которая может быть».
+
+    Он прав по построению, а не по случайности: `open_ones` отдаёт дела
+    от старых к новым, показывается верхушка из трёх, и пока эти три
+    не закроют, они будут приходить каждое утро до конца времён. Список
+    из 67 дел при этом виден на одну двадцатую.
+
+    Порядок теперь по трём разрядам, и владелец назвал все три сам —
+    «по теме дня, по свежести упоминания, с ротацией»:
+
+    1. **когда дело показывали последний раз** — не показанное ни разу идёт
+       первым. Это и есть ротация: три дела в день на 67 открытых дают полный
+       круг примерно за три недели, и ни одно не пропадает навсегда;
+    2. **когда последний раз была запись по теме этого дела** — свежее выше.
+       Это «тема дня»: если вчера владелец говорил про учёбу, утром поднимутся
+       дела по учёбе. Считается по темам записи-источника, ноль вызовов модели;
+    3. **возраст дела** — прежнее правило, ставшее последним разрядом.
+       `vision.md` §7 требует эскалации вверх по важности, а «висит дольше
+       всех» — единственная мера важности, которая есть без спроса.
+
+    **Почему ротация первым разрядом, а не свежесть.** Свежесть первой дала бы
+    ту же болезнь с другим лицом: дела «горячей» темы показывались бы каждое
+    утро, пока тема горяча, а остальные шестьдесят не показались бы никогда.
+    Ротация — это и есть обещание, что дело однажды придёт; свежесть решает
+    только, в каком порядке внутри этого обещания.
+    """
+    open_now = await open_ones(now)
+    if not open_now:
+        return []
+
+    shown = await touches.deeds_shown()
+    fresh = await _topic_freshness()
+
+    def rank(item: Commitment) -> tuple[date, float, datetime, int]:
+        # Свежесть — со знаком минус: сортировка по возрастанию, а свежее
+        # должно быть выше. Ноль означает «темы нет вовсе» и уводит дело вниз
+        # своей группы, а не выкидывает его: дело без темы всё равно висит.
+        moment = fresh.get(item.id)
+        return (
+            shown.get(item.id, date.min),
+            -moment.timestamp() if moment is not None else 0.0,
+            item.created_at,
+            item.id,
+        )
+
+    return sorted(open_now, key=rank)[:limit]
+
+
+async def _topic_freshness() -> dict[int, datetime]:
+    """Когда по теме каждого дела последний раз что-то записывали.
+
+    Тема у дела не своя: она берётся у записи-источника, а «свежесть темы» —
+    это момент **последней** записи по любой из этих тем. Один запрос,
+    ни одного вызова модели (принцип 12): темы уже размечены.
+    """
+    theirs = aliased(EntryTopic)
+    others = aliased(EntryTopic)
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Commitment.id, func.max(Entry.created_at))
+                .join(theirs, theirs.source_entry_id == Commitment.source_entry_id)
+                .join(others, others.topic_id == theirs.topic_id)
+                .join(Entry, Entry.id == others.source_entry_id)
+                .group_by(Commitment.id)
+            )
+        ).all()
+
+    return {int(row[0]): row[1] for row in rows if row[1] is not None}
 
 
 async def open_count(now: datetime) -> int:

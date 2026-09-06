@@ -43,6 +43,7 @@ from brain.core import status as core_status
 from brain.core.llm import limits
 from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
+from brain.core.present import archive_question, archive_topics
 from brain.core.retrieval import search
 from brain.core.scheduler import recurrence, reminders
 from brain.storage.models.annotation import AnnotationType
@@ -65,6 +66,20 @@ PRIVATE_VOICE_REFUSED = (
 )
 SEARCH_FAILED = "Поиск не отработал — посмотрите логи. Записи целы."
 
+# Приватный режим: разговор по теме идёт (он не выходит за пределы базы),
+# а поиск — нет. Поиску нужен вектор запроса, а вектор считает внешняя модель,
+# то есть текст владельца ушёл бы наружу ровно в том режиме, который заведён
+# затем, чтобы он наружу не уходил (инвариант 5).
+#
+# Молчать здесь нельзя: сообщение уже легло записью, и владелец, не получивший
+# ответа, решит, что архив пуст, — та же ошибка, что и «Ничего не нашёл» после
+# падения провайдера.
+ARCHIVE_PRIVATE = (
+    "Приватный режим — по архиву не ищу: запрос ушёл бы наружу за вектором.\n"
+    "Мысль записана. Разговор по теме («что там по учёбе») работает и здесь — "
+    "он никуда не ходит."
+)
+
 # Тексты среза по темам. Молчание здесь — обычный исход: тем меньше двух
 # означает, что срезом это не назовёшь (`core/digest/by_topic`).
 NO_TOPICS = (
@@ -79,7 +94,10 @@ RESULTS = 5
 
 HELP = (
     "Пишите или наговаривайте — сохраню.\n"
-    "Скажите «напомни завтра в 10 …» — напомню.\n\n"
+    "Скажите «напомни завтра в 10 …» — напомню.\n"
+    # Примеры фраз, а не список функций (`vision.md` §14): списки не читают.
+    "Спросите «что там по учёбе» или «что я думал про работу» — расскажу, "
+    "что записано. Сообщение при этом всё равно сохранится.\n\n"
     "/find <что искать> — поиск по архиву\n"
     "/recall — о чём вы думали за неделю; /recall <тема> — вспомнить подробно\n"
     "/status — всё ли работает\n"
@@ -217,14 +235,14 @@ def build_router(settings: Settings) -> Router:
             await message.answer(await digest.by_topic.text(writer, found, days=days, now=now))
             return
 
-        remembered = await digest.by_topic.pick(topic, now)
-        if remembered is None:
+        talk = await archive_topics.collect(topic, now)
+        if talk is None:
             known = await digest.by_topic.names(now, days=days)
             listed = ", ".join(known) if known else "пока никаких"
             await message.answer(NO_SUCH_TOPIC.format(topic=topic, known=listed))
             return
 
-        await message.answer(digest.render.resurfaced(remembered, timezone=settings.brain_timezone))
+        await message.answer(archive_topics.text(talk, timezone=settings.brain_timezone, now=now))
 
     @router.message(F.voice)
     async def voice(message: Message) -> None:
@@ -296,12 +314,14 @@ def build_router(settings: Settings) -> Router:
             answers=await _answering(message),
         )
 
+        private = await repository.is_private_mode()
+
         try:
             async with capture_transaction() as uow:
                 result = await ingest.capture_text(
                     uow,
                     incoming,
-                    is_private=await repository.is_private_mode(),
+                    is_private=private,
                     timezone=settings.brain_timezone,
                     now=datetime.now(UTC),
                 )
@@ -311,6 +331,8 @@ def build_router(settings: Settings) -> Router:
             return
 
         if result.duplicate:
+            # Тот же апдейт пришёл дважды. Ни записи, ни ответа по архиву:
+            # владелец спрашивал один раз.
             await ack.delete()
             return
 
@@ -319,9 +341,80 @@ def build_router(settings: Settings) -> Router:
             # («когда напомнить?») кнопок не получает: ответ там свободный,
             # и кнопка под ним обещала бы не то.
             await ack.edit_text(result.reply, reply_markup=yes_no_keyboard(result.entry_id))
+        else:
+            await ack.edit_text(result.reply)
+
+        # Ответ по архиву идёт **после** записи и **отдельным сообщением**.
+        # См. `_from_archive`: это и есть то место, где решается, что делать
+        # с ложным срабатыванием признака.
+        await _from_archive(message, private=private)
+
+    async def _from_archive(message: Message, *, private: bool) -> None:
+        """Ответить по архиву на сообщение, которое выглядит вопросом к нему.
+
+        **Запись при этом уже сохранена, и это главное решение здесь.** Признак
+        «вопрос к архиву» разбирает код по конечному списку форм
+        (`present/archive_question`), и ошибаться он будет в обе стороны.
+        Цена ошибок разная, и потому они разведены:
+
+            признак не сработал   владелец получил «Записал.» и не получил
+                                  ответа — обидно, но мысль цела, и `/find`
+                                  никуда не делся;
+            признак сработал зря  владелец получил «Записал.» **и** лишнее
+                                  сообщение с выдачей поиска — шум на один
+                                  экран, и мысль всё равно цела.
+
+        Другой порядок («это похоже на вопрос — значит, не записываю»)
+        недопустим ни при каком качестве признака: `entries` только на вставку
+        (инвариант 3), и не сохранённая мысль не восстановится ниоткуда —
+        ни командой, ни из логов, ни из переписки. Поэтому поиск здесь
+        **добавляется** к записи, а не заменяет её, и подтверждение «Записал.»
+        владелец видит в любом случае.
+
+        Порядок внутри тоже не случайный: сначала разговор по теме, потом
+        поиск. Разговор не выходит за пределы базы и стоит ноль запросов
+        к провайдеру, а поиск платит вектором запроса за каждый вопрос.
+        """
+        if not settings.archive_answers:
+            # Выключатель есть у всего, что живёт на каждом сообщении
+            # (`LINKS_ENABLED`, `CLEANUP_ENABLED`): снимать такой механизм
+            # надо строкой в `.env`, а не правкой кода. Молчание тут полное —
+            # запись при этом сохраняется, она сохранилась выше по коду.
             return
 
-        await ack.edit_text(result.reply)
+        question = archive_question.asked(
+            message.text or "", mark_limit=settings.archive_question_mark_limit
+        )
+        if question is None:
+            return
+
+        # Срабатывание механизма, живущего на каждом сообщении, обязано быть
+        # видно в журнале: иначе «почему он вдруг ответил поиском» не разобрать.
+        logger.info("вопрос к архиву (%s): %r", question.signal, question.query)
+        now = datetime.now(UTC)
+
+        try:
+            talk = await archive_topics.collect(question.query, now)
+            if talk is not None:
+                await message.answer(
+                    archive_topics.text(talk, timezone=settings.brain_timezone, now=now)
+                )
+                return
+
+            if private:
+                await message.answer(ARCHIVE_PRIVATE)
+                return
+
+            embedder = embeddings.build_embedder(settings)
+            found = await search.search(embedder, question.query, limit=RESULTS)
+        except Exception:
+            # Поиск ходит наружу за вектором запроса, и провайдер падает.
+            # Молчать нельзя: владелец решит, что в архиве ничего нет.
+            logger.exception("ответ по архиву не собрался: %r", question.query)
+            await message.answer(SEARCH_FAILED)
+            return
+
+        await message.answer(search_text.render(question.query, found, today=now))
 
     async def _answered_a_question(message: Message) -> bool:
         """Разобрать ответ на «когда напомнить?». `False` — это не ответ.

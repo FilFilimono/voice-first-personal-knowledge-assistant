@@ -182,6 +182,38 @@ async def shown_in_evening() -> set[int]:
     return {int(value) for row in rows if row for value in row}
 
 
+async def deeds_shown() -> dict[int, date]:
+    """Когда каждое дело последний раз показывалось в утренней сводке.
+
+    Основание ротации, заведённой 6 сентября 2026. Претензия владельца
+    дословно: «висит раз, два, три и ещё 64. Эти три я вижу каждое утро, они
+    одинаковые». Так и было по построению: отбор шёл по возрасту, а старейшие
+    из шестидесяти семи дел каждое утро одни и те же.
+
+    Считается **по журналу касаний**, а не колонкой «показано» у дела:
+    журнал уже хранит, что именно ушло, и вторая копия однажды разошлась бы
+    с первой молча — та же причина, по которой здесь живут `shown_in_evening`
+    и `resurfaced_since`. Заодно колонка с числом показов рано или поздно
+    прочиталась бы вслух, а это счётчик (`vision.md` §7.0, п.5).
+    """
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Touch.local_date, Touch.payload["commitment_ids"]).where(
+                    Touch.slot == TouchSlot.MORNING, Touch.sent_at.is_not(None)
+                )
+            )
+        ).all()
+
+    seen: dict[int, date] = {}
+    for day, ids in rows:
+        for value in ids or []:
+            deed_id = int(value)
+            if seen.get(deed_id, date.min) < day:
+                seen[deed_id] = day
+    return seen
+
+
 async def resurfaced_since(day: date) -> set[int]:
     """Какие записи уже всплывали начиная с этих суток.
 

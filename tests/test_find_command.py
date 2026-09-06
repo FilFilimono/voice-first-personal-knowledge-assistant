@@ -3,13 +3,21 @@
 1. `/find` возвращает найденное, и у каждой строки есть дата
 2. `/find` без запроса объясняет, как им пользоваться, а не молчит
 3. ничего не нашлось — так и говорит
-4. обычное сообщение **не** перехватывается поиском: оно записывается
+4. обычное сообщение **не теряется** из-за того, что похоже на вопрос
 5. упавший поиск объясняется вслух и не выглядит как пустой архив
 6. приватная запись в выдаче помечена
 
-Пункт 4 — главный. Захват это единственное, что в системе не имеет права
-работать через раз, поэтому поиск живёт командой, а не словом «найди»
-в начале сообщения.
+Пункт 4 — главный, и 06.09.2026 он переформулирован. Раньше он звучал
+«обычное сообщение не перехватывается поиском», и поиск жил только командой:
+слово «найди» в начале мысли считалось мыслью. Владелец отверг это прямо —
+«ты должен зайти, прочитать и вспомнить, а он тебе даже этого не даёт», —
+и теперь похожее на вопрос сообщение отвечается поиском тоже.
+
+Неизменной осталась причина, по которой пункт главный: захват — единственное,
+что в этой системе не имеет права работать через раз. Поэтому поиск
+**добавляется** к записи, а не заменяет её, и ложное срабатывание признака
+стоит лишнего сообщения, а не мысли. Разбор признака и его цена —
+`tests/test_archive_talk.py`.
 """
 
 import asyncio
@@ -94,7 +102,18 @@ def dispatcher(
 
     monkeypatch.setattr("brain.adapters.telegram.handlers.capture_transaction", fake_transaction)
     monkeypatch.setattr("brain.adapters.telegram.handlers.repository.is_private_mode", not_private)
+
+    async def no_topic(name: str, now: datetime) -> None:
+        """Тем в быстром тесте нет: база сюда не поднимается.
+
+        Подменять обязательно. Без этого разговор по теме полез бы в базу,
+        упал бы там и увёл ответ в «Поиск не отработал» — то есть тест был бы
+        зелёным по неправильной причине, а поиск не проверялся бы вовсе.
+        """
+        return None
+
     monkeypatch.setattr("brain.adapters.telegram.handlers.search.search", searcher)
+    monkeypatch.setattr("brain.adapters.telegram.handlers.archive_topics.collect", no_topic)
     monkeypatch.setattr(
         "brain.adapters.telegram.handlers.embeddings.build_embedder", lambda settings: object()
     )
@@ -181,11 +200,19 @@ async def test_broken_search_is_not_an_empty_archive(
 async def test_ordinary_message_is_still_captured(
     dispatcher: Dispatcher, bot: Bot, uow: FakeUnitOfWork, searcher: SearchSpy
 ) -> None:
-    """Слово «найди» в начале мысли — это мысль, а не команда."""
+    """Слово «найди» в начале мысли уводит в поиск — но записи не стоит.
+
+    С 06.09.2026 «найди» входит в список признаков вопроса к архиву
+    (`present/archive_question.OPENINGS`), и на этой фразе признак срабатывает
+    **зря**: «найди время на разбор задач» — задача, а не вопрос. Цена ошибки
+    названа здесь целиком: владелец получит лишнее сообщение с выдачей поиска,
+    а мысль всё равно ляжет записью. Обратный порядок был бы недопустим —
+    `entries` только на вставку.
+    """
     await dispatcher.feed_update(bot, make_update(make_message(text="найди время на разбор задач")))
 
     assert uow.entries[0].raw_text == "найди время на разбор задач"
-    assert searcher.queries == []
+    assert searcher.queries == ["время на разбор задач"]
 
 
 async def test_command_is_advertised() -> None:

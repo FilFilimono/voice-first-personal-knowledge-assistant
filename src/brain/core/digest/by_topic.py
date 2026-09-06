@@ -66,31 +66,43 @@ class Slice:
     """Срез по темам за период."""
 
     topics: list[Counted]
-    since: datetime
+    # `None` — срез по всему архиву, а не за окно. Тип честный, а не удобный:
+    # подставить сюда «начало времён» значило бы соврать про границу.
+    since: datetime | None
     until: datetime
 
 
-async def collect(now: datetime, *, days: int) -> Slice | None:
+async def collect(now: datetime, *, days: int | None) -> Slice | None:
     """Темы за период. `None` — срезом это назвать нельзя.
 
     Считается по времени записи, а не по времени разметки: владельца
     интересует, о чём он думал на неделе, а не когда воркер разгрёб очередь.
+
+    **`days=None` означает весь архив, и это не удобство вызова.** Утреннее
+    сообщение показывает срез именно так — решение владельца 06.09.2026.
+    Довод его же, дословно: за счётчиком «и ещё 64» лежат записи, которые
+    он забыл и достать не может, и заменяется счётчик не другим числом,
+    а **доступом к архиву**. Архив при этом весь, а не недельный: неделя
+    отвечает на вопрос «о чём я думал», а забытое лежит не в ней.
+    Живая проверка 06.09.2026 показала, зачем это разделение: за последнюю
+    неделю в архиве **ноль записей**, и недельный срез молчал бы.
     """
-    since = now - timedelta(days=days)
+    since = None if days is None else now - timedelta(days=days)
 
     async with session_scope() as session:
-        rows = (
-            await session.execute(
-                select(Topic.name, func.count().label("entries"))
-                .select_from(EntryTopic)
-                .join(Topic, Topic.id == EntryTopic.topic_id)
-                .join(Entry, Entry.id == EntryTopic.source_entry_id)
-                .where(Entry.created_at >= since, Entry.created_at <= now)
-                .group_by(Topic.name)
-                .order_by(func.count().desc(), Topic.name)
-                .limit(MAX_TOPICS)
-            )
-        ).all()
+        query = (
+            select(Topic.name, func.count().label("entries"))
+            .select_from(EntryTopic)
+            .join(Topic, Topic.id == EntryTopic.topic_id)
+            .join(Entry, Entry.id == EntryTopic.source_entry_id)
+            .where(Entry.created_at <= now)
+            .group_by(Topic.name)
+            .order_by(func.count().desc(), Topic.name)
+            .limit(MAX_TOPICS)
+        )
+        if since is not None:
+            query = query.where(Entry.created_at >= since)
+        rows = (await session.execute(query)).all()
 
     if len(rows) < MIN_TOPICS:
         logger.info("срез по темам не собирается: тем за %s дн. — %s", days, len(rows))
@@ -103,7 +115,9 @@ async def collect(now: datetime, *, days: int) -> Slice | None:
     )
 
 
-async def text(model: LanguageModel | None, found: Slice, *, days: int, now: datetime) -> str:
+async def text(
+    model: LanguageModel | None, found: Slice, *, days: int | None, now: datetime
+) -> str:
     """Срез словами. Список тем и приглашение — код, первая строка — см. `recall`.
 
     Приглашение называет команду прямо и с примером: «спросите» без образца
@@ -120,8 +134,10 @@ async def text(model: LanguageModel | None, found: Slice, *, days: int, now: dat
     )
 
 
-def _period(days: int) -> str:
+def _period(days: int | None) -> str:
     """Период по-русски. Неделя — это неделя, а не «7 дн.»."""
+    if days is None:
+        return "всё время"
     return "неделю" if days == 7 else f"{days} дн."
 
 
@@ -182,7 +198,7 @@ async def eligible(name: str, now: datetime) -> list[Old]:
     ]
 
 
-async def names(now: datetime, *, days: int) -> list[str]:
+async def names(now: datetime, *, days: int | None) -> list[str]:
     """Темы периода списком — чтобы сказать, что можно вспомнить.
 
     Нужна там, где владелец назвал тему, которой нет: список вместо «не нашёл»

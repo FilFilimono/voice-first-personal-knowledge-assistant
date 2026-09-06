@@ -29,8 +29,9 @@
 from dataclasses import dataclass
 from datetime import datetime
 
+from brain.core.digest import by_topic, loops
 from brain.core.digest import commitments as commitment_store
-from brain.core.digest import loops
+from brain.core.digest.by_topic import Slice
 from brain.core.present.digest import MAX_DEEDS
 from brain.storage.models.commitment import Commitment
 from brain.storage.models.loop import Loop
@@ -53,6 +54,9 @@ class Morning:
     commitments: list[Commitment]
     open_commitments: int
     loop: Loop | None
+    # Срез по темам всего архива — то, что встало на место счётчика «и ещё 64».
+    # `None` — тем меньше двух, срезом это не назвать (`digest/by_topic`).
+    topics: Slice | None = None
 
     @property
     def empty(self) -> bool:
@@ -63,6 +67,12 @@ class Morning:
         «Со вчера ждут разбора: 2», и после него неразобранное перестало быть
         поводом отправить сводку. Теперь оно не попадает в неё вовсе — см.
         шапку модуля, — и это условие осталось тем же самым: дела и петля.
+
+        **Срез по темам поводом отправить сводку не является, и это намеренно.**
+        Он не меняется день ото дня — это оглавление архива, а не новость,
+        — и сводка, состоящая из одного оглавления, была бы ежедневным
+        сообщением ни о чём. Он приходит вместе с тем, что и так есть,
+        и добавляет к нему доступ к архиву.
         """
         return not self.commitments and self.loop is None
 
@@ -89,10 +99,17 @@ async def collect(now: datetime) -> Morning:
     """
     # Момент нужен и здесь: отложенное дело возвращается сроком, а не заданием,
     # и «что висит» — вопрос про сейчас, а не про состояние в базе.
-    open_now = await commitment_store.open_ones(now)
-
+    #
+    # Показываемые дела и их общее число считаются **разными запросами**,
+    # и с 6 сентября 2026 иначе нельзя: отбор больше не «верхушка списка»,
+    # а ротация со свежестью темы (`commitments.for_morning`), и срезать
+    # её из общего списка значило бы повторить порядок в двух местах.
     return Morning(
-        commitments=open_now[:COMMITMENTS_SHOWN],
-        open_commitments=len(open_now),
+        commitments=await commitment_store.for_morning(now, COMMITMENTS_SHOWN),
+        open_commitments=await commitment_store.open_count(now),
         loop=await loops.pick(now),
+        # Срез по **всему** архиву, а не за неделю: он заменил счётчик «и ещё
+        # 64», а за тем счётчиком лежало забытое, и лежало оно не в последней
+        # неделе. Разбор — `by_topic.collect`.
+        topics=await by_topic.collect(now, days=None),
     )

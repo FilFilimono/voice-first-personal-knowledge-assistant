@@ -21,12 +21,30 @@
 вся ценность которой в архиве, разрушает собственное сырьё.
 
 **Отбор — код, речь — модель, и сегодня даже речь код** (принцип 12). Какой
-вопрос, к какой теме, к какому делу и в какой день — считается запросами
+вопрос, к какой теме, к какой записи и в какой день — считается запросами
 к архиву, ноль вызовов модели. Формулировку в полном режиме пишет модель
-(`core/present/question`), и ветка под это лежит за `WRITTEN`, выключенным
-по умолчанию.
+(`core/present/question`), и ветка под это лежит за `PROMPTING_WRITTEN`,
+выключенным по умолчанию.
 
-Четыре правила отбора, каждое со своей опорой:
+**Набор урезан владельцем 6 сентября 2026 с восьми видов до пяти**, и два
+оставшихся переписаны. Вычеркнуты `last_time` (те же данные, что у затихшей
+темы, — пара вопросов через день), `own_side` и `intention` (оба стояли
+на делах, а дела из утреннего сообщения уходят). Переписаны:
+
+- **`look_back`** брал запись по возрасту, то есть выдавал старое, ни с чем
+  не связанное, — ровно та претензия, ради которой набор и пересматривался.
+  Теперь старая запись ищется **по близости к тому, о чём владелец говорит
+  сейчас**; связного нет — вид молчит;
+- **`blocker`** звучал «Что вчера помешало?» и был единственным без факта
+  перед вопросом: предполагал провал до того, как он известен. Теперь это факт
+  из данных плюс «что мешает?», а срабатывает он на теме, в которую владелец
+  возвращается без движения.
+
+Пять правил отбора, каждое со своей опорой:
+
+- **из архива достаётся связанное, а не случайное** (решение владельца
+  06.09.2026): молчание честнее несвязанной цитаты, потому что одна такая
+  обесценивает и все остальные;
 
 - **один вопрос в сообщении** (§1.3): раскачка молчит в тот день, когда
   сообщение слота уже о чём-то спрашивает — например, когда в сводке есть
@@ -44,7 +62,8 @@
   вслух — других судеб у числа в базе не бывает (`vision.md` §7.0, п.5).
 
 **Чего в наборе нет намеренно.** Шкал и «change ruler» (§1.5, п.8) — это
-счётчик, запрещённый §7.0 п.5, и владелец подтвердил отказ. Вопросов про то,
+счётчик, запрещённый §7.0 п.5, и владелец подтвердил отказ. Вопросов, стоящих
+на списке дел, — вычеркнуты 06.09.2026 вместе с самим списком. Вопросов про то,
 что зависит от других людей (§2.3) — такие подсказки не отзываются вовсе;
 вместо сужения тем вопрос переформулируется **на часть владельца**: не «почему
 созвон не состоялся», а «что ты успел со своей стороны». Вопроса «как
@@ -54,43 +73,52 @@
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, literal_column, select
 
+from brain.config import PromptingSlot, Settings, get_settings
 from brain.core.digest import slots
+from brain.core.memory import overrides
 from brain.core.memory.repository import display_text, is_private_now
 from brain.core.ports import LanguageModel
 from brain.core.present import guard
 from brain.core.present import question as writer
+from brain.core.retrieval import links
 from brain.storage.db import session_scope
-from brain.storage.models.commitment import Commitment, CommitmentState
+from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.entry import Entry
 from brain.storage.models.topic import EntryTopic, Topic
 from brain.storage.models.touch import Touch, TouchSlot
 
 logger = logging.getLogger(__name__)
 
-# --- Настройки. Пока константы, и это надо знать ---
+# --- Слоты: настройка, а не константа ---
 #
-# Обе обязаны переехать в `brain.config` — «переключение стоит смены настроек,
-# а не переписывания кода» (требование владельца, план Фазы 4). Здесь они
-# лежат временно: файл настроек в момент написания блока A правился соседней
-# работой, и две руки в одном файле стоят дороже, чем перенос двух строк.
-# Точный текст полей — в отчёте блока A.
+# Здесь только перевод имени из `.env` в значение колонки. Сам список живёт
+# в `brain.config` (`PROMPTING_SLOTS`) — решение владельца № 2 от 27.08.2026,
+# и до 6 сентября оно было нарушено: константа модуля значила, что переключить
+# режим без правки кода нельзя. Перевод не в настройках, потому что
+# `brain.config` не импортирует `brain.storage`.
+_BY_NAME: dict[PromptingSlot, TouchSlot] = {
+    "morning": TouchSlot.MORNING,
+    "day": TouchSlot.DAY,
+    "evening": TouchSlot.EVENING,
+}
 
-# В каких слотах спрашивать. **По умолчанию только утро** — решение владельца
-# № 2 от 27.08.2026: каждый слот это отдельный запрос в сутки, и упирается это
-# в квоту, а не во вкус. Полный режим добавляет сюда `DAY` и `EVENING`.
-SLOTS: tuple[TouchSlot, ...] = (TouchSlot.MORNING,)
 
-# Вопрос пишет модель, а не шаблон кода. Выключено — это минимальный режим
-# Фазы 4. Ветка за флагом написана вместе с ним и проверяется тестом от входа
-# системы с флагом, поднятым в самом тесте (`tests/test_prompting_path.py`).
-WRITTEN = False
+def slots_from(settings: Settings) -> frozenset[TouchSlot]:
+    """В каких слотах спрашивать. Пусто — раскачка молчит везде.
+
+    Пустое множество здесь законно и означает выключатель: `PROMPTING_SLOTS=`
+    в `.env` — естественный способ сказать «не спрашивай», и он обязан работать
+    без правки кода, ровно как пустая квота означает «лимит неизвестен».
+    """
+    return frozenset(_BY_NAME[name] for name in settings.prompting_slots)
+
 
 # --- Пороги отбора ---
 
@@ -113,10 +141,49 @@ MIN_TOPIC_ENTRIES = 3
 # конкретное действие, без оценки и без счёта достижений.
 RETURN_DAYS = 3
 
-# Окно «оглянуться назад» (§1.5, п.5). Ближе двух недель — это ещё не «назад»,
-# владелец такое помнит и сам; дальше двух месяцев — уже археология.
+# Насколько старше должна быть запись, чтобы «оглянуться назад» на неё имело
+# смысл (§1.5, п.5). Ближе двух недель — это ещё не «назад», владелец такое
+# помнит и сам.
+#
+# **Верхней границы больше нет, и это решение владельца 6 сентября 2026.**
+# Здесь стояло `LOOK_BACK_MAX = 60 дней` — «дальше двух месяцев уже
+# археология». Оно было верно, пока старая запись выбиралась по возрасту:
+# случайная мысль полугодовой давности действительно не к месту. Теперь запись
+# выбирается **по связи с тем, о чём владелец говорит сейчас**, и относимость
+# обеспечивает связь, а не окно. Прошлогодняя запись про то же самое — это
+# как раз то, ради чего система и заводилась.
 LOOK_BACK_MIN = timedelta(days=14)
-LOOK_BACK_MAX = timedelta(days=60)
+
+# Что считается «сейчас»: окно, из которого берётся запись, к которой ищется
+# старая.
+#
+# **Неделя, а не три дня, и число выбрано живой проверкой 06.09.2026,
+# а не рассуждением.** Первая редакция брала три дня — то же окно, что
+# у затихшей темы. Прогон по рабочему архиву показал, что в этом окне
+# **ноль записей**: последняя сделана 1 сентября, а сегодня шестое. То есть
+# вид, названный владельцем главным, молчал бы в день собственного включения
+# и молчал бы молча — ровно тот почерк, из-за которого Фаза 4 неделю выглядела
+# работающей.
+#
+# Дальше недели окно не растягивается намеренно: молчание длиннее недели —
+# это уже случай затихшей темы (`quiet_topic`), и у него свой вопрос.
+RECENT = timedelta(days=7)
+
+# Сколько свежих записей опрашивать, прежде чем сдаться. Каждая — один запрос
+# к векторам, то есть цена перебора видна; десяти хватает на три дня живого
+# темпа (9.4 записи в день), а связь находится у четырёх записей из пяти.
+RECENT_TRIED = 10
+
+# Окно, в котором тема считается «упоминается несколько раз». Неделя — то же
+# окно, что у среза по темам: меньше — и три упоминания собираются редко,
+# больше — и «сейчас» перестаёт быть сейчас.
+STUCK_WINDOW = timedelta(days=7)
+
+# Что считается движением по теме. Решение и понимание — единственные два типа,
+# в которых владелец сам говорит, что сдвинулся; остальные семь этого не
+# говорят, включая `task`: заведённая задача — это ещё не движение, а его
+# намерение.
+MOVED: frozenset[AnnotationType] = frozenset({AnnotationType.DECISION, AnnotationType.INSIGHT})
 
 # Короче этого не цитируется: «ок», «в 14:50», проверка бота — там нечего
 # вспоминать, а вытащенный обрывок читается как сбой. То же число, что
@@ -148,10 +215,29 @@ class Question:
     kind: str
     method: str
     text: str
+    # Факт, на котором стоит вопрос, — то, что владелец читает **до** него.
+    # Пустая строка означает, что факт вошёл в сам вопрос и отдельной части
+    # у него нет; так устроены четыре вида из пяти.
+    #
+    # Отдельной частью он появился 6 сентября 2026 вместе с новым порядком
+    # утреннего сообщения: материал сверху, вопрос в конце (решение владельца).
+    # Разделять пришлось потому, что это одна вещь на два места в сообщении,
+    # а не две разные: цитата из архива и вопрос про неё.
+    material: str = ""
     entry_ids: tuple[int, ...] = ()
     # То, из чего собран вопрос, — вход модельной ветки. Приватного здесь
     # не бывает: отбор берёт цитаты запросом с `~is_private_now()`.
     facts: tuple[str, ...] = ()
+
+    @property
+    def whole(self) -> str:
+        """Вопрос вместе с фактом — там, где они идут одним куском.
+
+        Так он уходит везде, кроме утреннего сообщения: в слоте, которому
+        больше нечего сказать, вопрос обязан нести свой факт с собой, иначе
+        «Что с тех пор изменилось?» приходит само по себе и не значит ничего.
+        """
+        return f"{self.material} {self.text}" if self.material else self.text
 
 
 Builder = Callable[[datetime, str], Awaitable[Question | None]]
@@ -171,6 +257,9 @@ class Item:
     source: str
     template: str
     build: Builder
+    # Шаблон факта, который в утреннем сообщении показывается **отдельно
+    # и выше** вопроса. Пусто — факт входит в сам вопрос.
+    fact: str = ""
     # Чем подставляются поля шаблона, когда вопрос показывают вне архива:
     # в тестах и в отчёте владельцу. Выдуманы намеренно — живая речь в git
     # не уходит (ADR-0002).
@@ -280,22 +369,44 @@ async def _silent_topic(now: datetime) -> _Gap | None:
     return _Gap(topic=str(row[0]), days=max(1, (now - row[1]).days), last=last)
 
 
-async def _last_of_topic(name: str) -> _Recorded | None:
-    """Последняя **неприватная** запись темы. Она же — цитата и связь."""
+async def _last_of_topic(
+    name: str, *, since: datetime | None = None, quotable: bool = False
+) -> _Recorded | None:
+    """Последняя **неприватная** запись темы. Она же — цитата и связь.
+
+    Две поправки, и обе заведены по разбору тестов 06.09.2026 — то есть найдены
+    чтением кода вокруг новых тестов, а не падением:
+
+    - **`since`** ограничивает окном. Без него `blocker` мог процитировать
+      запись месячной давности, назвав её словами «тема, в которую ты
+      возвращаешься»: тема набрала три записи за неделю, а последняя
+      **неприватная** оказалась старше окна. Факт при этом остался бы верным,
+      а цитата — не из того времени, о котором речь;
+    - **`quotable`** требует длины. Там, где текст показывается владельцу,
+      «ок» или «в 14:50» читаются как сбой, а не как его мысль. Тот же порог,
+      что у всплывания и у цитат раскачки.
+
+    Оба выключены по умолчанию намеренно: `quiet_topic` и `returning` берут
+    отсюда только номер записи и не цитируют её вовсе, а лишний порог сделал
+    бы их молчаливыми там, где сказать есть что.
+    """
     body = display_text()
 
     async with session_scope() as session:
-        row = (
-            await session.execute(
-                select(Entry.id, body, Entry.created_at)
-                .select_from(EntryTopic)
-                .join(Topic, Topic.id == EntryTopic.topic_id)
-                .join(Entry, Entry.id == EntryTopic.source_entry_id)
-                .where(Topic.name == name, ~is_private_now(), body.is_not(None))
-                .order_by(Entry.created_at.desc())
-                .limit(1)
-            )
-        ).first()
+        query = (
+            select(Entry.id, body, Entry.created_at)
+            .select_from(EntryTopic)
+            .join(Topic, Topic.id == EntryTopic.topic_id)
+            .join(Entry, Entry.id == EntryTopic.source_entry_id)
+            .where(Topic.name == name, ~is_private_now(), body.is_not(None))
+            .order_by(Entry.created_at.desc())
+            .limit(1)
+        )
+        if since is not None:
+            query = query.where(Entry.created_at >= since)
+        if quotable:
+            query = query.where(func.length(body) >= MIN_LENGTH)
+        row = (await session.execute(query)).first()
 
     if row is None:
         return None
@@ -367,37 +478,105 @@ async def _recorded(*, since: datetime, until: datetime, newest: bool = True) ->
     return _Recorded(entry_id=int(row[0]), text=str(row[1]), created_at=row[2])
 
 
-@dataclass(frozen=True, slots=True)
-class _Deed:
-    """Дело в том виде, в каком его видит отбор."""
+async def _lately(now: datetime, limit: int) -> list[_Recorded]:
+    """Последние записи — то, «про что владелец сейчас». Свежие первыми.
 
-    entry_id: int
-    text: str
+    Нужны связанному всплыванию: старая запись выбирается не случайно, а по
+    близости к тому, о чём владелец говорил на днях. Отбор здесь тот же, что
+    у цитаты, — неприватные и не короче `MIN_LENGTH`.
+    """
+    body = display_text()
 
-
-async def _deed(state: CommitmentState, now: datetime) -> _Deed | None:
-    """Старейшее дело в этом состоянии, заведённое из **неприватной** записи."""
     async with session_scope() as session:
-        row = (
+        rows = (
             await session.execute(
-                select(
-                    Commitment.source_entry_id,
-                    func.coalesce(Commitment.title, Commitment.text),
-                )
-                .join(Entry, Entry.id == Commitment.source_entry_id)
+                select(Entry.id, body, Entry.created_at)
                 .where(
-                    Commitment.state == state,
-                    Commitment.created_at <= now,
+                    Entry.created_at >= now - RECENT,
+                    Entry.created_at <= now,
                     ~is_private_now(),
+                    func.length(body) >= MIN_LENGTH,
                 )
-                .order_by(Commitment.created_at.asc())
-                .limit(1)
+                .order_by(Entry.created_at.desc())
+                .limit(limit)
             )
-        ).first()
+        ).all()
 
-    if row is None:
-        return None
-    return _Deed(entry_id=int(row[0]), text=" ".join(str(row[1]).split()))
+    return [_Recorded(entry_id=int(row[0]), text=str(row[1]), created_at=row[2]) for row in rows]
+
+
+async def _subject(entry_id: int) -> str | None:
+    """Тема записи — то, чем в сообщении называется «про что ты сейчас».
+
+    `None` — темы нет, и тогда вид молчит на этой записи и пробует следующую.
+    Подставлять вместо темы обрывок текста нельзя: «ты сейчас про надо бы
+    посмотреть» — это не название предмета, а середина фразы.
+    """
+    async with session_scope() as session:
+        name = await session.scalar(
+            select(Topic.name)
+            .select_from(EntryTopic)
+            .join(Topic, Topic.id == EntryTopic.topic_id)
+            .where(EntryTopic.source_entry_id == entry_id)
+            .order_by(Topic.name)
+            .limit(1)
+        )
+    return None if name is None else str(name)
+
+
+async def _stuck_topic(now: datetime) -> _Recorded | None:
+    """Тема, о которой владелец говорит и в которой ничего не сдвинулось.
+
+    Возвращается **последняя запись** такой темы: она и есть факт, с которого
+    начинается вопрос.
+
+    **Что здесь считается движением, и почему именно это.** Решение владельца
+    6 сентября 2026: условие срабатывания — «одна и та же тема упоминается
+    несколько раз без движения», а не «вчера была запись и есть дело в работе».
+    Прежнее условие предполагало провал до того, как он известен, и вопрос
+    «что вчера помешало?» получался приговором с вопросительным знаком.
+
+    Движение берётся из разметки, а не из состояния дел: тема, по которой
+    за неделю есть решение (`decision`) или понимание (`insight`), сдвинулась
+    **по словам самого владельца**. Тема, где за неделю три и больше
+    упоминаний и ни одного из этих двух, — это возвращение к одному и тому же
+    без вывода. Счётчик при этом не показывается и в текст не попадает
+    (`vision.md` §7.0, п.5): число решает, спрашивать ли, а сказано будет
+    только «ты писал: …».
+
+    Тип спрашивается по одной записи через `overrides.current_type` — там же,
+    где его спрашивают связи, и по той же причине: это единственное место,
+    где поправка владельца перебивает ответ модели, и второе такое выражение
+    в общем запросе разъехалось бы с ним молча.
+    """
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Topic.name, func.array_agg(Entry.id))
+                .select_from(EntryTopic)
+                .join(Topic, Topic.id == EntryTopic.topic_id)
+                .join(Entry, Entry.id == EntryTopic.source_entry_id)
+                .where(Entry.created_at >= now - STUCK_WINDOW, Entry.created_at <= now)
+                .group_by(Topic.name)
+                .having(func.count() >= MIN_TOPIC_ENTRIES)
+                .order_by(func.count().desc(), Topic.name)
+            )
+        ).all()
+
+    for name, entry_ids in rows:
+        moved = False
+        for entry_id in entry_ids:
+            if await overrides.current_type(int(entry_id)) in MOVED:
+                moved = True
+                break
+        if moved:
+            continue
+        # Цитата — из того же окна, о котором говорит вопрос, и достаточно
+        # длинная, чтобы её можно было узнать. Разбор — в `_last_of_topic`.
+        last = await _last_of_topic(str(name), since=now - STUCK_WINDOW, quotable=True)
+        if last is not None:
+            return last
+    return None
 
 
 def _yesterday(now: datetime, timezone: str) -> tuple[datetime, datetime]:
@@ -424,6 +603,45 @@ def _when(moment: datetime, timezone: str) -> str:
     return f"{moment.astimezone(ZoneInfo(timezone)):%d.%m}"
 
 
+def _about(subject: str, moment: datetime, now: datetime, timezone: str) -> str:
+    """Первая половина связанного всплывания: про что владелец говорил.
+
+    **«Сейчас» говорится только тогда, когда это правда.** Владелец записал
+    вопрос как «Ты сейчас про X», и на живом архиве это неверно чаще, чем
+    кажется: проверка 06.09.2026 нашла последнюю запись пятидневной давности.
+    Сказать «ты сейчас про разработку» про позапрошлую среду — это выдумать
+    факт, а факт в этом наборе несущая часть, а не подводка.
+
+    Граница — сутки: сегодняшнее и вчерашнее владелец держит в голове как
+    текущее, а всё, что дальше, называется датой.
+
+    **Тема берётся в кавычки и в именительном падеже, а не подставляется
+    в предлог.** «Ты сейчас про учёба» — то, что вышло бы иначе: имена тем
+    склоняет русский язык, а не `str.format`. Кавычки здесь не украшение,
+    а единственный способ поставить неизменённое слово в живую фразу; тем же
+    приёмом пользуются остальные виды набора («по теме „учёба“»).
+    """
+    zone = ZoneInfo(timezone)
+    days = (now.astimezone(zone).date() - moment.astimezone(zone).date()).days
+    if days <= 1:
+        return f"Ты сейчас про тему «{subject}»"
+    return f"{_when(moment, timezone)} у тебя была запись по теме «{subject}»"
+
+
+def _said(moment: datetime, now: datetime, timezone: str) -> str:
+    """«Вчера» или дата — тем словом, каким это назвал бы человек.
+
+    Вчерашнее называется вчерашним: «05.09 ты писал» про вчера читается
+    канцелярски, а вопрос и без того держится на том, что владелец узнаёт
+    в цитате себя. Дальше вчерашнего — дата, потому что «позавчера»
+    и «на прошлой неделе» уже требуют считать в уме.
+    """
+    zone = ZoneInfo(timezone)
+    if moment.astimezone(zone).date() == (now.astimezone(zone) - timedelta(days=1)).date():
+        return "Вчера"
+    return _when(moment, timezone)
+
+
 # --- Сам набор ---
 #
 # Порядок здесь — приоритет при равенстве, а не расписание: выбирается
@@ -431,12 +649,9 @@ def _when(moment: datetime, timezone: str) -> str:
 # Первым стоит вопрос, разобранный владельцем как образец всего набора.
 
 QUIET_TOPIC = "quiet_topic"
-LAST_TIME = "last_time"
 LOOK_BACK = "look_back"
 YESTERDAY = "yesterday"
-OWN_SIDE = "own_side"
 RETURNING = "returning"
-INTENTION = "intention"
 BLOCKER = "blocker"
 
 
@@ -453,30 +668,49 @@ async def _build_quiet_topic(now: datetime, timezone: str) -> Question | None:
     )
 
 
-async def _build_last_time(now: datetime, timezone: str) -> Question | None:
-    found = await _silent_topic(now)
-    if found is None:
-        return None
-    return _make(
-        LAST_TIME,
-        entry_ids=(found.last.entry_id,),
-        facts=(found.last.text,),
-        when=_when(found.last.created_at, timezone),
-        topic=found.topic,
-    )
-
-
 async def _build_look_back(now: datetime, timezone: str) -> Question | None:
-    found = await _recorded(since=now - LOOK_BACK_MAX, until=now - LOOK_BACK_MIN)
-    if found is None:
-        return None
-    return _make(
-        LOOK_BACK,
-        entry_ids=(found.entry_id,),
-        facts=(found.text,),
-        when=_when(found.created_at, timezone),
-        quote=quote(found.text),
-    )
+    """Старое, **связанное с тем, о чём владелец говорит сейчас**.
+
+    **Переписано 6 сентября 2026 решением владельца, и это правка важнее
+    самого вычёркивания.** Прежняя редакция брала запись по возрасту — любую
+    из окна 14–60 дней, — то есть делала ровно то, на что владелец жаловался:
+    «то, что бот пишет из архива, не несёт никакого смысла, оно ни с чем
+    не связано».
+
+    Теперь порядок обратный: берётся то, о чём он говорил на днях, и к нему
+    ищется похожее в старом — **векторной близостью, без вызова модели**
+    (инвариант 8). Механизм тот же, что у связей в момент записи
+    (`core/retrieval/links`), с двумя поправками: цель обязана быть старше
+    на две недели, а не на сутки, и связь нужна одна.
+
+    **Связного не нашлось — вид молчит, а не выдаёт случайное.** Это прямое
+    указание владельца, и оно сильнее желания заполнить слот: несвязанная
+    цитата обесценивает и все остальные.
+    """
+    rules = replace(links.from_settings(get_settings()), min_age=LOOK_BACK_MIN, limit=1)
+
+    for recent in await _lately(now, RECENT_TRIED):
+        found = await links.related(recent.entry_id, rules=rules)
+        if not found:
+            continue
+        subject = await _subject(recent.entry_id)
+        if subject is None:
+            # Тема — это «про что ты сейчас». Записи без темы пропускаем:
+            # подставить вместо неё обрывок значит сказать бессмыслицу.
+            continue
+        old = found[0]
+        return _make(
+            LOOK_BACK,
+            # Обе записи: и свежая, на которой стоит «сейчас», и старая,
+            # которую цитируем. По ним ответ владельца связывается с тем,
+            # на что он отвечал.
+            entry_ids=(recent.entry_id, old.entry_id),
+            facts=(recent.text, old.text),
+            lately=_about(subject, recent.created_at, now, timezone),
+            when=_when(old.created_at, timezone),
+            quote=quote(old.text),
+        )
+    return None
 
 
 async def _build_yesterday(now: datetime, timezone: str) -> Question | None:
@@ -489,18 +723,6 @@ async def _build_yesterday(now: datetime, timezone: str) -> Question | None:
         entry_ids=(found.entry_id,),
         facts=(found.text,),
         quote=quote(found.text),
-    )
-
-
-async def _build_own_side(now: datetime, timezone: str) -> Question | None:
-    found = await _deed(CommitmentState.IN_PROGRESS, now)
-    if found is None:
-        return None
-    return _make(
-        OWN_SIDE,
-        entry_ids=(found.entry_id,),
-        facts=(found.text,),
-        deed=quote(found.text),
     )
 
 
@@ -518,55 +740,62 @@ async def _build_returning(now: datetime, timezone: str) -> Question | None:
     )
 
 
-async def _build_intention(now: datetime, timezone: str) -> Question | None:
-    found = await _deed(CommitmentState.OPEN, now)
+async def _build_blocker(now: datetime, timezone: str) -> Question | None:
+    """Тема, в которую владелец возвращается и в которой ничего не сдвинулось.
+
+    **Переписано 6 сентября 2026 решением владельца.** Прежний вопрос звучал
+    «Что вчера помешало?» и был единственным в наборе без факта перед вопросом:
+    он предполагал, что что-то не вышло, ещё до того как это известно.
+    Владелец назвал это прямо, и правка ровно та же, что у всего набора, —
+    **факт из данных, потом открытый вопрос**: сначала его собственные слова,
+    потом «что мешает?».
+
+    Условие срабатывания поменялось вместе с текстом, и это половина правки:
+    было «вчера была запись и есть дело в работе», стало «одна и та же тема
+    упоминается несколько раз без движения». Тогда факт настоящий,
+    а не предполагаемый — см. `_stuck_topic`.
+
+    Спрашивается **препятствие, а не вина**: «что мешает» — про обстоятельства,
+    «почему не сделал» — про человека, и второе запрещено §4.1 и §4.2 разбора.
+    """
+    found = await _stuck_topic(now)
     if found is None:
         return None
     return _make(
-        INTENTION,
+        BLOCKER,
         entry_ids=(found.entry_id,),
         facts=(found.text,),
-        deed=quote(found.text),
+        when=_said(found.created_at, now, timezone),
+        quote=quote(found.text),
     )
 
 
-async def _build_blocker(now: datetime, timezone: str) -> Question | None:
-    """Заготовка владельца, урезанная до одного вопроса (решение № 2).
-
-    Данные ей всё-таки нужны, хотя сам вопрос их не называет: «что вчера
-    помешало?» на пустом вчера — это вопрос ни о чём, а на вчера без единого
-    висящего дела он предполагает провал, которого не было.
-    """
-    start, end = _yesterday(now, timezone)
-    if await _recorded(since=start, until=end) is None:
-        return None
-    found = await _deed(CommitmentState.IN_PROGRESS, now)
-    if found is None:
-        return None
-    return _make(BLOCKER, entry_ids=(found.entry_id,), facts=(found.text,))
-
-
 SET: dict[str, Item] = {
+    # Первым — связанное всплывание. Порядок здесь работает только при
+    # равенстве, но именно этот вид владелец назвал делающим главную работу
+    # (решение 06.09.2026), поэтому в первые дни, пока ни один вопрос ещё
+    # не задавали, спрашивается он.
+    LOOK_BACK: Item(
+        method="4 · оглянуться назад по архиву; 7 · говорить его словами",
+        source="§1.5, п. 5 — Look Back · §4.4 чистый язык · связь по §5.4 vision",
+        # Единственный вид, у которого факт вынесен отдельно: в утреннем
+        # сообщении он и есть «материал сверху», а вопрос уходит в конец
+        # (порядок сообщения — решение владельца 06.09.2026).
+        fact="{lately}. А {when} писал: «{quote}»",
+        template="Что с тех пор изменилось?",
+        build=_build_look_back,
+        sample={
+            "lately": "Ты сейчас про тему «учёба»",
+            "when": "06.08",
+            "quote": "надо разобраться с индексами",
+        },
+    ),
     QUIET_TOPIC: Item(
         method="1 · назвать факт, не человека; 5 · дать выбор; 11 · факт, потом вопрос",
         source="§4.2 наблюдение против оценки · §1.2 праведный рефлекс · §2.3 MindScape",
         template="За {days} ни одной записи по теме «{topic}» — застряло или отпало?",
         build=_build_quiet_topic,
         sample={"days": "3 дня", "topic": "учёба"},
-    ),
-    LAST_TIME: Item(
-        method="3 · попросить пример; 4 · оглянуться назад по архиву",
-        source="§1.5, пп. 4 и 5 — Ask for Examples, Look Back",
-        template="{when} ты последний раз писал по теме «{topic}». Что тогда получилось?",
-        build=_build_last_time,
-        sample={"when": "14.08", "topic": "учёба"},
-    ),
-    LOOK_BACK: Item(
-        method="4 · оглянуться назад по архиву; 7 · говорить его словами",
-        source="§1.5, п. 5 — Look Back · §4.4 чистый язык",
-        template="{when} ты писал: «{quote}». Что с тех пор изменилось?",
-        build=_build_look_back,
-        sample={"when": "06.08", "quote": "надо разобраться с индексами"},
     ),
     YESTERDAY: Item(
         method="2 · привязать к моменту, а не к периоду; 7 · говорить его словами",
@@ -575,13 +804,6 @@ SET: dict[str, Item] = {
         build=_build_yesterday,
         sample={"quote": "надо разобраться с индексами"},
     ),
-    OWN_SIDE: Item(
-        method="8 · спрашивать про то, что в его власти; 2 · привязать к моменту",
-        source="§2.3 подсказки не работают на чужое действие · §4.3 SBI",
-        template="Ты отметил в работе: «{deed}». Что успел со своей стороны?",
-        build=_build_own_side,
-        sample={"deed": "разобраться с индексами"},
-    ),
     RETURNING: Item(
         method="6 · утверждение по фактам вместо похвалы, «ты», а не «я»",
         source="§1.6 affirmation — конкретное действие без оценки",
@@ -589,19 +811,12 @@ SET: dict[str, Item] = {
         build=_build_returning,
         sample={"topic": "индексы", "days": "3 дня"},
     ),
-    INTENTION: Item(
-        method="10 · конкретизировать намерение; 7 · говорить его словами",
-        source="§3.2 Gollwitzer & Sheeran, implementation intentions · §4.4",
-        template="Ты писал: «{deed}». Когда сегодня к этому вернёшься?",
-        build=_build_intention,
-        sample={"deed": "разобраться с индексами"},
-    ),
     BLOCKER: Item(
-        method="9 · один вопрос в сообщении (заготовка владельца, урезанная)",
-        source="§1.3 ловушка допроса · решение владельца № 2 от 27.08.2026",
-        template="Что вчера помешало?",
+        method="11 · сначала факт, потом открытый вопрос; 7 · говорить его словами",
+        source="§2.3 MindScape · §4.1 blameless · решение владельца от 06.09.2026",
+        template="{when} ты писал: «{quote}». Что мешает?",
         build=_build_blocker,
-        sample={},
+        sample={"when": "Вчера", "quote": "надо разобраться с индексами"},
     ),
 }
 
@@ -615,6 +830,7 @@ def _make(
         kind=kind,
         method=item.method,
         text=item.template.format(**fields),
+        material=item.fact.format(**fields) if item.fact else "",
         entry_ids=tuple(entry_ids),
         facts=tuple(facts),
     )
@@ -625,9 +841,15 @@ def sample(kind: str, **overrides: str) -> str:
 
     Лишние поля шаблону не мешают: `format` берёт только те, что в нём есть, —
     поэтому один и тот же набор подстановок годится всему набору сразу.
+
+    Факт и вопрос склеиваются: в отчёте владельцу вид показывается целиком,
+    а не половиной. То, что в утреннем сообщении они стоят в разных местах, —
+    свойство сообщения, а не вида.
     """
     item = SET[kind]
-    return item.template.format(**{**item.sample, **overrides})
+    fields = {**item.sample, **overrides}
+    asked = item.template.format(**fields)
+    return f"{item.fact.format(**fields)} {asked}" if item.fact else asked
 
 
 # --- Журнал: что спрашивали и что на это ответили ---
@@ -729,7 +951,11 @@ async def pick(
     проверки на повтор.
 
     Порядок набора участвует только при равенстве — когда ни один из вопросов
-    ещё не задавали.
+    ещё не задавали. Первым в наборе стоит связанное всплывание (`LOOK_BACK`):
+    владелец назвал его делающим главную работу и попросил дать ему **больший
+    вес, а не жёсткую последовательность** (решение 06.09.2026). Вес — это
+    ровно и есть место в наборе: спрошенный вчера, он уходит в конец очереди
+    наравне со всеми.
     """
     if not await _due(slots.local_date(now, timezone)):
         return None
@@ -739,7 +965,10 @@ async def pick(
     candidates: list[tuple[date, int, Question]] = []
     for order, (kind, item) in enumerate(SET.items()):
         found = await item.build(now, timezone)
-        if found is None or not acceptable(found.text):
+        # Гвард гоняется по вопросу **вместе с фактом**: цитата владельца живёт
+        # именно в факте, и проверять один вопрос значило бы не проверять
+        # ровно ту часть, ради которой гвард здесь и стоит.
+        if found is None or not acceptable(found.whole):
             continue
         candidates.append((asked.get(kind, date.min), order, found))
 
@@ -754,14 +983,21 @@ async def pick(
 async def _written(found: Question, *, model: LanguageModel | None, now: datetime) -> Question:
     """Полный режим: тот же вопрос, написанный моделью.
 
-    Ветка выключена по умолчанию (`WRITTEN`), но написана и вызывается отсюда,
-    с пути тика: код за флагом, который никто не зовёт, — это `loops.is_stuck`,
-    и стоила она проекту месяца неработавшей смены вопроса у петли.
+    Ветка выключена по умолчанию (`PROMPTING_WRITTEN`), но написана
+    и вызывается отсюда, с пути тика: код за флагом, который никто не зовёт, —
+    это `loops.is_stuck`, и стоила она проекту месяца неработавшей смены
+    вопроса у петли.
 
     Отказ модели, придержанная квота и отвергнутый гвардом ответ дают один
     и тот же исход — прежний шаблон кода. Он поэтому не удаляется никогда.
+
+    **Модель переписывает вопрос, а факт остаётся кодом.** Факт — это дословная
+    цитата владельца и дата из базы; отдать их модели значило бы разрешить ей
+    править услышанное имя и подвинуть дату, а отличить верную починку
+    от выдумки гвард не может в принципе (решение владельца 27.08.2026,
+    те же доводы, что у названий дел).
     """
-    if not WRITTEN:
+    if not get_settings().prompting_written:
         return found
 
     phrase = await writer.written(
@@ -771,15 +1007,10 @@ async def _written(found: Question, *, model: LanguageModel | None, now: datetim
         facts=found.facts,
         now=now,
     )
-    if phrase is None or not acceptable(phrase):
+    written = replace(found, text=phrase or "")
+    if phrase is None or not acceptable(written.whole):
         return found
-    return Question(
-        kind=found.kind,
-        method=found.method,
-        text=phrase,
-        entry_ids=found.entry_ids,
-        facts=found.facts,
-    )
+    return written
 
 
 def payload(found: Question) -> dict[str, Any]:
@@ -841,17 +1072,12 @@ async def answered(message_id: int) -> Answer | None:
 
 __all__ = [
     "BLOCKER",
-    "INTENTION",
-    "LAST_TIME",
     "LOOK_BACK",
     "MIN_LENGTH",
-    "OWN_SIDE",
     "QUIET_TOPIC",
     "RETURNING",
     "SET",
     "SILENCE_STREAK",
-    "SLOTS",
-    "WRITTEN",
     "YESTERDAY",
     "Answer",
     "Item",
@@ -865,4 +1091,5 @@ __all__ = [
     "pick",
     "quote",
     "sample",
+    "slots_from",
 ]

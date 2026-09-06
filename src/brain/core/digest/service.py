@@ -18,6 +18,7 @@
 import logging
 from datetime import date, datetime
 
+from brain.config import get_settings
 from brain.core.digest import (
     commitments,
     evening,
@@ -172,6 +173,14 @@ async def _prepare(
     и вторая вопросительная строка под ней — ловушка допроса
     (`docs/prompting_sources.md`, §1.3).
     """
+    if slot is TouchSlot.MORNING:
+        # Утро собирается отдельно, и не ради удобства: с 6 сентября 2026
+        # вопрос раскачки стоит в нём **в двух местах** — факт материалом
+        # сверху, вопрос в конце, — а остальные слоты по-прежнему приписывают
+        # его целиком снизу. Собрать это общим кодом значило бы сделать вид,
+        # что сообщения устроены одинаково.
+        return await _morning(now, timezone, model)
+
     prepared = await _content(slot, now, timezone, model)
     asked = await _prompting(slot, prepared, now, timezone, model)
 
@@ -181,14 +190,67 @@ async def _prepare(
     if prepared is None:
         # Слоту сказать нечего — тогда вопрос и есть всё сообщение. Кнопок
         # под ним нет, поэтому уйдёт оно беззвучно (`vision.md` §7.1).
-        return prompting.alone(asked.text), {
+        return prompting.alone(asked.whole), {
             "prompting": prompting.payload(asked),
             "prompting_only": True,
         }
 
     text, payload = prepared
     payload["prompting"] = prompting.payload(asked)
-    return prompting.attach(text, asked.text), payload
+    return prompting.attach(text, asked.whole), payload
+
+
+async def _morning(
+    now: datetime, timezone: str, model: LanguageModel | None
+) -> tuple[str, dict[str, object]] | None:
+    """Утреннее сообщение целиком. `None` — сказать нечего.
+
+    Порядок сборки диктуется тем, что каждый шаг знает не всё:
+
+    1. содержание собирается первым — от него зависит, спрашивает ли сообщение
+       уже о чём-то само (петля кончается «Сдвинулось?»);
+    2. вопрос выбирается вторым, по **сухому** тексту: правило «один вопрос
+       в сообщении» проверяется по готовым словам, а не перебором случаев;
+    3. лид пишется третьим, и бюджет слов ему считается по тексту **вместе
+       с материалом и вопросом** — иначе сорок секунд из `vision.md` §5.1
+       обещаны про сообщение, а посчитаны про его половину.
+
+    Сухой рендер зовётся здесь трижды и это ничего не стоит: он чистая функция
+    от уже прочитанных данных.
+    """
+    content = await morning.collect(now)
+
+    if content.empty:
+        asked = await _prompting(TouchSlot.MORNING, None, now, timezone, model)
+        if asked is None:
+            return None
+        # Делам и петле сказать нечего — остаётся вопрос, и он несёт свой факт
+        # с собой: «Что с тех пор изменилось?» само по себе не значит ничего.
+        return prompting.alone(asked.whole), {
+            "prompting": prompting.payload(asked),
+            "prompting_only": True,
+        }
+
+    dry = render.morning(content)
+    asked = await _prompting(TouchSlot.MORNING, (dry, {}), now, timezone, model)
+    spent = len(render.morning(content, asked=asked).split())
+
+    payload: dict[str, object] = {
+        "commitment_ids": [item.id for item in content.commitments],
+        "loop_id": content.loop.id if content.loop else None,
+        # Правило про три откладывания — часть замысла, а не оформления
+        # (`vision.md` §5.2), поэтому признак считается в ядре, а не в адаптере.
+        # Считает его сам `Morning`: тот же признак выбирает вопрос в тексте
+        # сводки, и посчитанный тут второй раз он мог бы разойтись с текстом
+        # молча. В журнал попадает вместе с остальной нагрузкой: по строке
+        # касания должно быть видно, какой вопрос ушёл.
+        "loop_stuck": content.loop_stuck,
+    }
+    if asked is not None:
+        payload["prompting"] = prompting.payload(asked)
+
+    written = await _lead(model, content, now, timezone, spent=spent)
+    return render.morning(content, written=written, asked=asked), payload
 
 
 async def _prompting(
@@ -202,9 +264,12 @@ async def _prompting(
 
     Слоты — настройка, а не константа (решение владельца № 2), и по умолчанию
     там только утро: каждый слот это отдельный запрос в сутки в полном режиме,
-    и упирается это в квоту, а не во вкус.
+    и упирается это в квоту, а не во вкус. `PROMPTING_SLOTS` читается **здесь,
+    на каждом тике**, а не при импорте модуля: настройка, снятая один раз
+    в момент загрузки, требовала бы перезапуска воркера — то есть была бы
+    константой с лишним шагом.
     """
-    if slot not in prompting.SLOTS:
+    if slot not in prompting.slots_from(get_settings()):
         return None
     if prepared is not None and not prompting.fits(prepared[0]):
         return None
@@ -224,22 +289,6 @@ async def _content(
     запроса из двадцати. Гонка при этом умозрительная: воркер один и тикает
     раз в пять минут.
     """
-    if slot is TouchSlot.MORNING:
-        content = await morning.collect(now)
-        if content.empty:
-            return None
-        return render.morning(content, written=await _lead(model, content, now, timezone)), {
-            "commitment_ids": [item.id for item in content.commitments],
-            "loop_id": content.loop.id if content.loop else None,
-            # Правило про три откладывания — часть замысла, а не оформления
-            # (`vision.md` §5.2), поэтому признак считается в ядре, а не
-            # в адаптере. Считает его сам `Morning`: тот же признак выбирает
-            # вопрос в тексте сводки, и посчитанный тут второй раз он мог бы
-            # разойтись с текстом молча. В журнал попадает вместе с остальной
-            # нагрузкой: по строке касания должно быть видно, какой вопрос ушёл.
-            "loop_stuck": content.loop_stuck,
-        }
-
     if slot is TouchSlot.DAY:
         old = await resurface.pick(now)
         if old is None:
@@ -265,7 +314,12 @@ async def _content(
 
 
 async def _lead(
-    model: LanguageModel | None, content: morning.Morning, now: datetime, timezone: str
+    model: LanguageModel | None,
+    content: morning.Morning,
+    now: datetime,
+    timezone: str,
+    *,
+    spent: int,
 ) -> guard.Written | None:
     """Лид сводки от модели. `None` — сводка уйдёт сухим рендером.
 
@@ -276,9 +330,10 @@ async def _lead(
 
     **Бюджет считает код.** Сухие строки уже написаны, и сколько слов осталось
     лиду, знает только тот, кто их поставил: сорок секунд из `vision.md` §5.1 —
-    это про всё сообщение, а не про то, что написала модель. Сухой рендер
-    собирается для счёта дважды — он чистая функция, и второй вызов стоит
-    склейки десятка строк.
+    это про всё сообщение, а не про то, что написала модель. `spent` приходит
+    готовым и считается **по тексту вместе с материалом и вопросом** — с
+    6 сентября 2026 сообщение состоит не только из дел, и считать бюджет
+    по одним делам значило бы обещать сорок секунд, а мерить половину.
     """
     if model is None:
         return None
@@ -304,7 +359,7 @@ async def _lead(
         ),
         now=now,
         timezone=timezone,
-        words=lead.WORD_BUDGET - len(render.morning(content).split()),
+        words=lead.WORD_BUDGET - spent,
     )
 
 
