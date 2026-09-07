@@ -32,6 +32,7 @@
     prompting.py    раскачка: набор вопросов, правило выбора и разбор ответа
     resurface.py    всплывание старого
     evening.py      спорные записи и долг, который не копится
+    failures.py     что упало внутри тика — чтобы отказ не был тихим
     weekly.py       недельное ревью, включающееся по данным
     morning.py      сборка утренней сводки
     service.py      тик: что из этого сегодня уместно
@@ -41,6 +42,7 @@ from brain.core.digest import (
     by_topic,
     commitments,
     evening,
+    failures,
     habits,
     loops,
     morning,
@@ -59,6 +61,7 @@ __all__ = [
     "by_topic",
     "commitments",
     "evening",
+    "failures",
     "habits",
     "loops",
     "morning",

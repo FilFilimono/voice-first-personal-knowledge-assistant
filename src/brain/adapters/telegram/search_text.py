@@ -11,35 +11,63 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from brain.core.present import entry as entry_view
 from brain.core.retrieval.search import Found
 
 NOTHING = "Ничего не нашёл."
 EMPTY_QUERY = "После /find напишите, что искать. Например: /find экзамен"
+
+# Приписка к выдаче в приватном режиме. Обязательна, и вот почему.
+#
+# Приватный режим снимает канал вектора (`core/retrieval/search.local`):
+# вектор запроса считает внешняя модель, а в этом режиме наружу не уходит
+# ничего. Поиск при этом работает — двумя каналами из трёх, — но находит
+# он **только по словам**, и запись, не разделяющую с запросом ни одного
+# слова, не найдёт вовсе.
+#
+# Молчать об этом нельзя по тому же правилу, по которому ретроактивная
+# приватность обязана сказать, что текст уже уходил наружу: обещать полноту,
+# которой нет, хуже, чем признать неполноту. Иначе пустая выдача прочитается
+# как «в архиве этого нет», а это неправда.
+WITHOUT_VECTOR = "🔒 Приватный режим: искал по словам, без смысловой близости."
 
 # Сколько текста показывать в строке. Средняя запись архива — 159 символов,
 # то есть большинство влезает целиком; обрезка нужна длинным.
 PREVIEW = 160
 
 
-def render(query: str, found: list[Found], *, today: datetime) -> str:
+def render(query: str, found: list[Found], *, today: datetime, local: bool = False) -> str:
     """Собрать ответ на поиск.
 
     `today` нужен, чтобы не писать год у сегодняшних записей: «18.08» читается
     быстрее, чем «18.08.2026», а для прошлогодней записи год как раз важен.
+
+    `local` — искали без вектора (приватный режим). Приписка идёт **последней
+    строкой и в обоих случаях**, включая пустую выдачу: именно на пустой она
+    и нужнее всего — без неё «ничего не нашёл» читается как «в архиве этого
+    нет», а правда в том, что искали одним способом из двух.
     """
     if not found:
-        return f"«{query}» — {NOTHING.lower()}"
+        found_nothing = f"«{query}» — {NOTHING.lower()}"
+        return f"{found_nothing}\n\n{WITHOUT_VECTOR}" if local else found_nothing
 
     lines = [f"Нашёл по запросу «{query}»:", ""]
     lines.extend(_line(item, today=today) for item in found)
+    if local:
+        lines += ["", WITHOUT_VECTOR]
     return "\n".join(lines)
 
 
 def _line(item: Found, *, today: datetime) -> str:
+    """Строка выдачи. Якорь — последним, отбитый от текста.
+
+    Отбивка обязательна: без пробела и в одну строку с концом цитаты якорь
+    читается как часть мысли владельца, а не как ссылка (`present/entry`).
+    """
     when = item.created_at.astimezone(ZoneInfo(item.timezone))
     stamp = f"{when:%d.%m}" if when.year == today.year else f"{when:%d.%m.%Y}"
     lock = "🔒 " if item.is_private else ""
-    return f"{stamp} · {lock}{_shorten(item.text)}"
+    return f"{stamp} · {lock}{_shorten(item.text)}  {entry_view.anchor(item.entry_id)}"
 
 
 def _shorten(text: str) -> str:

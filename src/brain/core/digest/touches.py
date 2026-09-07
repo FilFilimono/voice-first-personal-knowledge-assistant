@@ -73,6 +73,21 @@ async def record_silence(slot: TouchSlot, day: date, *, reason: SilenceReason) -
     return await _record(slot, day, sent_at=None, reason=reason, payload=None)
 
 
+async def record_failure(slot: TouchSlot, day: date) -> bool:
+    """Записать, что механизм слота упал. `False` — слот уже разрешён.
+
+    **Заведено 7 сентября 2026, решение владельца.** Строка нужна затем, чтобы
+    «сегодня нечего сказать» и «сегодня сломалось» перестали выглядеть
+    одинаково: в тот день упавшие привычки унесли с собой весь тик, и снаружи
+    это читалось как молчание. Отсутствие строки при этом означает третье —
+    воркер не дожил до окна слота, — и все три различаются только так.
+
+    Возвращает `False`, когда слот уже отправлен или уже промолчал по существу:
+    отказ не имеет права затереть состоявшееся решение.
+    """
+    return await _record(slot, day, sent_at=None, reason=SilenceReason.FAILED, payload=None)
+
+
 async def _record(
     slot: TouchSlot,
     day: date,
@@ -81,6 +96,19 @@ async def _record(
     reason: SilenceReason | None,
     payload: dict[str, Any] | None,
 ) -> bool:
+    """Занять слот за эти сутки. `False` — он уже занят по существу.
+
+    **Одно исключение из «строка на слот в сутки», и оно узкое.** Строку
+    `FAILED` разрешено переписать: она означает не решение промолчать,
+    а то, что решить не удалось, — и оставить её на сутки значило бы, что один
+    отказ провайдера съедает целый день сводки, хотя стоит он пяти минут.
+    Условие стоит в самой базе (`WHERE`), а не в коде: проверка «а не упал ли
+    он раньше» двумя запросами разъехалась бы при гонке двух тиков ровно так же,
+    как разъехалась бы проверка «а не отправляли ли уже».
+
+    Всё остальное — `sent`, `quiet`, `over_budget`, `nothing_to_say` —
+    неприкосновенно: это и есть защита от двойной отправки.
+    """
     async with session_scope() as session:
         written = await session.scalar(
             pg_insert(Touch)
@@ -92,7 +120,16 @@ async def _record(
                 silence_reason=reason,
                 payload=payload or {},
             )
-            .on_conflict_do_nothing(index_elements=[Touch.slot, Touch.local_date])
+            .on_conflict_do_update(
+                index_elements=[Touch.slot, Touch.local_date],
+                set_={
+                    "sent_at": sent_at,
+                    "silence_reason": reason,
+                    "payload": payload or {},
+                    "created_at": datetime.now(UTC),
+                },
+                where=Touch.silence_reason == SilenceReason.FAILED,
+            )
             .returning(Touch.id)
         )
     return written is not None

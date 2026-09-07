@@ -42,6 +42,7 @@ from brain.core.ports import LanguageModel
 from brain.core.present.repository import TitleTarget
 from brain.core.retrieval import repository as retrieval_repository
 from brain.core.scheduler.queue import ENRICH, INDEX, TRANSCRIBE
+from brain.storage import schema
 from brain.storage.db import dispose_engine, session_scope
 from brain.storage.models.annotation import Annotation, AnnotationType
 from brain.storage.models.entry import Entry, EntryKind
@@ -624,6 +625,13 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     try:
+        # Схема — до самой команды. С этого случая долг и начался: 26 августа
+        # 2026 `just backfill-titles` упал `invalid input value for enum
+        # commitment_state` — код знал новые состояния, база нет
+        # (`storage/schema`). Внутри `try`, чтобы движок закрылся и на отказе:
+        # проверка уже открыла соединение.
+        await schema.require("Команда не выполнена.")
+
         if arguments.command == "requeue-transcripts":
             await requeue_transcripts(dry_run=arguments.dry_run)
         elif arguments.command == "reindex":

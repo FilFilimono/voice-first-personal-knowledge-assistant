@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 from brain.config import get_settings
 from brain.core import llm
 from brain.core.ports import EntryText, LanguageModel
+from brain.core.present import entry as entry_view
 from brain.core.present import guard
 from brain.core.present.pacing import cosmetic_allowed
 from brain.core.retrieval.links import Link
@@ -126,9 +127,19 @@ def snippet(text: str, limit: int = SNIPPET) -> str:
 
 
 def quotes(links: Sequence[Link], *, timezone: str) -> list[str]:
-    """Прежние записи с датами — то, ради чего связь и показывается."""
+    """Прежние записи с датами — то, ради чего связь и показывается.
+
+    С 7 сентября 2026 у каждой цитаты якорь: связь показывает 200 символов
+    старой записи, а `vision.md` §8 требует, чтобы в оригинал можно было
+    провалиться. Собирается якорь в `present/entry` — одним местом на все
+    шесть отправителей.
+    """
     zone = ZoneInfo(timezone)
-    return [f"{link.created_at.astimezone(zone):%d.%m.%Y}: {snippet(link.text)}" for link in links]
+    return [
+        f"{link.created_at.astimezone(zone):%d.%m.%Y}: {snippet(link.text)}  "
+        f"{entry_view.anchor(link.entry_id)}"
+        for link in links
+    ]
 
 
 def template(links: Sequence[Link], *, timezone: str) -> str:

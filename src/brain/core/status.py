@@ -86,6 +86,14 @@ class Touches:
     # Сколько записей зафиксировалось само. Владельцу об этом не сообщают
     # (`vision.md` §7.0, принцип 2) — но спросить он вправе.
     auto_resolved: int
+    # Что упало внутри тика за сегодня и сколько раз. Пусто — всё отработало.
+    #
+    # Стоит здесь, потому что здесь стоит всё, что иначе не видно со стороны.
+    # С 7 сентября 2026 механизмы тика огорожены `try/except`, и без этой
+    # строки правка поменяла бы громкое падение на тихое: сам себе система
+    # об отказах не пишет (это требование внимания), значит спросить о них
+    # владелец должен уметь.
+    failures: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +166,7 @@ async def _touches(now: datetime, timezone: str) -> Touches:
         open_loops=open_loops,
         habits=await digest.habits.open_count(),
         auto_resolved=await digest.evening.auto_resolved_count(),
+        failures=await digest.failures.of_day(now, timezone=timezone),
     )
 
 

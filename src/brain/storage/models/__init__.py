@@ -20,6 +20,7 @@ from brain.storage.models.override import EntryOverride, OverrideAction
 from brain.storage.models.private_mode import PrivateModeChange
 from brain.storage.models.quiet import QuietKind, QuietPeriod
 from brain.storage.models.reminder import Reminder, ReminderTrigger
+from brain.storage.models.tick_failure import TickFailure
 from brain.storage.models.topic import EntryTopic, Topic, normalize
 from brain.storage.models.touch import SilenceReason, Touch, TouchCategory, TouchSlot
 from brain.storage.models.transcript import Transcript
@@ -54,6 +55,7 @@ __all__ = [
     "ReminderTrigger",
     "Rhythm",
     "SilenceReason",
+    "TickFailure",
     "Topic",
     "Touch",
     "TouchCategory",

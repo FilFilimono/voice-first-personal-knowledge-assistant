@@ -242,8 +242,12 @@ def test_render_shortens_long_text_on_word_boundary() -> None:
 
     line = search_text.render("что угодно", [long_entry], today=TODAY).splitlines()[-1]
 
-    assert line.endswith("…")
-    assert "слов…" not in line, "обрезано посреди слова"
+    # Якорь `/e31` стоит **после** цитаты (решение владельца 07.09.2026),
+    # поэтому обрезка проверяется до него, а не по концу строки.
+    quoted = line.split("  ")[0]
+
+    assert quoted.endswith("…")
+    assert "слов…" not in quoted, "обрезано посреди слова"
 
 
 def test_render_collapses_line_breaks() -> None:

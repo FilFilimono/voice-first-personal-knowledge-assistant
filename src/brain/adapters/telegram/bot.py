@@ -16,6 +16,7 @@ from aiogram.types import BotCommand
 from brain.adapters.telegram.handlers import build_router
 from brain.adapters.telegram.whitelist import WhitelistMiddleware
 from brain.config import Settings, get_runtime_settings
+from brain.storage import schema
 from brain.storage.db import dispose_engine
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,12 @@ async def run() -> None:
     """Поднять бота. Падает на старте, если окружение задано неполно."""
     settings = get_runtime_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    # Схема — до соединения с Telegram, по той же причине, по которой токен
+    # проверяется до всего: бот, поднявшийся на чужой схеме, выглядит рабочим
+    # и отвечает «Принял», а падает на первой же записи — то есть в тот момент,
+    # когда владелец уже наговорил мысль (`storage/schema`).
+    await schema.require("Бот не запущен.")
 
     bot = Bot(token=settings.telegram_bot_token)
     dispatcher = build_dispatcher(settings)

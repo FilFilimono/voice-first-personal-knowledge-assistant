@@ -49,6 +49,7 @@ from brain.core.scheduler.queue import (
     TOUCH_SCHEDULE,
     TRANSCRIBE,
 )
+from brain.storage import schema
 from brain.storage.db import asyncpg_dsn
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,13 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
     """Фабрика для `pgq run brain.worker:create_app`."""
     settings = get_runtime_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    # Схема — **до всего остального**, включая соединения и модели. Она дешевле
+    # (один запрос, без сети) и фундаментальнее: на непринятой миграции воркер
+    # поднимался и падал каждые пять минут, на каждом тике. Случилось это
+    # дважды — 26.08 и 07.09.2026, — и второй раз уже у владельца, а не
+    # в разработке. См. `storage/schema`.
+    await schema.require("Воркер не запущен.")
 
     connection = await asyncpg.connect(dsn=asyncpg_dsn())
     bot = Bot(token=settings.telegram_bot_token)

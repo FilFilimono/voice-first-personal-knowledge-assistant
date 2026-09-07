@@ -48,7 +48,7 @@ from aiogram import Bot, Dispatcher
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from brain.adapters.telegram import handlers
+from brain.adapters.telegram import handlers, search_text
 from brain.adapters.telegram.bot import build_dispatcher
 from brain.config import Settings
 from brain.core.present import archive_question, archive_topics
@@ -92,6 +92,17 @@ class SearchSpy:
         return [FOUND]
 
 
+class LocalSearchSpy:
+    """Поиск без вектора — то, чем отвечает приватный режим с 07.09.2026."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def __call__(self, query: str, *, limit: int = 5) -> list[Found]:
+        self.queries.append(query)
+        return [FOUND]
+
+
 class TopicSpy:
     """Разговор по теме, который ничего не знает: тем в быстрых тестах нет."""
 
@@ -114,6 +125,11 @@ def searcher() -> SearchSpy:
 
 
 @pytest.fixture
+def local_searcher() -> LocalSearchSpy:
+    return LocalSearchSpy()
+
+
+@pytest.fixture
 def topics() -> TopicSpy:
     return TopicSpy()
 
@@ -129,6 +145,7 @@ def fast(
     monkeypatch: pytest.MonkeyPatch,
     uow: FakeUnitOfWork,
     searcher: SearchSpy,
+    local_searcher: LocalSearchSpy,
     topics: TopicSpy,
     private: bool,
 ) -> Dispatcher:
@@ -144,6 +161,7 @@ def fast(
     monkeypatch.setattr("brain.adapters.telegram.handlers.capture_transaction", fake_transaction)
     monkeypatch.setattr("brain.adapters.telegram.handlers.repository.is_private_mode", private_mode)
     monkeypatch.setattr("brain.adapters.telegram.handlers.search.search", searcher)
+    monkeypatch.setattr("brain.adapters.telegram.handlers.search.local", local_searcher)
     monkeypatch.setattr("brain.adapters.telegram.handlers.archive_topics.collect", topics)
     monkeypatch.setattr(
         "brain.adapters.telegram.handlers.embeddings.build_embedder", lambda settings: object()
@@ -284,18 +302,29 @@ async def test_a_broken_search_does_not_cost_the_entry(
 
 @pytest.mark.parametrize("private", [True])
 async def test_a_private_question_never_leaves_the_machine(
-    fast: Dispatcher, bot: Bot, uow: FakeUnitOfWork, searcher: SearchSpy, session: FakeSession
+    fast: Dispatcher,
+    bot: Bot,
+    uow: FakeUnitOfWork,
+    searcher: SearchSpy,
+    local_searcher: LocalSearchSpy,
+    session: FakeSession,
 ) -> None:
     """Инвариант 5. Поиску нужен вектор запроса, а вектор считают снаружи.
 
-    Приватный режим заведён ровно затем, чтобы текст владельца наружу не уходил,
-    — значит, и запрос не уходит. Молчания при этом нет: сообщение объясняет,
-    почему поиска не было, иначе владелец решит, что архив пуст.
+    **Переписано 07.09.2026 по решению владельца.** До этого дня приватный
+    режим не искал по архиву вовсе и объяснял почему, а команда `/find` в том
+    же режиме искала и уходила наружу. Довод владельца дословно:
+    *несогласованность двух дверей хуже любой из них — привыкнет к одной,
+    ошибётся на другой.*
+
+    Теперь обе двери делают одно: снимают **канал вектора**, а не поиск.
+    Два канала из трёх считаются внутри Postgres и наружу не ходят.
     """
     await _say(fast, bot, "что там по учёбе?")
 
-    assert searcher.queries == []
-    assert session.texts[-1] == handlers.ARCHIVE_PRIVATE
+    assert searcher.queries == [], "за вектором пошли в приватном режиме"
+    assert local_searcher.queries == ["учёбе"]
+    assert search_text.WITHOUT_VECTOR in session.texts[-1]
     assert [entry.raw_text for entry in uow.entries] == ["что там по учёбе?"]
 
 
@@ -591,26 +620,29 @@ async def test_a_topic_touched_in_passing_is_answered_honestly(
 
 
 @pytest.mark.integration
-async def test_a_topic_recorded_today_names_the_real_reason(
+async def test_a_topic_recorded_today_is_told_about(
     archived: None,
     live: Dispatcher,
     bot: Bot,
     session: FakeSession,
     archive: list[archive_module.Entry],
 ) -> None:
-    """Причина молчания называется та, которая есть, а не первая подходящая.
+    """**Перевёрнуто 07.09.2026 решением владельца.**
 
-    Запись темы «созвоны» развёрнутая — 1647 символов, — но принята час назад.
-    Сказать про неё «вскользь» было бы такой же неправдой, как «ничего
-    не нашёл»: вспоминать нечего не потому, что коротко, а потому, что владелец
-    сказал это сегодня.
+    Прежде этот тест проверял обратное: запись темы «созвоны» развёрнутая —
+    1647 символов, — но принята час назад, и разговор про неё молчал, потому
+    что порог «старше суток» достался ему от всплывания.
+
+    Владелец отменил это прямо: у всплывания порог верен — оно достаёт старое
+    **без повода**, и сегодняшнее он помнит без бота. У разговора по теме
+    вопрос обратный: «что там по учёбе» спрашивают про сейчас, и самая свежая
+    запись важнее всех — она и есть «а сейчас».
     """
     await _say(live, bot, f"/recall {CALLS}")
 
     said = session.texts[-1]
-    assert "за последние сутки" in said
-    assert "вскользь" not in said
-    assert _head(archive, TODAYS) not in said
+    assert _head(archive, TODAYS) in said, "сегодняшняя запись не показана"
+    assert "Вспоминать пока нечего" not in said
 
 
 @pytest.mark.integration

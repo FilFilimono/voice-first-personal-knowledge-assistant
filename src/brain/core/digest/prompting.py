@@ -85,6 +85,7 @@ from brain.core.digest import slots
 from brain.core.memory import overrides
 from brain.core.memory.repository import display_text, is_private_now
 from brain.core.ports import LanguageModel
+from brain.core.present import entry as entry_view
 from brain.core.present import guard
 from brain.core.present import question as writer
 from brain.core.retrieval import links
@@ -706,6 +707,8 @@ async def _build_look_back(now: datetime, timezone: str) -> Question | None:
             # на что он отвечал.
             entry_ids=(recent.entry_id, old.entry_id),
             facts=(recent.text, old.text),
+            # Цитируется старая запись, в неё и проваливаться.
+            quoted=old.entry_id,
             lately=_about(subject, recent.created_at, now, timezone),
             when=_when(old.created_at, timezone),
             quote=quote(old.text),
@@ -722,6 +725,7 @@ async def _build_yesterday(now: datetime, timezone: str) -> Question | None:
         YESTERDAY,
         entry_ids=(found.entry_id,),
         facts=(found.text,),
+        quoted=found.entry_id,
         quote=quote(found.text),
     )
 
@@ -765,6 +769,7 @@ async def _build_blocker(now: datetime, timezone: str) -> Question | None:
         BLOCKER,
         entry_ids=(found.entry_id,),
         facts=(found.text,),
+        quoted=found.entry_id,
         when=_said(found.created_at, now, timezone),
         quote=quote(found.text),
     )
@@ -822,15 +827,42 @@ SET: dict[str, Item] = {
 
 
 def _make(
-    kind: str, *, entry_ids: Sequence[int] = (), facts: Sequence[str] = (), **fields: str
+    kind: str,
+    *,
+    entry_ids: Sequence[int] = (),
+    facts: Sequence[str] = (),
+    quoted: int | None = None,
+    **fields: str,
 ) -> Question:
-    """Собрать вопрос по шаблону набора."""
+    """Собрать вопрос по шаблону набора.
+
+    `quoted` — запись, которую вопрос **цитирует**. Не первая из `entry_ids`
+    и не последняя: у `look_back` записей две — свежая, на которой стоит
+    «сейчас», и старая, из которой взята цитата, — и провалиться надо во
+    вторую. Угадывать это по порядку значило бы поставить якорь на ту запись,
+    которую владелец и так только что писал.
+
+    Якорь приписывается туда, где стоит сама цитата: у `look_back` это факт
+    сверху сообщения, у `yesterday` и `blocker` — текст вопроса. Иначе ссылка
+    оторвалась бы от того, к чему относится, а сообщение это два разных места
+    (`digest/render.morning`).
+    """
     item = SET[kind]
+    said = item.template.format(**fields)
+    material = item.fact.format(**fields) if item.fact else ""
+
+    if quoted is not None:
+        tail = f"  {entry_view.anchor(quoted)}"
+        if material:
+            material += tail
+        else:
+            said += tail
+
     return Question(
         kind=kind,
         method=item.method,
-        text=item.template.format(**fields),
-        material=item.fact.format(**fields) if item.fact else "",
+        text=said,
+        material=material,
         entry_ids=tuple(entry_ids),
         facts=tuple(facts),
     )

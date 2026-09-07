@@ -219,6 +219,7 @@ async def test_status_reports_the_worker_first(
             open_loops=0,
             habits=0,
             auto_resolved=0,
+            failures={},
         ),
     )
 

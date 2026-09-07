@@ -40,6 +40,7 @@ NO_TOUCHES = Touches(
     open_loops=0,
     habits=0,
     auto_resolved=0,
+    failures={},
 )
 
 
@@ -236,6 +237,7 @@ def test_missing_summary_and_silent_summary_read_differently() -> None:
                 open_loops=0,
                 habits=0,
                 auto_resolved=0,
+                failures={},
             )
         ),
         timezone=TIMEZONE,
@@ -258,6 +260,7 @@ def test_quiet_period_is_visible_with_the_way_out() -> None:
                 open_loops=0,
                 habits=0,
                 auto_resolved=0,
+                failures={},
             )
         ),
         timezone=TIMEZONE,
@@ -284,6 +287,7 @@ def test_auto_resolved_debt_is_answerable_but_never_pushed() -> None:
                 open_loops=2,
                 habits=0,
                 auto_resolved=3,
+                failures={},
             )
         ),
         timezone=TIMEZONE,

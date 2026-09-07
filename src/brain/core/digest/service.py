@@ -7,21 +7,29 @@
 
 **Порядок внутри слота обратный ожидаемому: сначала занять место в журнале,
 потом отправлять.** Отправив первым, при гонке двух тиков мы получили бы два
-одинаковых сообщения и одну строку журнала. Цена обратного порядка названа
-вслух ниже: упавшая отправка оставляет слот занятым, и сводка в этот день
-не придёт.
+одинаковых сообщения и одну строку журнала.
+
+**Каждый механизм тика огорожен, и это правка 7 сентября 2026.** До неё порядок
+«долг → привычки → слоты» шёл без единого `try`, и упавшие привычки унесли
+с собой утреннюю сводку, раскачку, всплывание, вечерний разбор — **и запись
+молчания в журнал**. Снаружи это неотличимо от «сегодня нечего сказать».
+Теперь упавший механизм пишет строку в `tick_failures`, упавший слот получает
+`silence_reason = failed`, а остальные идут дальше. Строка `failed` **не сжигает
+сутки**: следующий тик через пять минут пробует снова и переписывает её.
 
 **Долг фиксируется на каждом тике и молча** — он не слот и в журнал касаний
 не попадает вовсе, потому что касанием не является (`vision.md` §7.0, принцип 2).
 """
 
 import logging
+from collections.abc import Awaitable
 from datetime import date, datetime
 
 from brain.config import get_settings
 from brain.core.digest import (
     commitments,
     evening,
+    failures,
     habits,
     loops,
     morning,
@@ -36,7 +44,7 @@ from brain.core.digest import (
 from brain.core.ports import LanguageModel, Notifier
 from brain.core.present import digest as lead
 from brain.core.present import guard
-from brain.storage.models.touch import SilenceReason, TouchCategory, TouchSlot
+from brain.storage.models.touch import SilenceReason, Touch, TouchCategory, TouchSlot
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +75,11 @@ async def tick(
     осознанно и значит «сухой рендер»: так тик зовут тесты, которые про
     расписание, а не про текст.
     """
+    day = slots.local_date(now, timezone)
+
     # Долг — первым и всегда: он не зависит от слотов, от паузы и от бюджета,
     # потому что не является сообщением.
-    await evening.settle_debt(now)
+    await _isolated("фиксация долга", day, evening.settle_debt(now))
 
     # Привычки — до слотов и **вне** их. Это заказанное касание (`vision.md`
     # §7.1): владелец подтвердил его сам, и система не имеет права молчать
@@ -85,19 +95,75 @@ async def tick(
     #
     # Возвращённые номера здесь не нужны и в слоты не попадают: слот —
     # это место в журнале касаний, а заказанное в бюджете не участвует.
-    await habits.remind_due(now=now, timezone=timezone, chat_id=chat_id, notifier=notifier)
+    await _isolated(
+        "напоминания привычек",
+        day,
+        habits.remind_due(now=now, timezone=timezone, chat_id=chat_id, notifier=notifier),
+    )
 
-    day = slots.local_date(now, timezone)
     done = await touches.of_day(day)
     silent = await quiet.is_quiet(now)
 
     sent: list[TouchSlot] = []
     for slot in slots.due(now, timezone):
-        if slot in done:
+        if _settled(done.get(slot)):
             continue
-        if await _handle(slot, day, now, timezone, chat_id, notifier, silent=silent, model=model):
-            sent.append(slot)
+        try:
+            if await _handle(
+                slot, day, now, timezone, chat_id, notifier, silent=silent, model=model
+            ):
+                sent.append(slot)
+        except Exception as failure:
+            # Слот упал — остальные слоты обязаны отработать. Строка `failed`
+            # ставится затем, чтобы «сегодня нечего сказать» и «сегодня
+            # сломалось» перестали выглядеть одинаково, и переписывается
+            # следующим тиком: сбой стоит пяти минут, а не суток.
+            logger.exception("слот %s за %s не отработал", slot, day)
+            await failures.record(f"слот «{_SLOT_NAMES[slot]}»", failure, day=day)
+            await touches.record_failure(slot, day)
     return sent
+
+
+# Имена слотов по-русски: они уезжают в `/status`, который читает владелец.
+# Значения `TouchSlot` там читались бы как отладочный вывод.
+_SLOT_NAMES: dict[TouchSlot, str] = {
+    TouchSlot.MORNING: "утро",
+    TouchSlot.DAY: "день",
+    TouchSlot.EVENING: "вечер",
+    TouchSlot.WEEKLY: "неделя",
+}
+
+
+def _settled(row: Touch | None) -> bool:
+    """Разрешён ли слот за эти сутки по существу.
+
+    Строка `failed` разрешением не является: она означает, что решить
+    не удалось. Следующий тик обязан попробовать снова — иначе один отказ
+    провайдера съедает целые сутки сводки.
+    """
+    return row is not None and row.silence_reason is not SilenceReason.FAILED
+
+
+async def _isolated(mechanism: str, day: date, work: Awaitable[object]) -> None:
+    """Выполнить механизм так, чтобы его падение не унесло весь тик.
+
+    **Тут вся правка 7 сентября 2026 в одну строку.** До неё порядок внутри
+    тика был «долг → привычки → слоты» без единого `try`, и упавшие привычки
+    унесли с собой утреннюю сводку, раскачку, всплывание, вечерний разбор —
+    **и запись молчания в журнал**. Снаружи это неотличимо от «сегодня нечего
+    сказать»: журнал молчание пишет, но пишет его тот же тик, который упал.
+
+    Долг и напоминания привычек слотами не являются (они вне бюджета и вне
+    журнала касаний, `vision.md` §7.1), поэтому строки в `touches` им
+    не положено — их отказ уходит в `tick_failures` и виден в `/status`.
+    Проглотить его молча было бы хуже, чем упасть: тихо не работающий механизм
+    в этом проекте уже стоил недели.
+    """
+    try:
+        await work
+    except Exception as failure:
+        logger.exception("механизм %r не отработал", mechanism)
+        await failures.record(mechanism, failure, day=day)
 
 
 async def _handle(
@@ -137,22 +203,38 @@ async def _handle(
         logger.info("слот %s за %s уже занят соседним тиком", slot, day)
         return False
 
-    try:
-        message_id = await _send(slot, chat_id, text, payload, notifier)
-    except Exception:
-        # Слот остаётся занятым намеренно. Повтор отправки рискует прислать
-        # то же самое дважды, а пропущенная сводка стоит одного дня — завтра
-        # придёт следующая. Что воркер жив, видно по пульсу в `/status`.
-        logger.exception("касание %s не отправилось; слот за %s остаётся занятым", slot, day)
-        return False
+    # Отправка **не глушится здесь**, и это правка 7 сентября 2026.
+    #
+    # Прежде упавшая отправка ловилась на месте и слот оставался занятым
+    # до конца суток. Довод был «повтор рискует прислать то же самое дважды»,
+    # и цена ему казалась в один день. Живая база показала, чего это стоит
+    # на самом деле: `sent_at` пишется **до** отправки, поэтому в журнале
+    # упавшая отправка выглядит точно так же, как состоявшаяся, — 7 сентября
+    # журнал говорил «сводка отправлена в 09:30», а владелец не получил ничего
+    # и узнал об этом только потому, что спросил. Молчание снова стало
+    # неотличимо от смерти, только теперь с подтверждением в базе.
+    #
+    # Поэтому отказ уходит наверх, тик ставит слоту `failed`, и следующий тик
+    # через пять минут пробует снова. **Цена названа вслух:** если Telegram
+    # сообщение принял, а ответ до нас не дошёл, владелец получит его дважды.
+    # Это дешевле суток тишины и, в отличие от неё, заметно.
+    message_id = await _send(slot, chat_id, text, payload, notifier)
 
-    await _after(slot, payload, now)
-    # Идентификатор ушедшего сообщения дописывается в журнал **после** отправки:
-    # до неё его не существует. По нему потом узнаётся, что владелец отвечает
-    # именно на вопрос раскачки, — тем же приёмом, каким ответ на «когда
-    # напомнить?» узнаётся по `ack_message_id` в `entries.meta`.
-    if "prompting" in payload:
-        await touches.remember_message(slot, day, message_id=message_id)
+    # Дальше сообщение **уже ушло**, и упасть отсюда наверх нельзя: слот
+    # получил бы `failed`, а следующий тик прислал бы то же самое второй раз.
+    # Поэтому здесь отказ глушится по-настоящему — в лог.
+    try:
+        await _after(slot, payload, now)
+        # Идентификатор ушедшего сообщения дописывается в журнал **после**
+        # отправки: до неё его не существует. По нему потом узнаётся, что
+        # владелец отвечает именно на вопрос раскачки, — тем же приёмом, каким
+        # ответ на «когда напомнить?» узнаётся по `ack_message_id` в
+        # `entries.meta`. Заодно это единственный след доставки в базе: его
+        # отсутствие у строки с раскачкой и выдало 7 сентября.
+        if "prompting" in payload:
+            await touches.remember_message(slot, day, message_id=message_id)
+    except Exception:
+        logger.exception("касание %s ушло, но отметить его не удалось", slot)
     return True
 
 

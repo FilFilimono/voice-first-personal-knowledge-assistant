@@ -15,6 +15,7 @@
 """
 
 import logging
+import re
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,7 @@ from brain.core.llm import limits
 from brain.core.memory import overrides, repository
 from brain.core.memory.unit_of_work import capture_transaction
 from brain.core.present import archive_question, archive_topics
+from brain.core.present import entry as entry_view
 from brain.core.retrieval import search
 from brain.core.scheduler import recurrence, reminders
 from brain.storage.models.annotation import AnnotationType
@@ -66,20 +68,6 @@ PRIVATE_VOICE_REFUSED = (
 )
 SEARCH_FAILED = "Поиск не отработал — посмотрите логи. Записи целы."
 
-# Приватный режим: разговор по теме идёт (он не выходит за пределы базы),
-# а поиск — нет. Поиску нужен вектор запроса, а вектор считает внешняя модель,
-# то есть текст владельца ушёл бы наружу ровно в том режиме, который заведён
-# затем, чтобы он наружу не уходил (инвариант 5).
-#
-# Молчать здесь нельзя: сообщение уже легло записью, и владелец, не получивший
-# ответа, решит, что архив пуст, — та же ошибка, что и «Ничего не нашёл» после
-# падения провайдера.
-ARCHIVE_PRIVATE = (
-    "Приватный режим — по архиву не ищу: запрос ушёл бы наружу за вектором.\n"
-    "Мысль записана. Разговор по теме («что там по учёбе») работает и здесь — "
-    "он никуда не ходит."
-)
-
 # Тексты среза по темам. Молчание здесь — обычный исход: тем меньше двух
 # означает, что срезом это не назовёшь (`core/digest/by_topic`).
 NO_TOPICS = (
@@ -100,6 +88,10 @@ HELP = (
     "что записано. Сообщение при этом всё равно сохранится.\n\n"
     "/find <что искать> — поиск по архиву\n"
     "/recall — о чём вы думали за неделю; /recall <тема> — вспомнить подробно\n"
+    # Якорь объясняется примером, а не описанием команды: в меню Telegram его
+    # не положить (номер — часть самой команды), и увидит его владелец в конце
+    # цитаты. Одна строка тут нужна затем, чтобы первый раз он понял, что это.
+    "/e42 — показать запись целиком; такой номер стоит в конце каждой цитаты\n"
     "/status — всё ли работает\n"
     "/private on — приватный режим: записи не уходят наружу, голосовые "
     "не принимаются\n"
@@ -194,9 +186,19 @@ def build_router(settings: Settings) -> Router:
             await message.answer(search_text.EMPTY_QUERY)
             return
 
-        embedder = embeddings.build_embedder(settings)
+        # В приватном режиме поиск идёт **без вектора** — решение владельца
+        # 07.09.2026. Отказывать целиком не надо: два канала из трёх считаются
+        # внутри Postgres и наружу не ходят. Эмбеддер при этом не строится
+        # вовсе: ветка обязана быть здесь, а не внутри `search`, иначе «наружу
+        # не пошли» держалось бы на честном слове аргумента.
+        private = await repository.is_private_mode()
+
         try:
-            found = await search.search(embedder, query, limit=RESULTS)
+            found = (
+                await search.local(query, limit=RESULTS)
+                if private
+                else await search.search(embeddings.build_embedder(settings), query, limit=RESULTS)
+            )
         except Exception:
             # Поиск ходит наружу за вектором запроса, и провайдер падает.
             # Молчать нельзя: владелец решит, что в архиве ничего нет.
@@ -204,7 +206,38 @@ def build_router(settings: Settings) -> Router:
             await message.answer(SEARCH_FAILED)
             return
 
-        await message.answer(search_text.render(query, found, today=datetime.now(UTC)))
+        await message.answer(
+            search_text.render(query, found, today=datetime.now(UTC), local=private)
+        )
+
+    @router.message(Command(re.compile(rf"{entry_view.PREFIX}(\d+)")))
+    async def show_entry(message: Message, command: CommandObject) -> None:
+        """Запись целиком по якорю из цитаты — `/e42`.
+
+        **Регистрируется до `F.text`**, иначе `/e42` легло бы в архив записью:
+        роутер идёт по порядку, и обработчик, стоящий ниже общего фильтра,
+        не получит ничего. Ровно так же стоят `/find` и `/recall`.
+
+        Регулярным выражением, а не списком команд: номер записи — часть самой
+        команды, и это единственный способ сделать якорь **тапабельным**.
+        Telegram превращает `/слово` в ссылку сам, но только если это `/слово`,
+        а не `/слово 42` — команда с аргументом набирается руками, а якорь,
+        который надо набирать, работать не будет (`present/entry`).
+        """
+        found = command.regexp_match
+        if found is None:  # pragma: no cover — сюда не пускает фильтр
+            return
+
+        shown = await entry_view.full(int(found.group(1)))
+        if shown is None:
+            await message.answer(entry_view.NOT_FOUND)
+            return
+
+        # Длинная запись уходит несколькими сообщениями, а не обрезается:
+        # обрезка здесь вернула бы ровно тот дефект, ради которого команда
+        # и заведена (`vision.md` §8).
+        for part in entry_view.parts(entry_view.text(shown, now=datetime.now(UTC))):
+            await message.answer(part)
 
     @router.message(Command("recall"))
     async def recall(message: Message, command: CommandObject) -> None:
@@ -401,12 +434,18 @@ def build_router(settings: Settings) -> Router:
                 )
                 return
 
-            if private:
-                await message.answer(ARCHIVE_PRIVATE)
-                return
-
-            embedder = embeddings.build_embedder(settings)
-            found = await search.search(embedder, question.query, limit=RESULTS)
+            # Вторая дверь ведёт себя ровно как первая (`/find`), и это
+            # решение владельца 07.09.2026: до него она в приватном режиме
+            # не искала вовсе, а команда искала и ходила наружу.
+            # Довод дословно: «несогласованность двух дверей хуже любой
+            # из них — привыкнет к одной, ошибётся на другой».
+            found = (
+                await search.local(question.query, limit=RESULTS)
+                if private
+                else await search.search(
+                    embeddings.build_embedder(settings), question.query, limit=RESULTS
+                )
+            )
         except Exception:
             # Поиск ходит наружу за вектором запроса, и провайдер падает.
             # Молчать нельзя: владелец решит, что в архиве ничего нет.
@@ -414,7 +453,7 @@ def build_router(settings: Settings) -> Router:
             await message.answer(SEARCH_FAILED)
             return
 
-        await message.answer(search_text.render(question.query, found, today=now))
+        await message.answer(search_text.render(question.query, found, today=now, local=private))
 
     async def _answered_a_question(message: Message) -> bool:
         """Разобрать ответ на «когда напомнить?». `False` — это не ответ.

@@ -32,14 +32,14 @@
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
-from brain.core.digest.by_topic import MIN_AGE
 from brain.core.digest.resurface import MIN_LENGTH
 from brain.core.memory.repository import display_text
+from brain.core.present import entry as entry_view
 from brain.storage.db import session_scope
 from brain.storage.models.entry import Entry
 from brain.storage.models.topic import EntryTopic, Topic, normalize
@@ -51,6 +51,22 @@ logger = logging.getLogger(__name__)
 # по времени**, а не последние пять: смысл разговора в движении, а последние
 # пять — это срез одной недели.
 MAX_MOMENTS = 5
+
+# Насколько старой должна быть запись, чтобы попасть в разговор. Ноль — то есть
+# порога нет вовсе.
+#
+# **Разведено с всплыванием 7 сентября 2026, решение владельца.** Прежде здесь
+# стоял `by_topic.MIN_AGE` — сутки, унаследованные от всплывания, где они верны:
+# всплывание достаёт старое **без повода**, и сегодняшнее владелец помнит без
+# бота. Разговор по теме он заводит сам, и вопрос в нём ровно обратный —
+# «а что сейчас». Довод владельца дословно: на вопрос «что там по учёбе»
+# сегодняшняя запись самая нужная, а не самая лишняя.
+#
+# Константа не удалена, а оставлена нулём намеренно: она называет решение.
+# Убрав её, мы получили бы модуль, в котором про возраст не сказано ничего,
+# — и следующая правка вернула бы сюда чужой порог тем же путём, каким он сюда
+# попал в первый раз.
+MIN_AGE = timedelta(0)
 
 # Сколько символов записи цитировать. Больше, чем во всплывании старого
 # у сводки (70), и столько же, сколько у связи (200): здесь смысл именно
@@ -70,6 +86,12 @@ SNIPPET = 220
 # с «похудение».
 MIN_STEM = 4
 MAX_TAIL = 3
+
+# Что считается «сказанным только что». К показу отношения не имеет — нужно
+# ровно одному месту: честному ответу, когда цитировать нечего (`_nothing_
+# to_tell`). Отдельным именем, а не `by_topic.MIN_AGE`, потому что это другой
+# вопрос: не «стоит ли показывать», а «помнит ли владелец это сам».
+FRESH = timedelta(days=1)
 
 MONTHS = (
     "январь",
@@ -140,12 +162,14 @@ async def collect(name: str, now: datetime) -> Talk | None:
             )
         ).all()
 
-    # Пороги те же, что у «вспомним подробно» и у всплывания, и взяты они
-    # оттуда же, а не написаны заново: «что имеет смысл вспоминать» не должно
-    # решаться двумя разными числами в двух модулях.
+    # Два порога, и они пришли из **разных** мест намеренно.
     #
-    #   старше суток   сегодняшнее владелец помнит и без бота
-    #   длиннее ста    «напомни в 14:50 пойти домой» вспоминать нечего
+    #   возраст   свой, и он нулевой — см. `MIN_AGE` выше. Разведён
+    #             с всплыванием 07.09.2026 решением владельца: «что там
+    #             по учёбе» спрашивают про сейчас, а не про позапрошлый месяц;
+    #   длина     общий с всплыванием (`resurface.MIN_LENGTH`), и общий
+    #             по существу: «напомни в 14:50 пойти домой» вспоминать нечего
+    #             ни там, ни здесь.
     moments = [
         Moment(entry_id=int(row[0]), text=str(row[1]), created_at=row[2])
         for row in rows
@@ -154,7 +178,11 @@ async def collect(name: str, now: datetime) -> Talk | None:
         and len(" ".join(str(row[1]).split())) >= MIN_LENGTH
     ]
 
-    fresh = sum(1 for row in rows if row[2] > now - MIN_AGE)
+    # Сколько записей темы моложе суток. Показу они больше не мешают, но
+    # в ответе про пустоту нужны по-прежнему: «касались дважды, оба раза
+    # вскользь» — неправда про две сегодняшние развёрнутые записи. Сутки здесь
+    # не порог показа, а срок, за который владелец помнит сказанное сам.
+    fresh = sum(1 for row in rows if row[2] > now - FRESH)
 
     logger.info(
         "разговор по теме %r: записей %s, из них моложе суток %s, годных к показу %s",
@@ -260,7 +288,13 @@ def text(talk: Talk, *, timezone: str, now: datetime) -> str:
         elif month is None:
             lines.append("")
         month = (when.year, when.month)
-        lines.append(f"{_stamp(when, now=now)} · {_snippet(moment.text)}")
+        # Якорь — за цитатой и отбитый от неё. Здесь он нужнее всего:
+        # предел цитаты 220 символов, и это то самое место, про которое
+        # владелец сказал «то же „и ещё 64“, только в другом месте».
+        lines.append(
+            f"{_stamp(when, now=now)} · {_snippet(moment.text)}  "
+            f"{entry_view.anchor(moment.entry_id)}"
+        )
 
     hidden = talk.total - len(shown)
     if hidden > 0:

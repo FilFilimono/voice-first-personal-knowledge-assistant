@@ -27,6 +27,7 @@ from brain.core.digest.prompting import Question
 from brain.core.digest.resurface import Old
 from brain.core.digest.weekly import Weekly
 from brain.core.enrich.reply import NAMES
+from brain.core.present import entry as entry_view
 from brain.core.present.guard import Written
 from brain.core.retrieval.links import Link
 from brain.core.scheduler import recurrence
@@ -313,7 +314,11 @@ def habit(item: Habit, said: Sequence[Link] = (), *, timezone: str) -> str:
 
     for link in said:
         when = link.created_at.astimezone(ZoneInfo(timezone))
-        lines += ["", f"Ты говорил об этом {when:%d.%m}:", f"«{snippet(link.text, limit=200)}»"]
+        lines += [
+            "",
+            f"Ты говорил об этом {when:%d.%m}:",
+            f"«{snippet(link.text, limit=200)}»  {entry_view.anchor(link.entry_id)}",
+        ]
 
     lines += ["", HABIT_QUESTION]
     return "\n".join(lines)
@@ -333,7 +338,8 @@ HABIT_QUESTION = "Как продвижение? Что получается, ч
 def resurfaced(old: Old, *, timezone: str) -> str:
     """Всплывшая запись. Без повода и без вопроса — на то и всплывание."""
     when = old.created_at.astimezone(ZoneInfo(timezone))
-    return f"📄 Из архива, {when:%d.%m.%Y}:\n\n{snippet(old.text, limit=400)}"
+    body = snippet(old.text, limit=400)
+    return f"📄 Из архива, {when:%d.%m.%Y}:\n\n{body}\n\n{entry_view.anchor(old.entry_id)}"
 
 
 def weekly(review: Weekly) -> str:

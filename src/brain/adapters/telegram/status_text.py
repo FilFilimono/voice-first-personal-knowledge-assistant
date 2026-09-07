@@ -145,6 +145,10 @@ SILENCE = {
     SilenceReason.NOTHING_TO_SAY: "нечего было сказать",
     SilenceReason.QUIET: "вы просили молчать",
     SilenceReason.OVER_BUDGET: "бюджет касаний исчерпан",
+    # Четвёртая причина — не решение промолчать, а несостоявшееся решение.
+    # Формулировка поэтому другая по роду: три первых объясняют молчание,
+    # эта сообщает о поломке.
+    SilenceReason.FAILED: "механизм упал, пробую снова",
 }
 
 
@@ -242,6 +246,16 @@ def _touches(status: SystemStatus, *, timezone: str) -> list[str]:
         lines.append(f"🌱 Привычек: {touches.habits}")
 
     lines.append(f"💬 Касаний сегодня: {touches.spent} из {touches.budget}")
+
+    if touches.failures:
+        # Отказы — сразу под касаниями и до всего прочего: это единственное
+        # место, где владелец узнаёт, что механизм сломался. Сама система
+        # об этом не пишет — сообщение «у меня сломалось» требует внимания,
+        # а сообщение обязано давать (`vision.md` §7.0, принцип 1).
+        broken = ", ".join(
+            name if count == 1 else f"{name} ×{count}" for name, count in touches.failures.items()
+        )
+        lines.append(f"⚠️ Сегодня упало в тике: {broken}")
 
     if touches.auto_resolved:
         # Владельцу об этом не сообщают уведомлением (`vision.md` §7.0,

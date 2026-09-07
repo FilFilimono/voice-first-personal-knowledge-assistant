@@ -102,7 +102,33 @@ class Found:
 
 
 async def search(embedder: Embedder, query: str, *, limit: int = 5) -> list[Found]:
-    """Найти записи по запросу. Пустой запрос ничего не ищет."""
+    """Найти записи по запросу всеми тремя каналами. Пустой запрос — пусто."""
+    return await _search(embedder, query, limit=limit)
+
+
+async def local(query: str, *, limit: int = 5) -> list[Found]:
+    """Найти, не выходя наружу: слова и триграммы, без вектора.
+
+    **Приватный режим снимает канал, а не поиск** — решение владельца
+    7 сентября 2026. Из трёх каналов наружу ходит один: полнотекст и триграммы
+    считаются внутри Postgres, а вектор запроса считает внешняя модель, то есть
+    текст владельца уезжает к провайдеру ровно в том режиме, который заведён
+    затем, чтобы он никуда не уезжал.
+
+    Инвариант 5 говорит про записи, а не про запросы, — и это была та щель,
+    в которую утечка проходила: команда `/find` в приватном режиме работала
+    как обычно. Довод владельца дословно: *несогласованность двух дверей хуже
+    любой из них — привыкнет к одной, ошибётся на другой.*
+
+    **Цена названа вслух, и владельцу о ней говорят.** Вектор — единственный
+    канал, находящий запись, не разделяющую с запросом ни одного слова
+    (см. шапку модуля). Без него поиск работает, но по словам: выдача беднее,
+    и выдавать её за полную молча нельзя (`adapters/telegram/search_text`).
+    """
+    return await _search(None, query, limit=limit)
+
+
+async def _search(embedder: Embedder | None, query: str, *, limit: int) -> list[Found]:
     query = query.strip()
     if not query:
         return []
@@ -112,13 +138,20 @@ async def search(embedder: Embedder, query: str, *, limit: int = 5) -> list[Foun
     return await _load(merged[:limit], rankings)
 
 
-async def channel_rankings(embedder: Embedder, query: str) -> dict[str, list[int]]:
+async def channel_rankings(embedder: Embedder | None, query: str) -> dict[str, list[int]]:
     """Что нашёл каждый канал — списком записей по убыванию его уверенности.
 
     Отдельной функцией, потому что этим пользуется eval: без поканальных чисел
     правка весов возвращается к «мне кажется, вектор надо усилить».
+
+    `embedder is None` означает «наружу не ходим»: канала вектора в ответе
+    тогда нет вовсе. Не пустой список, а отсутствующий ключ — и это не мелочь:
+    RRF складывает вклады найденных каналов, и пустой канал он посчитал бы
+    молчащим, а отсутствующий не считает никак. Разница видна eval'у, который
+    меряет recall по каналам: «вектор ничего не нашёл» и «вектора не было» —
+    разные числа.
     """
-    vector = await embedder.embed_query(query)
+    vector = None if embedder is None else await embedder.embed_query(query)
 
     async with session_scope() as session:
         # SET LOCAL живёт до конца транзакции и не трогает другие соединения.
@@ -126,11 +159,13 @@ async def channel_rankings(embedder: Embedder, query: str) -> dict[str, list[int
             text(f"SET LOCAL pg_trgm.word_similarity_threshold = {TRIGRAM_THRESHOLD}")
         )
 
-        return {
+        rankings = {
             FULLTEXT: await _entries(session, _FULLTEXT_SQL, {"q": query}),
             TRIGRAM: await _entries(session, _TRIGRAM_SQL, {"q": query}),
-            VECTOR: await _entries(session, _VECTOR_SQL, {"q": to_literal(vector)}),
         }
+        if vector is not None:
+            rankings[VECTOR] = await _entries(session, _VECTOR_SQL, {"q": to_literal(vector)})
+        return rankings
 
 
 def merge(rankings: dict[str, list[int]], weights: dict[str, float] | None = None) -> list[int]:

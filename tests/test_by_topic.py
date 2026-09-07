@@ -367,22 +367,26 @@ async def test_a_topic_is_found_by_its_normalized_name(
 
 
 @pytest.mark.integration
-async def test_todays_entry_is_not_something_to_recall(
+async def test_todays_entry_is_something_to_recall_after_all(
     archived: None,
     dispatcher: Dispatcher,
     bot: Bot,
     session: FakeSession,
     archive: list[archive_module.Entry],
 ) -> None:
-    """Сегодняшнее владелец помнит и без бота — та же причина, что у связей.
+    """**Перевёрнуто 07.09.2026 решением владельца.**
 
-    В теме одна запись, и она принята час назад. Значит, вспоминать нечего,
-    и ответ — список тем, а не эта запись.
+    Прежде здесь проверялось «сегодняшнее владелец помнит и без бота»: в теме
+    одна запись, принята час назад, и ответом был список тем. Порог достался
+    разговору от всплывания, где он верен, — и там он остался.
+
+    Здесь он неверен ровно наоборот: `/recall <тема>` спрашивают про движение,
+    и последняя запись — это «а сейчас». Разбор порогов —
+    `tests/test_topic_talk_threshold.py`.
     """
     await _ask(dispatcher, bot, f"/recall {ONLY_FRESH}")
 
-    assert _text_of(archive, TOO_FRESH) not in session.texts[-1]
-    assert ONLY_FRESH in session.texts[-1]
+    assert _text_of(archive, TOO_FRESH) in session.texts[-1]
 
 
 @pytest.mark.integration
