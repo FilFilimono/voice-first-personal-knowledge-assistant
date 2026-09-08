@@ -19,6 +19,8 @@
     cleanup.py     чистка расшифровки: промпт, схема ответа, разбор
     titles.py      названия дел и петель: пачка, проверка, запись
     digest.py      лид утренней сводки: вход модели, промпт, отказ
+    event.py       контекст перед встречей: сухой рендер трёх слоёв, фраза
+                   модели за флагом и потолок вызовов за сутки
     recall.py      связь и срез по темам: шаблон кода, модель — за флагом
     guard.py       проверка написанного моделью перед показом
     pacing.py      что замолкает первым, когда квота на исходе
@@ -34,7 +36,7 @@
 и к этому моменту пакет уже собран целиком.
 """
 
-from brain.core.present import digest, guard, recall, titles
+from brain.core.present import digest, event, guard, recall, titles
 from brain.core.present.cleanup import PROMPT, PURPOSE, clean_one, parse
 from brain.core.present.pacing import cosmetic_allowed
 
@@ -49,6 +51,7 @@ __all__ = [
     "clean_one",
     "cosmetic_allowed",
     "digest",
+    "event",
     "guard",
     "parse",
     "recall",

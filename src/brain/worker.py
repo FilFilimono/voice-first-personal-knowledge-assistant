@@ -29,7 +29,7 @@ from pgqueuer.models import Job, Schedule
 import brain.core.retrieval.embeddings as embeddings
 from brain.adapters.telegram.audio import TelegramAudioSource
 from brain.adapters.telegram.notifier import TelegramNotifier
-from brain.config import get_runtime_settings
+from brain.config import Settings, get_runtime_settings
 from brain.core import llm, stt
 from brain.core.provider_errors import ProviderError, advice
 from brain.core.scheduler import jobs
@@ -49,6 +49,7 @@ from brain.core.scheduler.queue import (
     TOUCH_SCHEDULE,
     TRANSCRIBE,
 )
+from brain.integrations.gcal import auth as gcal_auth
 from brain.storage import schema
 from brain.storage.db import asyncpg_dsn
 
@@ -168,6 +169,32 @@ def _advice(setting: str, error: ProviderError) -> str:
     return advice(error.status, setting, message=str(error))
 
 
+async def _report_calendar(settings: Settings) -> None:
+    """Сказать в лог, что с календарём. Не бросает ни при каком ответе.
+
+    Проверка — настоящий вызов (обновление токена), а не сверка настроек:
+    заполненный `.env` не означает, что Google этот токен ещё принимает,
+    а именно так эта интеграция и ломается — тихо, через неделю после
+    настройки (ADR-0016, цена решения, п. 2).
+
+    `check_available` не бросает по построению, и `try` здесь всё равно стоит:
+    воркер обязан подняться в любом случае, а «в любом случае» включает нашу
+    собственную ошибку в разборе ответа.
+    """
+    try:
+        status = await gcal_auth.check_available(settings)
+    except Exception:
+        logger.exception("календарь не проверился — воркер поднимается без него")
+        return
+
+    if not status.configured:
+        logger.info("календарь: %s", status.detail)
+    elif status.available:
+        logger.info("календарь настроен и отвечает")
+    else:
+        logger.warning("календарь настроен, но не отвечает.\n%s", status.detail)
+
+
 def payload_of(job: Job) -> dict[str, Any]:
     """Разобрать полезную нагрузку задания. В ней только идентификаторы."""
     if job.payload is None:
@@ -285,6 +312,21 @@ async def create_app() -> AsyncGenerator[PgQueuer]:
         await bot.session.close()
         await connection.close()
         raise
+
+    # Календарь проверяется **после** моделей и не имеет права остановить старт
+    # ни при каком ответе — ADR-0016 и та же мысль, что у косметики
+    # (ADR-0015, п. 6). Без расшифровки системы нет; без календаря захват
+    # записи, разметка, поиск и напоминания работают целиком, и валить из-за
+    # незаданного `GOOGLE_CALENDAR_REFRESH_TOKEN` весь воркер значило бы
+    # повторить 20 августа 2026, когда из-за квоты на эмбеддинги встали
+    # расшифровка и напоминания.
+    #
+    # Три состояния различаются в логе, потому что это три разные новости:
+    # «не настроен» — владелец не дошёл до конца инструкции; «отвечает» —
+    # всё в порядке; «не отвечает» — дошёл, а потом что-то отвалилось,
+    # и почти всегда это отозванный refresh token (совет приезжает готовым,
+    # из `gcal.errors.advice`).
+    await _report_calendar(settings)
 
     pgq = PgQueuer(AsyncpgDriver(connection))
 

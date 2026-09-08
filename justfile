@@ -114,6 +114,13 @@ eval-units *args:
 eval-stt *args:
     uv run python -m evals.stt.run {{args}}
 
+# Разовая авторизация в Google Calendar (ADR-0016). Делается **один раз
+# и с ноутбука**: посреди процедуры открывается браузер, а на сервере браузера
+# нет. Печатает две строки для .env — вставляет их владелец, секреты в файлы
+# проект не пишет. Процедура целиком: docs/google_calendar_setup.md.
+calendar-auth:
+    uv run python -m brain.integrations.gcal.authorize
+
 # Быстрые тесты: без БД, без сети. Это же гоняет Stop-хук.
 test:
     uv run pytest

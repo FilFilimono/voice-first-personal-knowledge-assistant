@@ -13,6 +13,8 @@ from brain.storage.models.base import Base
 from brain.storage.models.chunk import DIMENSIONS, FTS_CONFIG, Chunk
 from brain.storage.models.commitment import Commitment, CommitmentState
 from brain.storage.models.entry import Entry, EntryKind, EntrySource
+from brain.storage.models.entry_calendar_event import EntryCalendarEvent
+from brain.storage.models.event_context import EventContext
 from brain.storage.models.habit import Habit, HabitStatus, Rhythm
 from brain.storage.models.llm_call import LlmCall
 from brain.storage.models.loop import Loop, LoopStatus
@@ -37,11 +39,13 @@ __all__ = [
     "Commitment",
     "CommitmentState",
     "Entry",
+    "EntryCalendarEvent",
     "EntryKind",
     "EntryOverride",
     "EntrySource",
     "EntryTopic",
     "EntryUnit",
+    "EventContext",
     "Habit",
     "HabitStatus",
     "LlmCall",

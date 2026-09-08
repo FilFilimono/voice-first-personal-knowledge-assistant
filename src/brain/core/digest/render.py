@@ -27,6 +27,7 @@ from brain.core.digest.prompting import Question
 from brain.core.digest.resurface import Old
 from brain.core.digest.weekly import Weekly
 from brain.core.enrich.reply import NAMES
+from brain.core.ports import CalendarEvent
 from brain.core.present import entry as entry_view
 from brain.core.present.guard import Written
 from brain.core.retrieval.links import Link
@@ -43,6 +44,14 @@ from brain.storage.models.habit import Habit
 # Удалять его нельзя никогда, ровно как сухой рендер сводки: он и есть
 # та мягкая деградация, которой куплена недетерминированность.
 SNIPPET = 70
+
+# Сколько встреч показывать в первой строке и сколько символов брать
+# от названия. Пять — потому что сводка обязана читаться за сорок секунд,
+# а день, в котором встреч больше пяти, всё равно читается не в боте.
+# Сорок символов — длина, после которой строка расписания переносится
+# на телефоне и перестаёт быть одной строкой.
+EVENTS_SHOWN = 5
+EVENT_TITLE = 40
 
 # Возраст петли, после которого `vision.md` §6 велит читать его как перегрузку,
 # а не как лень. Формулировка меняется вместе с числом — иначе цифра сама
@@ -107,7 +116,23 @@ def morning(content: Morning, written: Written | None = None, asked: Question | 
     """
     lines = ["☀️ Утро."]
 
-    # 1. Материал. Первым идёт то, что можно прочитать, а не сделать.
+    # 0. Календарь на сегодня — **первой строкой сообщения** (`vision.md` §5.1).
+    #
+    # Это решение владельца от 7 сентября 2026, и оно спорит с его же решением
+    # от 6 сентября («сверху то, что можно прочитать, а не сделать»). Спор
+    # разрешён так: встречи — единственная строка сводки, которая ничего
+    # не требует. Она не про то, что владелец должен, и даже не про то, что он
+    # думал: она про то, что и так произойдёт сегодня, независимо от него.
+    # Поэтому порядок здесь выбран, а не сложился, и через полгода его надо
+    # читать именно так.
+    #
+    # Пусто — строки нет вовсе. Ни «сегодня встреч нет», ни «календарь
+    # недоступен»: и то, и другое — сообщение ни о чём в единственном
+    # ежедневном сообщении (§7.0, принцип 3).
+    lines += _agenda(content)
+
+    # 1. Материал. Первым из того, что про архив, идёт то, что можно прочитать,
+    # а не сделать.
     lines += _material(asked)
 
     # 2. Срез по темам — доступ к архиву на месте бывшего счётчика.
@@ -133,6 +158,42 @@ def morning(content: Morning, written: Written | None = None, asked: Question | 
     lines += _question(asked)
 
     return "\n".join(lines)
+
+
+def _agenda(content: Morning) -> list[str]:
+    """Встречи сегодняшнего дня одной строкой.
+
+    Одной, а не списком: сводка читается за сорок секунд (`vision.md` §5.1),
+    и пять строк расписания съели бы этот бюджет раньше, чем владелец дошёл бы
+    до дел. Время — в поясе владельца, и берётся оно из того же места, откуда
+    приехали события (`event_context.Agenda`), а не из настроек: второй
+    источник правды про пояс разошёлся бы с первым молча.
+
+    Событие «на весь день» показывается без времени. Показывать у него 00:00
+    значило бы назвать час, которого в календаре нет.
+
+    Длинный день обрезается многоточием **без числа**. Счётчик «и ещё 7»
+    в этом сообщении уже был — в виде «…и ещё 64 дела», — и владелец назвал
+    его самой ненужной строкой сводки. Многоточие говорит «список не весь»
+    и ничего не считает.
+    """
+    if content.agenda is None or not content.agenda.events:
+        return []
+
+    zone = ZoneInfo(content.agenda.timezone)
+    shown = content.agenda.events[:EVENTS_SHOWN]
+    listing = " · ".join(_meeting(event, zone) for event in shown)
+    if len(content.agenda.events) > EVENTS_SHOWN:
+        listing += " · …"
+    return ["", f"🗓 Сегодня: {listing}"]
+
+
+def _meeting(event: CalendarEvent, zone: ZoneInfo) -> str:
+    """Одна встреча: время и название. У события на весь день времени нет."""
+    title = snippet(event.title or "без названия", limit=EVENT_TITLE)
+    if event.all_day:
+        return title
+    return f"{event.starts_at.astimezone(zone):%H:%M} {title}"
 
 
 def _material(asked: Question | None) -> list[str]:

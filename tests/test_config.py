@@ -7,6 +7,9 @@
 3. whitelist читается из `123,456`, а не только из JSON
 4. пустой whitelist означает «никого», а не «всех»
 5. мусорное значение в whitelist падает при старте, а не молча пропускается
+6. настройки календаря **не** валят старт: без них бот и воркер поднимаются
+   как раньше, а «календарь настроен» отвечается наличием учётных данных,
+   а не отдельным флагом-выключателем
 """
 
 from collections.abc import Iterator
@@ -186,3 +189,62 @@ def test_the_phrase_of_a_link_is_written_by_code_until_billing() -> None:
     темпе 9.4 записи в день модельная фраза одна вынесла бы дневной остаток.
     """
     assert _settings().recall_written is False
+
+
+# --- Google Calendar (ADR-0016) ---
+
+
+def test_the_calendar_is_not_configured_out_of_the_box() -> None:
+    """Пустые учётные данные — это «календаря нет», а не «календарь сломан»."""
+    assert _settings().calendar_configured is False
+
+
+def test_the_calendar_needs_all_four_values_including_the_target() -> None:
+    """Клиент, который авторизовался и не знает, куда писать, настроен наполовину.
+
+    Проверяется снятием каждого значения по очереди: три из четырёх дают
+    систему, которая ведёт себя как настроенная и отказывает на первом же
+    вызове — то есть ровно тем почерком, который в проекте дороже всего.
+    """
+    filled = {
+        "google_calendar_client_id": "брайн.apps.googleusercontent.com",
+        "google_calendar_client_secret": "секрет",
+        "google_calendar_refresh_token": "1//0gрефреш",
+        "google_calendar_target_id": "brain@group.calendar.google.com",
+    }
+    assert _settings(**filled).calendar_configured is True
+
+    for missing in filled:
+        assert _settings(**{**filled, missing: "  "}).calendar_configured is False, missing
+
+
+def test_missing_calendar_settings_do_not_stop_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Без календаря захват записи работает, без расшифровки — нет.
+
+    Поэтому календарь не входит в `REQUIRED`: ронять воркер из-за незаданного
+    `GOOGLE_CALENDAR_REFRESH_TOKEN` значило бы повторить 20 августа 2026, когда
+    из-за квоты на эмбеддинги встали расшифровка и напоминания.
+    """
+    filled = _settings(telegram_bot_token="123:x", google_api_key="AI-x")
+    monkeypatch.setattr("brain.config.get_settings", lambda: filled)
+
+    settings = get_runtime_settings()
+
+    assert settings.calendar_configured is False
+    assert settings.google_calendar_refresh_token == ""
+
+
+def test_the_event_context_is_written_by_code_until_billing() -> None:
+    """Текст контекста по умолчанию не зовёт модель: 15 из 20 запросов заняты."""
+    assert _settings().event_context_written is False
+
+
+def test_the_daily_cap_on_event_context_is_set_by_code() -> None:
+    """Потолок задаётся числом, а не намерением (ADR-0016).
+
+    День с пятью встречами иначе съедает квоту чистки расшифровки, и узналось
+    бы это не отказом, а тем, что расшифровки тихо перестали чиститься.
+    """
+    assert _settings().event_context_daily_cap == 2

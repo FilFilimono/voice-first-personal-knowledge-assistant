@@ -30,9 +30,41 @@ PRIVATE = "private"
 SET = "set"
 
 
+# Кнопка «в календарь». Третья приставка, потому что смысл третий: «Да» под
+# вопросом заводит напоминание внутри бота, а это — выпускает событие наружу,
+# к третьей стороне. Одна приставка на оба означала бы, что нажатие, отправляющее
+# данные в Google, неотличимо от нажатия, которое ничего никуда не отправляет.
+CALENDAR_PREFIX = "gcal"
+ADD = "add"
+
+
 def answer_data(answer: str, entry_id: int) -> str:
     """Что вернётся в бот при нажатии кнопки."""
     return f"{CALLBACK_PREFIX}:{answer}:{entry_id}"
+
+
+def calendar_data(entry_id: int) -> str:
+    """Что вернётся в бот при нажатии «в календарь»."""
+    return f"{CALENDAR_PREFIX}:{ADD}:{entry_id}"
+
+
+def calendar_keyboard(entry_id: int) -> InlineKeyboardMarkup:
+    """Единственная кнопка, которой событие попадает в календарь.
+
+    **Другого пути наружу нет, и это критерий готовности Фазы 5**
+    (`tech_plan.md` §8: «ни одно событие не создано без моего нажатия»).
+    Кнопка одна, приставка своя, обработчик один — проверяется тестом пути.
+
+    Показывается не всегда: у приватной записи её нет вовсе, у ненастроенного
+    календаря тоже (`integrations.gcal.events.offered`). Кнопка, которая
+    ничего не делает, хуже отсутствующей — владелец нажимает, ничего
+    не происходит, и почему, узнать неоткуда.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗓 В календарь", callback_data=calendar_data(entry_id))]
+        ]
+    )
 
 
 def yes_no_keyboard(entry_id: int) -> InlineKeyboardMarkup:
@@ -144,6 +176,18 @@ class TelegramNotifier:
     async def ask_yes_no(self, chat_id: int, message_id: int, text: str, *, entry_id: int) -> None:
         """Превратить подтверждение приёма в вопрос с кнопками «Да» и «Нет»."""
         await self._edit(chat_id, message_id, text, markup=yes_no_keyboard(entry_id))
+
+    async def offer_calendar(
+        self, chat_id: int, message_id: int, text: str, *, entry_id: int
+    ) -> None:
+        """Показать текст и одну кнопку — «в календарь».
+
+        Зовётся из воркера, после расшифровки: наговорённое «напомни в четверг
+        в 19:00» заводит напоминание там, а не в адаптере. Без этого метода
+        кнопка была бы только у набранного текста — то есть у меньшей половины
+        записей владельца, и молча.
+        """
+        await self._edit(chat_id, message_id, text, markup=calendar_keyboard(entry_id))
 
     async def show_annotation(
         self,

@@ -24,18 +24,20 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import brain.core.retrieval.embeddings as embeddings
 from brain.adapters.telegram import digest_keyboards, search_text, status_text
 from brain.adapters.telegram import notifier as notifier_module
 from brain.adapters.telegram.notifier import (
     ANNOTATION_PREFIX,
+    CALENDAR_PREFIX,
     CALLBACK_PREFIX,
     NO,
     PRIVATE,
     SET,
     WRONG,
+    calendar_keyboard,
     yes_no_keyboard,
 )
 from brain.config import Settings
@@ -48,6 +50,7 @@ from brain.core.present import archive_question, archive_topics
 from brain.core.present import entry as entry_view
 from brain.core.retrieval import search
 from brain.core.scheduler import recurrence, reminders
+from brain.integrations.gcal import events as calendar
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.commitment import CommitmentState
 from brain.storage.models.habit import Rhythm
@@ -61,6 +64,21 @@ STORED = "Записал."
 CAPTURE_FAILED = "Не смог сохранить — повторите, пожалуйста."
 ALREADY_SCHEDULED = "Это напоминание уже заведено."
 QUESTION_LOST = "Не нашёл запись, к которой был вопрос — посмотрите логи."
+
+# Что показать после нажатия «в календарь». Владелец обязан увидеть **что
+# именно** ушло: текст, время и имя календаря — это требование приёмки Фазы 5,
+# а не вежливость. Молча события не создаются.
+CALENDAR_ADDED = "🗓 {title}\n{when}\n\nУшло в календарь «{calendar}»."
+CALENDAR_ALREADY = "🗓 Это уже в календаре."
+# Отказ по приватности выглядит как отказ, а не как поломка: так и задумано
+# (инвариант 5). Кнопки у приватной записи нет, но нажать старую можно —
+# приватность включается задним числом.
+CALENDAR_PRIVATE = "🔒 Приватная запись наружу не уходит. В календарь — тоже."
+CALENDAR_OFF = "Календарь не настроен. Процедура целиком — docs/google_calendar_setup.md."
+CALENDAR_NO_REMINDER = "У этой записи нет напоминания — в календарь класть нечего."
+# Запись цела — это первое, что владелец должен прочитать: отказ Google
+# не имеет права выглядеть как потеря мысли.
+CALENDAR_FAILED = "Не получилось создать событие. Запись цела, напоминание работает.\n\n{detail}"
 PRIVATE_VOICE_REFUSED = (
     "Приватный режим — только текст.\n"
     "Расшифровка идёт через внешний сервис, поэтому голосовое пришлось бы "
@@ -375,7 +393,11 @@ def build_router(settings: Settings) -> Router:
             # и кнопка под ним обещала бы не то.
             await ack.edit_text(result.reply, reply_markup=yes_no_keyboard(result.entry_id))
         else:
-            await ack.edit_text(result.reply)
+            # Явное «напомни в четверг в 19:00» заводит напоминание прямо здесь,
+            # без вопроса, — и это самый частый случай владельца. Значит,
+            # и предложение календаря живёт здесь тоже: одна ветка из двух
+            # оставила бы кнопку невидимой ровно там, где она нужнее всего.
+            await ack.edit_text(result.reply, reply_markup=await _calendar_offer(result.entry_id))
 
         # Ответ по архиву идёт **после** записи и **отдельным сообщением**.
         # См. `_from_archive`: это и есть то место, где решается, что делать
@@ -486,7 +508,7 @@ def build_router(settings: Settings) -> Router:
                 now=datetime.now(UTC),
             )
 
-        await replied_to.edit_text(_answered(outcome))
+        await replied_to.edit_text(_answered(outcome), reply_markup=await _calendar_offer(entry_id))
         return True
 
     @router.callback_query(F.data.startswith(f"{CALLBACK_PREFIX}:"))
@@ -534,7 +556,38 @@ def build_router(settings: Settings) -> Router:
                 now=datetime.now(UTC),
             )
 
-        await question.edit_text(_answered(outcome))
+        await question.edit_text(_answered(outcome), reply_markup=await _calendar_offer(entry_id))
+
+    @router.callback_query(F.data.startswith(f"{CALENDAR_PREFIX}:"))
+    async def add_to_calendar(callback: CallbackQuery) -> None:
+        """Нажатие «в календарь». **Единственный путь события наружу.**
+
+        Критерий готовности Фазы 5 — «ни одно событие не создано без моего
+        нажатия» (`tech_plan.md` §8), и держится он на том, что
+        `events.create_for_entry` зовётся отсюда и больше ниоткуда.
+
+        Отказ здесь ничего не роняет: запись цела, напоминание внутри бота
+        работает как раньше. Календарь — канал доставки, а не хранилище.
+        """
+        await callback.answer()
+
+        if callback.data is None or callback.message is None:  # pragma: no cover — фильтр выше
+            return
+
+        message = callback.message
+        if not isinstance(message, Message):  # pragma: no cover — слишком старое сообщение
+            return
+
+        entry_id = int(callback.data.split(":", maxsplit=2)[2])
+        result = await calendar.create_for_entry(entry_id, now=datetime.now(UTC))
+
+        # Кнопка снимается при любом исходе: она уже нажата, и второй раз она
+        # либо ничего не даст, либо даст второе событие. Текст при этом
+        # дописывается к прежнему, а не заменяет его — владелец должен видеть,
+        # на что именно он нажал.
+        await message.edit_text(
+            f"{message.text}\n\n{_calendar_said(result, settings)}", reply_markup=None
+        )
 
     @router.callback_query(F.data.startswith(f"{ANNOTATION_PREFIX}:"))
     async def annotation_button(callback: CallbackQuery) -> None:
@@ -918,6 +971,56 @@ async def _fold(message: Message | None, commitment_id: int) -> None:
 def _answered(outcome: reminders.ScheduleOutcome) -> str:
     """Что показать вместо вопроса, когда на него ответили."""
     return f"⏰ {outcome.message}" if outcome.created else outcome.message
+
+
+async def _calendar_offer(entry_id: int | None) -> InlineKeyboardMarkup | None:
+    """Предложить положить это же в календарь. `None` — не предлагать.
+
+    Зовётся из **обоих** мест, где у записи появляется напоминание: явное
+    «напомни в четверг в 19:00» заводит его сразу при приёме, а повелительный
+    глагол без «напомни» — только после нажатия «Да». Второе место без первого
+    оставило бы самый частый случай владельца без кнопки вовсе.
+
+    Все условия — в `events.offered`, и здесь их намеренно не дублируется
+    ни одного: календарь настроен, напоминание есть, запись не приватная,
+    события по ней ещё нет.
+
+    Здесь же проходит граница фазы: кнопка предлагает, событие создаёт нажатие.
+    Между этими двумя моментами владелец может передумать, и система обязана
+    это пережить — поэтому приватность проверяется ещё раз, уже в `integrations`.
+    """
+    if entry_id is None:
+        return None
+    if not await calendar.offered(entry_id):
+        return None
+    return calendar_keyboard(entry_id)
+
+
+def _calendar_said(result: calendar.Result, settings: Settings) -> str:
+    """Что показать после нажатия «в календарь».
+
+    Владелец видит **текст, время и имя календаря** — это требование приёмки
+    Фазы 5, а не вежливость: «молча события не создаются» проверяется тем,
+    что после нажатия он читает, что именно ушло и куда.
+
+    Время — в его поясе. В UTC оно было бы правдоподобным и неверным, а такая
+    ошибка в сообщении про встречу дороже любой другой.
+    """
+    if result.outcome is calendar.Outcome.CREATED and result.starts_at is not None:
+        local = result.starts_at.astimezone(ZoneInfo(settings.brain_timezone))
+        return CALENDAR_ADDED.format(
+            title=result.title, when=f"{local:%d.%m в %H:%M}", calendar=result.calendar
+        )
+
+    if result.outcome is calendar.Outcome.ALREADY:
+        return CALENDAR_ALREADY
+    if result.outcome is calendar.Outcome.PRIVATE:
+        return CALENDAR_PRIVATE
+    if result.outcome is calendar.Outcome.OFF:
+        return CALENDAR_OFF
+    if result.outcome is calendar.Outcome.NO_REMINDER:
+        return CALENDAR_NO_REMINDER
+    return CALENDAR_FAILED.format(detail=result.detail)
 
 
 def _reclassified(chosen: AnnotationType, was: AnnotationType | None) -> str:

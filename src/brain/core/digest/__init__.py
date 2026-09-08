@@ -23,6 +23,8 @@
 Что где лежит:
 
     by_topic.py     срез по темам за период и «вспомним подробно»
+    event_context.py  календарь внутрь: встречи на сегодня и контекст перед
+                    событием — заказанное касание вне бюджета и со звуком
     slots.py        чистая арифметика времени: чей момент наступил
     touches.py      журнал касаний и бюджет
     quiet.py        пауза и «сегодня выходной»
@@ -42,6 +44,7 @@ from brain.core.digest import (
     by_topic,
     commitments,
     evening,
+    event_context,
     failures,
     habits,
     loops,
@@ -61,6 +64,7 @@ __all__ = [
     "by_topic",
     "commitments",
     "evening",
+    "event_context",
     "failures",
     "habits",
     "loops",

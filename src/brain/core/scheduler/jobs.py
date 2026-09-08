@@ -44,6 +44,7 @@ from brain.core.retrieval.indexing import index_entry
 from brain.core.scheduler import reminders
 from brain.core.scheduler.queue import CLEANUP, ENRICH, INDEX, SHOW_TRANSCRIPT
 from brain.core.stt.errors import AudioTooLongError, PrivateContentError
+from brain.integrations.gcal import events as calendar
 from brain.storage.models.annotation import AnnotationType
 from brain.storage.models.entry import Entry
 from brain.storage.models.reminder import Reminder
@@ -182,6 +183,24 @@ async def _show(
     if reminder.ask is reminders.Ask.CONFIRM:
         await notifier.ask_yes_no(chat_id, ack_message_id, text, entry_id=entry_id)
         return
+
+    # Напоминание завелось прямо из расшифровки — предлагаем календарь
+    # (Фаза 5, ADR-0016). **Это не украшение, а половина фазы.** Наговорённое
+    # «напомни в четверг в 19:00» приходит сюда, а не в адаптер, и без этой
+    # ветки кнопка была бы только у набранного текста. Голос при этом главный
+    # способ записи у владельца — то есть фаза работала бы на меньшей половине
+    # случаев и, что хуже, молча: ровно так в проекте уже вели себя
+    # напоминания, работавшие только для текста.
+    #
+    # Отказ календаря сюда не поднимается: расшифровка показывается в любом
+    # случае. Мысль важнее кнопки.
+    if reminder.created:
+        try:
+            if await calendar.offered(entry_id):
+                await notifier.offer_calendar(chat_id, ack_message_id, text, entry_id=entry_id)
+                return
+        except Exception:
+            logger.exception("не смог предложить календарь для записи %s", entry_id)
 
     await notifier.edit(chat_id, ack_message_id, text)
 

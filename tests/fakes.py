@@ -73,6 +73,10 @@ class FakeNotifier:
         self.stuck_loops: list[int | None] = []
         self.evenings: list[tuple[int, str, list[int]]] = []
         self.quiet: list[tuple[int, str]] = []
+        # Предложения календаря: чат, сообщение, текст, запись. Отдельным
+        # списком, а не в `edited`: «показали текст» и «показали текст
+        # с кнопкой наружу» — разные утверждения, и путать их дорого.
+        self.calendar_offers: list[tuple[int, int, str, int]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         self.sent.append((chat_id, text))
@@ -83,6 +87,11 @@ class FakeNotifier:
 
     async def ask_yes_no(self, chat_id: int, message_id: int, text: str, *, entry_id: int) -> None:
         self.asked.append((chat_id, message_id, text, entry_id))
+
+    async def offer_calendar(
+        self, chat_id: int, message_id: int, text: str, *, entry_id: int
+    ) -> None:
+        self.calendar_offers.append((chat_id, message_id, text, entry_id))
 
     async def show_annotation(
         self,

@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.config import get_settings
 from brain.core import ingest
 from brain.core.memory import repository
 from brain.core.memory.unit_of_work import capture_transaction
@@ -187,3 +188,51 @@ async def test_ordinary_voice_note_says_nothing_about_reminders(audio_dir: Path)
     _, _, shown = notifier.edited[0]
     assert "Напомню" not in shown
     assert "не понял" not in shown.lower()
+
+
+async def test_a_spoken_reminder_offers_the_calendar(
+    archive: list[Entry], audio_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Наговорённое «напомни» тоже даёт кнопку в календарь. Фаза 5, ADR-0016.
+
+    **Этот тест написан после того, как дыра нашлась.** Кнопка была сделана
+    в адаптере — там, где владелец печатает, — а голосовое приходит не туда:
+    напоминание из расшифровки заводит воркер, и ветка `jobs._show` про
+    календарь не знала. Голос при этом главный способ записи, то есть фаза
+    работала бы на меньшей половине случаев и **молча** — ровно тем почерком,
+    которым в проекте уже вели себя напоминания, работавшие только для текста.
+
+    Проверяется отдельным списком заглушки, а не текстом сообщения: «показали
+    расшифровку» и «показали расшифровку с кнопкой наружу» — разные
+    утверждения, и по тексту они неотличимы.
+    """
+    monkeypatch.setenv("GOOGLE_CALENDAR_CLIENT_ID", "брайн.apps.googleusercontent.com")
+    monkeypatch.setenv("GOOGLE_CALENDAR_CLIENT_SECRET", "секрет")
+    monkeypatch.setenv("GOOGLE_CALENDAR_REFRESH_TOKEN", "1//0gрефреш")
+    monkeypatch.setenv("GOOGLE_CALENDAR_TARGET_ID", "brain@group.calendar.google.com")
+    get_settings.cache_clear()
+
+    notifier = FakeNotifier()
+    entry_id = await _capture_voice(audio_dir)
+    await _transcribe(entry_id, entry(archive, SPOKEN_WITH_DIGIT).text, notifier)
+
+    assert notifier.calendar_offers, "кнопки в календарь нет у наговорённого напоминания"
+    _, _, shown, offered_entry = notifier.calendar_offers[-1]
+    assert offered_entry == entry_id
+    assert "Напомню" in shown
+
+
+async def test_an_unconfigured_calendar_leaves_the_spoken_reminder_alone(
+    archive: list[Entry], audio_dir: Path
+) -> None:
+    """Календарь не настроен — расшифровка показывается как раньше, без кнопки.
+
+    Ненастроенный календарь не имеет права менять то, что владелец видит
+    после голосового: до Фазы 5 это работало, и обязано работать так же.
+    """
+    notifier = FakeNotifier()
+    entry_id = await _capture_voice(audio_dir)
+    await _transcribe(entry_id, entry(archive, SPOKEN_WITH_DIGIT).text, notifier)
+
+    assert notifier.calendar_offers == []
+    assert any("Напомню" in text for _, _, text in notifier.edited)
